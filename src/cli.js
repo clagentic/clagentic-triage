@@ -16,6 +16,11 @@ import { startWebhookServer } from './webhooks/server.js';
 import { dispatch } from './dispatchers/index.js';
 import { check_token_scopes } from './adapters/github.js';
 
+// NOTE(RT-009): the `hooks` config field is stored but not yet dynamically
+// imported. When hook module loading is implemented, apply _validate_module_path
+// from src/dispatchers/index.js before any import() of operator-supplied hook
+// module paths — same confinement rules as dispatcher modules.
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
