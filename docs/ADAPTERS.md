@@ -6,7 +6,7 @@ Adapters normalize events from external platforms into the common Event schema. 
 
 | Adapter | Status | Notes |
 |---|---|---|
-| `github` | planned | GitHub REST API + webhook receiver |
+| `github` | shipped | GitHub REST API + webhook receiver |
 | `gitlab` | planned | GitLab REST API |
 | `forgejo` | planned | Forgejo/Gitea-compatible REST API |
 
