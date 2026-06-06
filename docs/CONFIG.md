@@ -30,8 +30,8 @@ Configuration is loaded from (in priority order):
   "pending_queue": ".triage/pending.jsonl",
   "dispatchers": [
     {
-      "name": "lore",
-      "project": "my-project"
+      "name": "webhook",
+      "url": "https://example.com/triage-hook"
     }
   ],
   "hooks": [

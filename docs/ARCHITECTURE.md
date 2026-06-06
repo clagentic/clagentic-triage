@@ -15,8 +15,8 @@ Source (GitHub/GitLab/...)
       → Assessor (LLM: does this meet intent? what action?)
         → Router (map verdict → action class)
           → Approval gate (human OR auto, per action class config)
-            → Dispatcher (Lore / Jira / Linear / webhook / ...)
-              → Hook (optional: console push, Slack, etc.)
+            → Dispatcher (Jira / Linear / GitHub Issues / webhook / ...)
+              → Hook (optional: Slack, custom webhook, etc.)
 ```
 
 ## Interfaces

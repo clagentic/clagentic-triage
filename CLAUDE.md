@@ -8,7 +8,7 @@ LLM-powered triage agent for GitHub issues and PRs. Watches an org or repo, asse
 - Model selection is user-configurable. Never hardcode a model name in business logic.
 - No hardcoded org names, repo names, or usernames anywhere in src/. All config via environment or config file.
 - Adapters (GitHub, GitLab, etc.) are pluggable. Core logic must not import adapter internals directly — only through the adapter interface.
-- Backends (Lore, Jira, Linear, etc.) are pluggable. Core triage logic must not know about specific backend implementations.
+- Backends (Jira, Linear, GitHub Issues, webhook, etc.) are pluggable. Core triage logic must not know about specific backend implementations. Any backend — including private/internal systems — plugs in via the dispatcher interface and is loaded by config-supplied module path; never bundle a backend-specific adapter in core.
 - Dispatch hooks (console, webhooks, etc.) are optional and config-driven. The core pipeline runs cleanly with no hooks registered.
 - FSL-1.1-MIT license. See LICENSE.
 
@@ -18,8 +18,8 @@ LLM-powered triage agent for GitHub issues and PRs. Watches an org or repo, asse
 src/
   adapters/       # Source adapters: github.js, gitlab.js (interface: list_events, post_comment, etc.)
   assessors/      # LLM assessment logic: intent-check, quality-check, routing
-  dispatchers/    # Dispatch targets: lore.js, jira.js, linear.js, webhook.js
-  hooks/          # Optional integration hooks: console-push.js, etc.
+  dispatchers/    # Generic reference dispatchers only: webhook.js, noop.js (concrete backends are config-loaded plugins, not in-tree)
+  hooks/          # Optional integration hooks (config-loaded), e.g. clagentic:console push
   webhooks/       # Inbound webhook server for real-time events
   config/         # Config schema, loader, validator
 tests/
