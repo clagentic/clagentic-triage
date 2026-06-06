@@ -98,12 +98,17 @@ Review the pending queue:
 clagentic-triage review
 ```
 
-Approve or reject a queued verdict:
+Approve, override, or reject a queued verdict:
 
 ```
 clagentic-triage approve <id>
+clagentic-triage override <id> --action <class>
 clagentic-triage reject <id>
 ```
+
+`override` approves the item but substitutes a different action class
+(`respond`, `request_changes`, `close`, `dispatch`, `escalate`, `approve`)
+in place of the one the LLM suggested.
 
 ## Configuration
 
