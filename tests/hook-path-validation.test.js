@@ -48,20 +48,22 @@ const INSIDE_ABS_PATH = join(TEST_CWD, 'tests', 'fixtures', 'fake-dispatcher.js'
 // ---------------------------------------------------------------------------
 
 describe('_validate_module_path', () => {
-  it('bare npm package name is valid', () => {
+  it('bare npm package name is valid; resolvedPath is null (not a filesystem path)', () => {
     const result = _validate_module_path('my-package', TEST_CWD);
-    assert.deepEqual(result, { valid: true });
+    assert.equal(result.valid, true);
+    assert.equal(result.resolvedPath, null);
   });
 
-  it('scoped npm package name is valid', () => {
+  it('scoped npm package name is valid; resolvedPath is null', () => {
     const result = _validate_module_path('@scope/package', TEST_CWD);
-    assert.deepEqual(result, { valid: true });
+    assert.equal(result.valid, true);
+    assert.equal(result.resolvedPath, null);
   });
 
-  it('relative path within cwd is valid', () => {
-    // ./tests/fixtures/fake-dispatcher.js resolves inside the project root.
+  it('relative path within cwd is valid; resolvedPath is the absolute path', () => {
     const result = _validate_module_path('./tests/fixtures/fake-dispatcher.js', TEST_CWD);
-    assert.deepEqual(result, { valid: true });
+    assert.equal(result.valid, true);
+    assert.equal(result.resolvedPath, join(TEST_CWD, 'tests', 'fixtures', 'fake-dispatcher.js'));
   });
 
   it('relative path escaping cwd via ../ traversal is invalid', () => {
@@ -70,9 +72,10 @@ describe('_validate_module_path', () => {
     assert.match(result.reason, /outside the project root/);
   });
 
-  it('absolute path within cwd is valid', () => {
+  it('absolute path within cwd is valid; resolvedPath matches input', () => {
     const result = _validate_module_path(INSIDE_ABS_PATH, TEST_CWD);
-    assert.deepEqual(result, { valid: true });
+    assert.equal(result.valid, true);
+    assert.equal(result.resolvedPath, INSIDE_ABS_PATH);
   });
 
   it('absolute path outside cwd is invalid', () => {
@@ -143,5 +146,18 @@ describe('loadDispatchers with invalid module paths', () => {
     // Only noop loads; the evil entry is silently dropped (warning only).
     assert.equal(loaded.length, 1);
     assert.equal(loaded[0].name, 'noop');
+  });
+
+  it('loads a valid in-cwd module path end-to-end via the resolved absolute path', async () => {
+    // This is the integration test Peaches required (finding #2): a valid
+    // filesystem module path must load through loadDispatchers using the
+    // resolvedPath (file:// URL), not the raw entry.module string. Verifies
+    // that the validated path and the loaded path are identical — i.e. the
+    // confinement guard actually applies to the file that gets imported.
+    const loaded = await loadDispatchers({
+      dispatchers: [{ name: 'fake', module: INSIDE_ABS_PATH }],
+    });
+    assert.equal(loaded.length, 1, 'valid in-cwd module should load');
+    assert.equal(typeof loaded[0].create_task, 'function', 'loaded module must export create_task');
   });
 });

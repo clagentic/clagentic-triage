@@ -12,6 +12,7 @@
  */
 
 import { resolve, sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 // A bundled dispatcher name must be a plain, lowercase token. This bounds a
 // config-supplied `name` to a single file inside this directory: no slashes,
@@ -33,7 +34,11 @@ const BUNDLED_NAME_RE = /^[a-z][a-z0-9-]*$/;
  *
  * @param {string} modulePath - operator-supplied module field value
  * @param {string} [cwd]      - confinement root (default: process.cwd())
- * @returns {{ valid: true } | { valid: false, reason: string }}
+ * @returns {{ valid: true, resolvedPath: string|null } | { valid: false, reason: string }}
+ *   resolvedPath is the absolute filesystem path for relative/absolute inputs,
+ *   or null for bare npm specifiers (which are not filesystem paths).
+ *   Callers MUST import resolvedPath (as a file:// URL) rather than the raw
+ *   modulePath so the validated path and the loaded path are identical.
  */
 export function _validate_module_path(modulePath, cwd = process.cwd()) {
   if (typeof modulePath !== 'string') {
@@ -51,7 +56,7 @@ export function _validate_module_path(modulePath, cwd = process.cwd()) {
   if (!isRelative && !isAbsolute) {
     // Bare specifier (npm package, scoped package, data: URL, etc.) — not a
     // filesystem path, so path-traversal confinement does not apply.
-    return { valid: true };
+    return { valid: true, resolvedPath: null };
   }
 
   // For relative or absolute paths, resolve to an absolute path and verify
@@ -68,7 +73,10 @@ export function _validate_module_path(modulePath, cwd = process.cwd()) {
     };
   }
 
-  return { valid: true };
+  // Return the resolved absolute path so the caller imports exactly the file
+  // that was validated — not the raw specifier which ESM would resolve from a
+  // different base (the importing module's directory, not cwd).
+  return { valid: true, resolvedPath: resolved };
 }
 
 /**
@@ -104,7 +112,14 @@ async function resolveDispatcher(entry) {
       );
       return null;
     }
-    specifier = entry.module;
+    // Use the resolved absolute path (as a file:// URL) for filesystem specifiers
+    // so the path that was validated is exactly the path that is loaded. Using the
+    // raw entry.module would let ESM resolve it relative to this file's directory
+    // (src/dispatchers/), not cwd — making the confinement check meaningless for
+    // relative paths (Peaches finding #1, lr-9e79 review).
+    specifier = check.resolvedPath
+      ? pathToFileURL(check.resolvedPath).href
+      : entry.module;
   } else if (entry.name) {
     if (!BUNDLED_NAME_RE.test(entry.name)) {
       console.warn(
