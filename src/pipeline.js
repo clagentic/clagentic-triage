@@ -15,6 +15,7 @@ import { enrich } from './enricher.js';
 import { assess } from './assessor.js';
 import { route } from './router.js';
 import { enqueue } from './queue.js';
+import { dispatch } from './dispatchers/index.js';
 
 // ---------------------------------------------------------------------------
 // Dispatch execution
@@ -35,9 +36,10 @@ import { enqueue } from './queue.js';
  * @param {object} event       - Normalized Event
  * @param {object} assessment  - Assessment from assessor
  * @param {object} adapter     - Source adapter
- * @returns {Promise<{ action_taken: string | null, queue_reason: string | null }>}
+ * @returns {Promise<{ action_taken: string | null, queue_reason: string | null, dispatch_results: Array|null }>}
  *   action_taken is the action class that was executed, or null if deferred to queue.
  *   queue_reason is set for 'dispatch' and 'escalate' classes.
+ *   dispatch_results is set when the action class is 'dispatch' — per-dispatcher outcomes.
  */
 async function _executeAction(config, event, assessment, adapter) {
   const actionClass = assessment.suggested_action.class;
@@ -46,30 +48,33 @@ async function _executeAction(config, event, assessment, adapter) {
   switch (actionClass) {
     case 'respond':
       await adapter.post_comment(config, event, body);
-      return { action_taken: 'respond', queue_reason: null };
+      return { action_taken: 'respond', queue_reason: null, dispatch_results: null };
 
     case 'request_changes':
       await adapter.request_changes(config, event, body);
-      return { action_taken: 'request_changes', queue_reason: null };
+      return { action_taken: 'request_changes', queue_reason: null, dispatch_results: null };
 
     case 'approve':
       await adapter.approve_pr(config, event);
-      return { action_taken: 'approve', queue_reason: null };
+      return { action_taken: 'approve', queue_reason: null, dispatch_results: null };
 
     case 'close':
       await adapter.close_item(config, event);
-      return { action_taken: 'close', queue_reason: null };
+      return { action_taken: 'close', queue_reason: null, dispatch_results: null };
 
-    case 'dispatch':
-      // External dispatch is handled downstream; write to pending queue only.
-      return { action_taken: null, queue_reason: 'dispatch' };
+    case 'dispatch': {
+      // Fire all configured dispatchers. dispatch() handles per-dispatcher errors
+      // internally and never throws — failures are captured in the returned array.
+      const dispatchResults = await dispatch(config, event, assessment);
+      return { action_taken: null, queue_reason: 'dispatch', dispatch_results: dispatchResults };
+    }
 
     case 'escalate':
-      return { action_taken: null, queue_reason: 'escalate' };
+      return { action_taken: null, queue_reason: 'escalate', dispatch_results: null };
 
     default:
       // Unknown action class — treat as escalate.
-      return { action_taken: null, queue_reason: 'escalate' };
+      return { action_taken: null, queue_reason: 'escalate', dispatch_results: null };
   }
 }
 
@@ -162,7 +167,7 @@ export async function processEvent(config, event, adapter) {
     }
 
     // Stage 4: Dispatch — execute the adapter action.
-    const { action_taken, queue_reason: deferredQueueReason } = await _executeAction(
+    const { action_taken, queue_reason: deferredQueueReason, dispatch_results } = await _executeAction(
       config,
       event,
       assessment,
@@ -171,6 +176,8 @@ export async function processEvent(config, event, adapter) {
 
     // 'dispatch' and 'escalate' classes always land in the pending queue even
     // when they are in auto_approve — _executeAction returns no action_taken.
+    // For 'dispatch', _executeAction already fired the dispatchers; the queue
+    // entry records the per-dispatcher outcomes via dispatch_results.
     if (action_taken === null) {
       try {
         await _applyLabels(config, event, assessment, adapter, 'queued');
@@ -179,7 +186,7 @@ export async function processEvent(config, event, adapter) {
       }
 
       try {
-        await enqueue(config, { event: enrichedEvent, assessment, queue_reason: deferredQueueReason });
+        await enqueue(config, { event: enrichedEvent, assessment, queue_reason: deferredQueueReason, dispatch_results });
       } catch (queueErr) {
         console.warn(`[pipeline] enqueue failed for event ${eventId}: ${queueErr.message}`);
       }
@@ -190,6 +197,7 @@ export async function processEvent(config, event, adapter) {
         assessment,
         action_taken: null,
         queue_reason: deferredQueueReason,
+        dispatch_results: dispatch_results ?? null,
         dispatched_at: null,
         error: null,
       };

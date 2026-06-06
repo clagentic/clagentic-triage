@@ -93,12 +93,13 @@ async function writeLines(filePath, items) {
  *
  * @param {object} config
  * @param {object} opts
- * @param {object} opts.event          - EnrichedEvent
- * @param {object} opts.assessment     - Assessment
- * @param {string} opts.queue_reason   - 'awaiting_approval' | 'low_confidence' | 'dispatch' | 'escalate'
+ * @param {object} opts.event              - EnrichedEvent
+ * @param {object} opts.assessment         - Assessment
+ * @param {string} opts.queue_reason       - 'awaiting_approval' | 'low_confidence' | 'dispatch' | 'escalate'
+ * @param {Array|null} [opts.dispatch_results] - Per-dispatcher outcomes for 'dispatch'-class items
  * @returns {Promise<object>} The new queue item with id and queued_at filled in.
  */
-export async function enqueue(config, { event, assessment, queue_reason }) {
+export async function enqueue(config, { event, assessment, queue_reason, dispatch_results = null }) {
   const filePath = queuePath(config);
 
   const item = {
@@ -110,6 +111,7 @@ export async function enqueue(config, { event, assessment, queue_reason }) {
     status: 'pending',
     resolved_at: null,
     resolved_action: null,
+    dispatch_results,
   };
 
   await mkdir(dirname(filePath), { recursive: true });
@@ -153,11 +155,12 @@ export async function listItems(config, { status = ['pending'] } = {}) {
  * @param {object} opts
  * @param {string} opts.action                   - 'approved' | 'rejected' | 'overridden'
  * @param {string|null} [opts.resolved_action_class] - Used when action='overridden'; names the action class to execute
+ * @param {Array|null} [opts.dispatch_results]   - Per-dispatcher outcomes when action class is 'dispatch'
  * @returns {Promise<object>} The updated item.
  * @throws {QueueError} with code 'not_found' when the id is not in the queue.
  * @throws {QueueError} with code 'already_resolved' when the item is not in 'pending' status.
  */
-export async function resolveItem(config, id, { action, resolved_action_class = null }) {
+export async function resolveItem(config, id, { action, resolved_action_class = null, dispatch_results = null }) {
   const filePath = queuePath(config);
   const items = await readLines(filePath);
 
@@ -179,6 +182,7 @@ export async function resolveItem(config, id, { action, resolved_action_class = 
     status: action,
     resolved_at: new Date().toISOString(),
     resolved_action: resolved_action_class,
+    dispatch_results,
   };
 
   items[index] = updated;

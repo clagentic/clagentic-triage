@@ -24,6 +24,9 @@ export class ConfigError extends Error {
 
 const VALID_ADAPTERS = ['github', 'gitlab', 'forgejo'];
 const VALID_RUNNERS = ['claude-cli', 'anthropic-api', 'openai-compatible', 'clagentic-router'];
+
+// Dispatcher bundled names must be a simple lowercase token — no traversal chars.
+const DISPATCHER_BUNDLED_NAME_RE = /^[a-z][a-z0-9-]*$/;
 const VALID_AUTO_APPROVE_CLASSES = [
   'approve',
   'respond',
@@ -316,6 +319,39 @@ function validate(cfg) {
       'Set CLAGENTIC_TRIAGE_WEBHOOK_SECRET or webhooks.secret in your config. ' +
       'An unauthenticated webhook server is refused.',
     );
+  }
+
+  // Validate shape of each dispatchers entry. The dispatcher loader does
+  // resolution and module import at runtime; we only check structural
+  // correctness here so operators get early, clear feedback on bad config.
+  if (Array.isArray(cfg.dispatchers)) {
+    for (let i = 0; i < cfg.dispatchers.length; i++) {
+      const entry = cfg.dispatchers[i];
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new ConfigError(
+          `dispatchers[${i}] must be an object. Got: ${JSON.stringify(entry)}`,
+        );
+      }
+      const hasName = 'name' in entry;
+      const hasModule = 'module' in entry;
+      if (!hasName && !hasModule) {
+        throw new ConfigError(
+          `dispatchers[${i}] must have either a "name" or a "module" field.`,
+        );
+      }
+      if (hasName) {
+        if (typeof entry.name !== 'string' || !DISPATCHER_BUNDLED_NAME_RE.test(entry.name)) {
+          throw new ConfigError(
+            `dispatchers[${i}].name must be a string matching /^[a-z][a-z0-9-]*$/. Got: ${JSON.stringify(entry.name)}`,
+          );
+        }
+      }
+      if (hasModule && (typeof entry.module !== 'string' || entry.module.trim().length === 0)) {
+        throw new ConfigError(
+          `dispatchers[${i}].module must be a non-empty string. Got: ${JSON.stringify(entry.module)}`,
+        );
+      }
+    }
   }
 }
 
