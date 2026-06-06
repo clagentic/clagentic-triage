@@ -100,6 +100,13 @@ function defaults() {
     notifications: {
       webhooks: [],
     },
+    pre_filter: {
+      enabled: false,
+      runner: null,
+      model: null,
+      timeout_ms: null,
+      confidence_threshold: null,
+    },
   };
 }
 
@@ -349,6 +356,51 @@ function validate(cfg) {
       if (hasModule && (typeof entry.module !== 'string' || entry.module.trim().length === 0)) {
         throw new ConfigError(
           `dispatchers[${i}].module must be a non-empty string. Got: ${JSON.stringify(entry.module)}`,
+        );
+      }
+    }
+  }
+
+  // Validate pre_filter block if present.
+  if (cfg.pre_filter !== undefined && cfg.pre_filter !== null) {
+    const pf = cfg.pre_filter;
+
+    if (typeof pf.enabled !== 'boolean') {
+      throw new ConfigError(
+        `pre_filter.enabled must be a boolean. Got: ${JSON.stringify(pf.enabled)}`,
+      );
+    }
+
+    if (pf.runner !== null && pf.runner !== undefined) {
+      if (!VALID_RUNNERS.includes(pf.runner)) {
+        throw new ConfigError(
+          `pre_filter.runner must be one of: ${VALID_RUNNERS.join(', ')}. Got: ${pf.runner}`,
+        );
+      }
+    }
+
+    if (pf.model !== null && pf.model !== undefined && typeof pf.model !== 'string') {
+      throw new ConfigError(
+        `pre_filter.model must be a string or null. Got: ${JSON.stringify(pf.model)}`,
+      );
+    }
+
+    if (pf.timeout_ms !== null && pf.timeout_ms !== undefined) {
+      if (typeof pf.timeout_ms !== 'number' || pf.timeout_ms <= 0) {
+        throw new ConfigError(
+          `pre_filter.timeout_ms must be a positive number. Got: ${JSON.stringify(pf.timeout_ms)}`,
+        );
+      }
+    }
+
+    if (pf.confidence_threshold !== null && pf.confidence_threshold !== undefined) {
+      if (
+        typeof pf.confidence_threshold !== 'number' ||
+        pf.confidence_threshold < 0 ||
+        pf.confidence_threshold > 1
+      ) {
+        throw new ConfigError(
+          `pre_filter.confidence_threshold must be a number between 0 and 1. Got: ${JSON.stringify(pf.confidence_threshold)}`,
         );
       }
     }

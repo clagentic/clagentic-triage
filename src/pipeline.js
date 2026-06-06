@@ -13,6 +13,7 @@
 
 import { enrich } from './enricher.js';
 import { assess } from './assessor.js';
+import { preFilter, noiseAssessment } from './assessors/pre_filter.js';
 import { route } from './router.js';
 import { enqueue } from './queue.js';
 import { dispatch } from './dispatchers/index.js';
@@ -131,8 +132,21 @@ export async function processEvent(config, event, adapter) {
     // Stage 1: Enrich
     const enrichedEvent = await enrich(config, event, adapter);
 
-    // Stage 2: Assess
-    const assessment = await assess(config, enrichedEvent);
+    // Stage 1.5: Pre-filter (tier-1 cheap noise check, optional)
+    // Failures inside preFilter() degrade to pass-through — no extra handling needed here.
+    let assessment;
+    if (config.pre_filter?.enabled) {
+      const pfResult = await preFilter(config, enrichedEvent);
+      if (pfResult.noise === true) {
+        console.log(`[pipeline] pre-filter: noise detected — skipping main assessor (event=${eventId})`);
+        assessment = noiseAssessment(enrichedEvent, pfResult);
+      }
+    }
+
+    // Stage 2: Assess (skipped when pre-filter already produced an assessment)
+    if (!assessment) {
+      assessment = await assess(config, enrichedEvent);
+    }
 
     // Stage 3: Route — apply HITL gate (DD-001)
     const { should_dispatch, queue_reason } = route(config, assessment);

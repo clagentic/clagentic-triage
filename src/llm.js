@@ -531,6 +531,52 @@ function _validatePayload(payload) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Dispatch prompt to the selected runner backend and return the raw payload
+ * object WITHOUT schema validation. Used by callers (e.g. pre_filter.js) that
+ * expect a response format different from the standard assessment schema.
+ *
+ * The runner is selected in priority order:
+ *   1. opts.runner (explicit per-call override)
+ *   2. opts.config?.runner (from loaded config)
+ *   3. 'claude-cli' (built-in default)
+ *
+ * @param {string} prompt            - The full prompt text
+ * @param {object} [opts]
+ * @param {string} [opts.runner]     - Runner override
+ * @param {string} [opts.model]      - Model identifier
+ * @param {number} [opts.timeout_ms] - Timeout in milliseconds (default: 120000)
+ * @param {object} [opts.config]     - Full config object for runner-specific settings
+ * @returns {Promise<object|string>} - Raw parsed payload from the runner (no schema check)
+ * @throws {LlmError}                - On timeout, non-zero exit, or parse failure
+ */
+export async function callLlmRaw(prompt, opts = {}) {
+  const runner = opts.runner ?? opts.config?.runner ?? 'claude-cli';
+  const model = opts.model ?? opts.config?.model ?? null;
+  const timeoutMs = typeof opts.timeout_ms === 'number' ? opts.timeout_ms : DEFAULT_TIMEOUT_MS;
+  const config = opts.config ?? null;
+
+  switch (runner) {
+    case 'claude-cli':
+      return _runClaudeCli(prompt, model, timeoutMs);
+
+    case 'anthropic-api':
+      return _runAnthropicApi(prompt, model, timeoutMs, config);
+
+    case 'openai-compatible':
+      return _runOpenAiCompatible(prompt, model, timeoutMs, config);
+
+    case 'clagentic-router':
+      return _runClagenticRouter(prompt, model, timeoutMs, config);
+
+    default:
+      throw new LlmError(
+        `Unknown runner: "${runner}". Valid runners: ${VALID_RUNNERS.join(', ')}`,
+        'exit_nonzero',
+      );
+  }
+}
+
+/**
  * Call an LLM backend and return a validated assessment JSON payload.
  *
  * The runner is selected in priority order:
@@ -548,36 +594,6 @@ function _validatePayload(payload) {
  * @throws {LlmError}                - On timeout, non-zero exit, parse failure, or schema violation
  */
 export async function callLlm(prompt, opts = {}) {
-  const runner = opts.runner ?? opts.config?.runner ?? 'claude-cli';
-  const model = opts.model ?? opts.config?.model ?? null;
-  const timeoutMs = typeof opts.timeout_ms === 'number' ? opts.timeout_ms : DEFAULT_TIMEOUT_MS;
-  const config = opts.config ?? null;
-
-  let rawPayload;
-
-  switch (runner) {
-    case 'claude-cli':
-      rawPayload = await _runClaudeCli(prompt, model, timeoutMs);
-      break;
-
-    case 'anthropic-api':
-      rawPayload = await _runAnthropicApi(prompt, model, timeoutMs, config);
-      break;
-
-    case 'openai-compatible':
-      rawPayload = await _runOpenAiCompatible(prompt, model, timeoutMs, config);
-      break;
-
-    case 'clagentic-router':
-      rawPayload = await _runClagenticRouter(prompt, model, timeoutMs, config);
-      break;
-
-    default:
-      throw new LlmError(
-        `Unknown runner: "${runner}". Valid runners: ${VALID_RUNNERS.join(', ')}`,
-        'exit_nonzero',
-      );
-  }
-
+  const rawPayload = await callLlmRaw(prompt, opts);
   return _validatePayload(rawPayload);
 }
