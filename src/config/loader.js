@@ -174,9 +174,16 @@ function configFromEnv(env) {
     out.source.repos = splitCsv(env.CLAGENTIC_TRIAGE_REPOS);
   }
 
-  if (env.CLAGENTIC_TRIAGE_WATCH_ASSOCIATIONS !== undefined) {
-    out.source = out.source || {};
-    out.source.watch_associations = splitCsv(env.CLAGENTIC_TRIAGE_WATCH_ASSOCIATIONS);
+  // An empty value is treated as "unset" rather than "watch no associations".
+  // Clearing the external-only default via an empty env var would silently
+  // filter out every actor except those in watch_logins — a footgun. Operators
+  // who genuinely want association-based triage disabled set watch_logins.
+  if (env.CLAGENTIC_TRIAGE_WATCH_ASSOCIATIONS) {
+    const parsed = splitCsv(env.CLAGENTIC_TRIAGE_WATCH_ASSOCIATIONS);
+    if (parsed.length > 0) {
+      out.source = out.source || {};
+      out.source.watch_associations = parsed;
+    }
   }
 
   if (env.CLAGENTIC_TRIAGE_IGNORE_LOGINS !== undefined) {

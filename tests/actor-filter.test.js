@@ -163,6 +163,17 @@ describe('config — actor-filter defaults and validation', () => {
     assert.deepEqual(cfg.source.watch_logins, ['special-member']);
   });
 
+  test('empty CLAGENTIC_TRIAGE_WATCH_ASSOCIATIONS is treated as unset, not "watch nothing"', async () => {
+    const cfg = await loadIsolated({
+      env: { CLAGENTIC_TRIAGE_WATCH_ASSOCIATIONS: '' },
+    });
+    // An empty value must NOT clear the external default to [] (which would
+    // filter out every association-based actor) — it falls back to the default.
+    assert.deepEqual(cfg.source.watch_associations, [
+      'CONTRIBUTOR', 'FIRST_TIME_CONTRIBUTOR', 'FIRST_TIMER', 'NONE', 'MANNEQUIN',
+    ]);
+  });
+
   test('unknown association in watch_associations → ConfigError', async () => {
     await assert.rejects(
       () => loadIsolated({ configObj: { source: { watch_associations: ['MEMBER', 'BOGUS'] } } }),
@@ -228,6 +239,47 @@ describe('adapter — author_association captured in metadata', () => {
           author_association: 'MEMBER',
         },
         comment: { body: 'hi', user: { login: 'alice' } },
+      },
+    );
+    assert.equal(event.metadata.author_association, 'MEMBER');
+  });
+
+  it('pull_request_review uses the review author association when present', () => {
+    const event = normalize_webhook(
+      { 'x-github-event': 'pull_request_review' },
+      {
+        repository: { full_name: 'org/repo' },
+        pull_request: {
+          number: 9,
+          state: 'open',
+          labels: [],
+          user: { login: 'maintainer' },
+          author_association: 'OWNER',
+        },
+        review: {
+          body: 'LGTM',
+          user: { login: 'ext-reviewer' },
+          author_association: 'CONTRIBUTOR',
+        },
+      },
+    );
+    // The review author's own association takes precedence over the PR's.
+    assert.equal(event.metadata.author_association, 'CONTRIBUTOR');
+  });
+
+  it('pull_request_review carries through the parent PR association when the review lacks one', () => {
+    const event = normalize_webhook(
+      { 'x-github-event': 'pull_request_review' },
+      {
+        repository: { full_name: 'org/repo' },
+        pull_request: {
+          number: 10,
+          state: 'open',
+          labels: [],
+          user: { login: 'maintainer' },
+          author_association: 'MEMBER',
+        },
+        review: { body: 'changes', user: { login: 'maintainer' } },
       },
     );
     assert.equal(event.metadata.author_association, 'MEMBER');
