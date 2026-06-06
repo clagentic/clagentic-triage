@@ -14,6 +14,7 @@
 import { enrich } from './enricher.js';
 import { assess } from './assessor.js';
 import { route } from './router.js';
+import { enqueue } from './queue.js';
 
 // ---------------------------------------------------------------------------
 // Dispatch execution
@@ -141,6 +142,14 @@ export async function processEvent(config, event, adapter) {
         console.warn(`[pipeline] label_item failed for event ${eventId}: ${labelErr.message}`);
       }
 
+      try {
+        await enqueue(config, { event: enrichedEvent, assessment, queue_reason });
+      } catch (queueErr) {
+        // Queue write failure is non-fatal; log and continue so the event is
+        // still reflected in the returned result.
+        console.warn(`[pipeline] enqueue failed for event ${eventId}: ${queueErr.message}`);
+      }
+
       return {
         event_id: eventId,
         status: 'queued',
@@ -167,6 +176,12 @@ export async function processEvent(config, event, adapter) {
         await _applyLabels(config, event, assessment, adapter, 'queued');
       } catch (labelErr) {
         console.warn(`[pipeline] label_item failed for event ${eventId}: ${labelErr.message}`);
+      }
+
+      try {
+        await enqueue(config, { event: enrichedEvent, assessment, queue_reason: deferredQueueReason });
+      } catch (queueErr) {
+        console.warn(`[pipeline] enqueue failed for event ${eventId}: ${queueErr.message}`);
       }
 
       return {
