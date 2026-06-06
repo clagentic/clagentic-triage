@@ -161,15 +161,17 @@ export async function processEvent(config, event, adapter) {
         assessment,
         action_taken: null,
         queue_reason,
+        dispatch_results: null,
         dispatched_at: null,
         error: null,
       };
     }
 
     // Stage 4: Dispatch — execute the adapter action.
+    // Pass enrichedEvent so dispatchers receive the full context block (Peaches nit).
     const { action_taken, queue_reason: deferredQueueReason, dispatch_results } = await _executeAction(
       config,
-      event,
+      enrichedEvent,
       assessment,
       adapter,
     );
@@ -216,6 +218,7 @@ export async function processEvent(config, event, adapter) {
       assessment,
       action_taken,
       queue_reason: null,
+      dispatch_results: null,
       dispatched_at: new Date().toISOString(),
       error: null,
     };
@@ -227,6 +230,7 @@ export async function processEvent(config, event, adapter) {
       assessment: null,
       action_taken: null,
       queue_reason: null,
+      dispatch_results: null,
       dispatched_at: null,
       error: err.message ?? String(err),
     };
