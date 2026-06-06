@@ -227,14 +227,27 @@ test('8. config file is merged — env vars win over file values', async () => {
 test('8b. config file sets nested field — unset fields retain defaults', async () => {
   const cfg = await load({
     configObj: {
-      webhooks: { enabled: true, port: 9000 },
+      // A secret is required whenever webhooks.enabled is true (RT-004), so a
+      // valid enabled-webhook config must include one. This test proves that
+      // OTHER unset nested fields (bind, path) still fall back to defaults.
+      webhooks: { enabled: true, port: 9000, secret: 'test-secret' },
     },
   });
 
   assert.equal(cfg.webhooks.enabled, true);
   assert.equal(cfg.webhooks.port, 9000);
-  // secret was not in the file — must retain default
-  assert.equal(cfg.webhooks.secret, '');
+  assert.equal(cfg.webhooks.secret, 'test-secret');
+  // bind and path were not in the file — must retain defaults
+  assert.equal(cfg.webhooks.bind, '127.0.0.1');
+  assert.equal(cfg.webhooks.path, '/webhook');
+});
+
+test('8c. webhooks.enabled with empty secret is rejected (RT-004)', async () => {
+  await assert.rejects(
+    () => load({ configObj: { webhooks: { enabled: true, port: 9000 } } }),
+    (e) => e instanceof ConfigError && /secret is empty/.test(e.message),
+    'enabling webhooks without a secret must throw ConfigError',
+  );
 });
 
 // ---------------------------------------------------------------------------
