@@ -95,12 +95,39 @@ Optional integration hooks. Each hook exports:
 }
 ```
 
+## Module layout
+
+```
+src/
+  adapters/
+    github.js       # GitHub source adapter — poll + webhook interface
+    index.js        # Adapter registry / loader
+  config/
+    loader.js       # Config loader, env-var merging, schema validation
+    index.js        # Config module entry point
+  webhooks/
+    server.js       # Provider-agnostic inbound webhook server
+  assessor.js       # LLM assessment: enriched event + intent → verdict
+  enricher.js       # Context enrichment: intent file, repo context files
+  llm.js            # LLM runner dispatch (claude-cli / anthropic-api / openai-compatible / clagentic-router)
+  pipeline.js       # Pipeline orchestrator: event → enrich → assess → route → dispatch
+  queue.js          # Pending-queue read/write (JSONL)
+  router.js         # Verdict → action class mapping
+  yaml.js           # YAML parser wrapper
+  cli.js            # CLI entry point (clagentic-triage binary)
+  index.js          # Library entry point
+tests/
+docs/
+```
+
+Dispatchers, hooks, and additional backends are config-loaded external modules;
+no concrete backend implementations ship in-tree. Only generic reference dispatchers
+(`webhook`, `noop`) are planned as in-tree examples.
+
 ## Model selection
 
-The assessor respects `config.model`:
-- If set to a bare model string (e.g. `claude-sonnet-4-5`), it calls that model directly via `claude` CLI.
-- If set to `clagentic:router`, it delegates to the router service for chain selection.
-- Default: `clagentic:router` if the router is reachable, else falls back to the configured fallback model.
+The `config.runner` field selects the LLM backend; `config.model` is the model hint
+passed to that backend. See [CONFIG.md](CONFIG.md) for the full runner reference.
 
 ## Human-in-the-loop
 

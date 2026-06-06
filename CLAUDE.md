@@ -12,31 +12,6 @@ LLM-powered triage agent for GitHub issues and PRs. Watches an org or repo, asse
 - Dispatch hooks (console, webhooks, etc.) are optional and config-driven. The core pipeline runs cleanly with no hooks registered.
 - FSL-1.1-MIT license. See LICENSE.
 
-## Project Structure
-
-```
-src/
-  adapters/       # Source adapters: github.js, gitlab.js (interface: list_events, post_comment, etc.)
-  assessors/      # LLM assessment logic: intent-check, quality-check, routing
-  dispatchers/    # Generic reference dispatchers only: webhook.js, noop.js (concrete backends are config-loaded plugins, not in-tree)
-  hooks/          # Optional integration hooks (config-loaded), e.g. clagentic:console push
-  webhooks/       # Inbound webhook server for real-time events
-  config/         # Config schema, loader, validator
-tests/
-docs/
-  ARCHITECTURE.md
-  CONFIG.md
-  ADAPTERS.md
-  DISPATCHERS.md
-```
-
-## Key design decisions
-
-- Adapter interface (not finalized yet — see ARCHITECTURE.md)
-- Assessment pipeline: event → enrich → assess → route → dispatch
-- Human-in-the-loop by default: assessment produces a verdict + suggested action. Execution requires approval unless auto-mode is explicitly enabled per action type.
-- Dispatch hooks are declared in config as a list; each hook is a module that exports a standard interface.
-
 ## CLI Naming
 
 Follows the clagentic CLI Naming Standard (see the `clagentic-brand` repo at github.com/clagentic/brand).
@@ -44,3 +19,9 @@ Follows the clagentic CLI Naming Standard (see the `clagentic-brand` repo at git
 - **Binary:** `clagentic-triage`
 - **Env vars:** `CLAGENTIC_TRIAGE_*` prefix
 - **Config:** `~/.config/clagentic/triage/config.json`
+
+## Documentation
+
+Human-facing documentation lives in README.md (repo front door) and docs/ (detailed reference).
+
+CLAUDE.md is agent operating instructions only. It must not be used as repo documentation, duplicate content from README.md or docs/, or describe the project structure or design decisions.
