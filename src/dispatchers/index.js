@@ -11,22 +11,85 @@
  * See docs/DISPATCHERS.md for the dispatcher interface contract.
  */
 
+import { resolve, sep } from 'node:path';
+import { pathToFileURL } from 'node:url';
+
 // A bundled dispatcher name must be a plain, lowercase token. This bounds a
 // config-supplied `name` to a single file inside this directory: no slashes,
 // no dots, no leading hyphen, so it can never traverse out of ./ (RT-009).
 const BUNDLED_NAME_RE = /^[a-z][a-z0-9-]*$/;
 
 /**
+ * Validate an operator-supplied module path before dynamic import (RT-009).
+ *
+ * Three forms are accepted:
+ *   - Bare specifiers (npm package names, scoped packages, data: URLs, etc.) —
+ *     anything that does not start with `/`, `./`, or `../`. These resolve via
+ *     node_modules or are handled by the runtime, not the filesystem path
+ *     traversal machinery.
+ *   - Relative paths (`./...`, `../...`) — only if the resolved absolute path
+ *     remains within `cwd`. Paths that escape via `../` traversal are rejected.
+ *   - Absolute paths — only if they start with `cwd`. Absolute paths that point
+ *     outside `cwd` (e.g. `/etc/passwd`) are rejected.
+ *
+ * @param {string} modulePath - operator-supplied module field value
+ * @param {string} [cwd]      - confinement root (default: process.cwd())
+ * @returns {{ valid: true, resolvedPath: string|null } | { valid: false, reason: string }}
+ *   resolvedPath is the absolute filesystem path for relative/absolute inputs,
+ *   or null for bare npm specifiers (which are not filesystem paths).
+ *   Callers MUST import resolvedPath (as a file:// URL) rather than the raw
+ *   modulePath so the validated path and the loaded path are identical.
+ */
+export function _validate_module_path(modulePath, cwd = process.cwd()) {
+  if (typeof modulePath !== 'string') {
+    return { valid: false, reason: 'module path must be a string' };
+  }
+
+  // Null bytes are always rejected — they can truncate C-level path operations.
+  if (modulePath.includes('\0')) {
+    return { valid: false, reason: 'module path contains a null byte' };
+  }
+
+  const isRelative = modulePath.startsWith('./') || modulePath.startsWith('../');
+  const isAbsolute = modulePath.startsWith('/');
+
+  if (!isRelative && !isAbsolute) {
+    // Bare specifier (npm package, scoped package, data: URL, etc.) — not a
+    // filesystem path, so path-traversal confinement does not apply.
+    return { valid: true, resolvedPath: null };
+  }
+
+  // For relative or absolute paths, resolve to an absolute path and verify
+  // that the result is confined within cwd.
+  const resolved = resolve(cwd, modulePath);
+  // Append sep so that a cwd that is a prefix of another directory name does
+  // not accidentally pass (e.g. /tmp vs /tmp-evil).
+  const root = cwd.endsWith(sep) ? cwd : cwd + sep;
+
+  if (resolved !== cwd && !resolved.startsWith(root)) {
+    return {
+      valid: false,
+      reason: `module path resolves to "${resolved}" which is outside the project root "${cwd}"`,
+    };
+  }
+
+  // Return the resolved absolute path so the caller imports exactly the file
+  // that was validated — not the raw specifier which ESM would resolve from a
+  // different base (the importing module's directory, not cwd).
+  return { valid: true, resolvedPath: resolved };
+}
+
+/**
  * Resolve a single dispatchers config entry to a loaded module, or null.
  *
  * Resolution rules:
- *   - `module` set  -> dynamic-import that path as given (operator opt-in;
- *                      the operator is trusting that module).
+ *   - `module` set  -> validate path (RT-009), then dynamic-import.
  *   - `name` only   -> resolve a bundled dispatcher at ./<name>.js, after the
  *                      name passes BUNDLED_NAME_RE validation.
  *
- * Any failure (bad name, import error, missing create_task) logs a warning and
- * returns null so the caller can skip the entry without crashing the pipeline.
+ * Any failure (bad name, path validation, import error, missing create_task)
+ * logs a warning and returns null so the caller can skip the entry without
+ * crashing the pipeline.
  *
  * @param {object} entry - one element of config.dispatchers
  * @returns {Promise<object|null>} loaded dispatcher module, or null to skip
@@ -41,8 +104,22 @@ async function resolveDispatcher(entry) {
   let specifier;
 
   if (entry.module) {
-    // Operator-supplied module path: imported as given.
-    specifier = entry.module;
+    // Operator-supplied module path: validate before import (RT-009).
+    const check = _validate_module_path(entry.module);
+    if (!check.valid) {
+      console.warn(
+        `[dispatchers] skipping dispatcher "${label}": module path rejected — ${check.reason}`,
+      );
+      return null;
+    }
+    // Use the resolved absolute path (as a file:// URL) for filesystem specifiers
+    // so the path that was validated is exactly the path that is loaded. Using the
+    // raw entry.module would let ESM resolve it relative to this file's directory
+    // (src/dispatchers/), not cwd — making the confinement check meaningless for
+    // relative paths (Peaches finding #1, lr-9e79 review).
+    specifier = check.resolvedPath
+      ? pathToFileURL(check.resolvedPath).href
+      : entry.module;
   } else if (entry.name) {
     if (!BUNDLED_NAME_RE.test(entry.name)) {
       console.warn(
@@ -77,8 +154,9 @@ async function resolveDispatcher(entry) {
 /**
  * Load and validate all dispatchers declared in config.dispatchers.
  *
- * Entries that cannot be resolved (bad name, import failure, missing
- * create_task) are warned about and dropped. An empty or absent list yields [].
+ * Entries that cannot be resolved (bad name, path validation failure, import
+ * error, missing create_task) are warned about and dropped. An empty or absent
+ * list yields [].
  *
  * @param {object} config - loaded triage config
  * @returns {Promise<object[]>} resolved dispatcher modules, in config order
