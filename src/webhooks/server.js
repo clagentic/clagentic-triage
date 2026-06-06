@@ -36,7 +36,7 @@ import { createServer as _httpCreateServer } from 'node:http';
 /**
  * Maximum accepted request body size (bytes). The body is buffered into memory
  * before signature verification (verification needs the raw bytes), so an
- * unbounded body would be a pre-auth memory-exhaustion DoS. GitHub webhook
+ * unbounded body would be a pre-auth memory-exhaustion DoS. Typical webhook
  * payloads are well under 1 MB; cap generously at 5 MB and reject past it with
  * a 413 before the full body is buffered.
  */

@@ -26,6 +26,8 @@ import { createHmac } from 'node:crypto';
 
 import { createServer } from '../src/webhooks/server.js';
 import * as githubAdapter from '../src/adapters/github.js';
+import { loadAdapter } from '../src/cli.js';
+import { request as httpRequest } from 'node:http';
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -786,19 +788,24 @@ describe('adapter wiring contract', () => {
   const SECRET = 'test-secret';
   const WEBHOOK_METHODS = ['verify_webhook', 'get_delivery_id', 'normalize_webhook', 'is_bot_sender'];
 
-  it('github adapter module exports every webhook interface method', () => {
+  it('cli.loadAdapter produces an adapter with every webhook interface method', async () => {
+    // This drives the ACTUAL cli construction path. If cli.js reverts to a
+    // hand-picked subset that omits webhook methods, this fails — which is the
+    // regression this guards.
+    const adapter = await loadAdapter({ source: { adapter: 'github' } });
     for (const m of WEBHOOK_METHODS) {
       assert.equal(
-        typeof githubAdapter[m],
+        typeof adapter[m],
         'function',
-        `github adapter must export ${m}() for the webhook server`,
+        `cli.loadAdapter('github') must expose ${m}() for the webhook server`,
       );
     }
   });
 
-  it('a spread-module adapter (as cli builds it) serves a signed delivery end to end', async () => {
-    // Mirror cli.js exactly: spread the module into a plain object.
-    const adapter = { ...githubAdapter };
+  it('an adapter from cli.loadAdapter serves a signed delivery end to end', async () => {
+    // Use the real cli construction, not an inline spread, so the server is
+    // exercised against exactly what the running CLI would pass it.
+    const adapter = await loadAdapter({ source: { adapter: 'github' } });
     const config = makeConfig({ webhooks: { secret: SECRET, path: '/webhook' } });
 
     let received = null;
@@ -825,16 +832,62 @@ describe('adapter wiring contract', () => {
     }
   });
 
-  it('rejects an over-size body with 413 before verification', async () => {
+  it('rejects an over-size body (declared Content-Length) with a readable 413', async () => {
+    // fetch sets Content-Length, so this exercises the fast path: the cap is
+    // enforced before any body bytes are read and the client gets a clean 413.
     const adapter = { ...githubAdapter };
     const config = makeConfig({ webhooks: { secret: SECRET, path: '/webhook' } });
     const { server, port } = await startServer(config, adapter);
     try {
-      // 6 MB exceeds the 5 MB cap; no valid signature needed — it must be
-      // rejected before verification on size alone.
       const buf = Buffer.alloc(6 * 1024 * 1024, 0x61);
       const res = await sendWebhook(port, buf, { 'x-github-event': 'issues' });
       assert.equal(res.status, 413);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('bounds memory on a chunked over-size body with no Content-Length (streaming guard)', async () => {
+    // A chunked client without Content-Length bypasses the fast path. The
+    // streaming guard in readBody must stop accumulating and tear down the
+    // socket so memory stays bounded. The client sees a 413 OR a connection
+    // reset — either proves the body was not buffered unbounded. What must NOT
+    // happen is a 200/normal completion of a 6 MB upload.
+    const adapter = { ...githubAdapter };
+    const config = makeConfig({ webhooks: { secret: SECRET, path: '/webhook' } });
+    const { server, port } = await startServer(config, adapter);
+    try {
+      const outcome = await new Promise((resolve) => {
+        const req = httpRequest(
+          { host: '127.0.0.1', port, path: '/webhook', method: 'POST', headers: { 'x-github-event': 'issues' } },
+          (res) => {
+            res.resume();
+            res.on('end', () => resolve({ kind: 'status', status: res.statusCode }));
+          },
+        );
+        req.on('error', () => resolve({ kind: 'reset' }));
+        // Stream chunks past the cap without ever setting Content-Length
+        // (Node uses Transfer-Encoding: chunked when we write without a length).
+        const chunk = Buffer.alloc(512 * 1024, 0x61);
+        let written = 0;
+        const pump = () => {
+          while (written < 7 * 1024 * 1024) {
+            written += chunk.length;
+            if (!req.write(chunk)) {
+              req.once('drain', pump);
+              return;
+            }
+          }
+          req.end();
+        };
+        pump();
+      });
+
+      if (outcome.kind === 'status') {
+        assert.equal(outcome.status, 413, 'streaming over-size body should be rejected with 413');
+      } else {
+        assert.equal(outcome.kind, 'reset', 'socket reset is an acceptable bounded-memory outcome');
+      }
     } finally {
       await closeServer(server);
     }

@@ -7,6 +7,8 @@
  * env prefix is CLAGENTIC_TRIAGE_*, config at ~/.config/clagentic/triage/config.json.
  */
 
+import { argv } from 'node:process';
+import { fileURLToPath } from 'node:url';
 import { loadConfig, ConfigError } from './config/loader.js';
 import { listItems, resolveItem, QueueError } from './queue.js';
 import { runPipeline, processEvent } from './pipeline.js';
@@ -107,6 +109,28 @@ function formatItem(item) {
 }
 
 // ---------------------------------------------------------------------------
+// Adapter loading
+// ---------------------------------------------------------------------------
+
+/**
+ * Load the source adapter named by config and return it as a plain object.
+ *
+ * Spreads the full adapter module rather than cherry-picking methods. The
+ * webhook server needs the webhook interface (verify_webhook, get_delivery_id,
+ * normalize_webhook, is_bot_sender) in addition to the poll/action methods; a
+ * hand-maintained subset silently drifts from the adapter interface and leaves
+ * webhook methods undefined at runtime. Exported so the wiring contract can be
+ * tested without spawning the CLI.
+ *
+ * @param {object} config
+ * @returns {Promise<object>} the adapter (all named exports of the module)
+ */
+export async function loadAdapter(config) {
+  const adapterModule = await import(`./adapters/${config.source.adapter}.js`);
+  return { ...adapterModule };
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -115,13 +139,7 @@ async function cmdWatch(flags) {
   const intervalSec = flags.has('interval')
     ? parseInt(flags.get('interval'), 10)
     : (config.source?.poll_interval_seconds ?? 60);
-  // Spread the full adapter module rather than cherry-picking methods. The
-  // webhook server needs the webhook interface (verify_webhook, get_delivery_id,
-  // normalize_webhook, is_bot_sender) in addition to the poll/action methods;
-  // a hand-maintained subset silently drifts from the adapter interface and
-  // leaves webhook methods undefined at runtime.
-  const adapterModule = await import(`./adapters/${config.source.adapter}.js`);
-  const adapter = { ...adapterModule };
+  const adapter = await loadAdapter(config);
 
   let webhookServer = null;
 
@@ -148,7 +166,7 @@ async function cmdWatch(flags) {
 
   const tick = async () => {
     try {
-      const events = await adapterModule.list_events(config);
+      const events = await adapter.list_events(config);
       const { dispatched, queued, errors } = await runPipeline(config, events, adapter);
       out(
         `[clagentic-triage] cycle: dispatched=${dispatched.length} queued=${queued.length} errors=${errors.length}`,
@@ -175,10 +193,9 @@ async function cmdWatch(flags) {
 
 async function cmdRun(flags) {
   const config = await getConfig(flags);
-  const { list_events } = await import(`./adapters/${config.source.adapter}.js`);
-  const adapter = { list_events };
+  const adapter = await loadAdapter(config);
 
-  const events = await list_events(config);
+  const events = await adapter.list_events(config);
   const { dispatched, queued, errors } = await runPipeline(config, events, adapter);
 
   out(
@@ -343,4 +360,8 @@ async function main() {
   }
 }
 
-main();
+// Run only when invoked directly as the CLI entry point — not when imported
+// (e.g. by tests that exercise loadAdapter). argv[1] is the executed script.
+if (argv[1] && fileURLToPath(import.meta.url) === argv[1]) {
+  main();
+}
