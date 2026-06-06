@@ -27,6 +27,7 @@
  */
 
 import { callLlmRaw, LlmError } from '../llm.js';
+import { redact } from '../assessor.js';
 
 // ---------------------------------------------------------------------------
 // Config helpers
@@ -66,11 +67,11 @@ function _resolvePreFilterConfig(config) {
  * @returns {string}
  */
 function _buildPreFilterPrompt(enrichedEvent, model) {
-  // Minimal redaction: strip the most common injection markers. Full redaction
-  // runs in the main assessor (assessor.js) — repeating the full suite here
-  // would add latency for no pre-filter-specific benefit.
-  const title = (enrichedEvent.title ?? '').slice(0, 500).replace(/<\/UNTRUSTED_USER_CONTENT>/gi, '[redacted]');
-  const body = (enrichedEvent.body ?? '').slice(0, 1500).replace(/<\/UNTRUSTED_USER_CONTENT>/gi, '[redacted]');
+  // Apply full credential and injection-marker redaction (DD-004, RT-001) before
+  // embedding untrusted content in the prompt. The pre-filter is an independent
+  // LLM egress path and must sanitize inputs the same way the main assessor does.
+  const title = redact(enrichedEvent.title ?? '').slice(0, 500);
+  const body = redact(enrichedEvent.body ?? '').slice(0, 1500);
 
   return `You are a spam and noise classifier for a GitHub triage system.
 

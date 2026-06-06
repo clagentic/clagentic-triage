@@ -112,3 +112,5 @@ Set `pre_filter.model` to the cheapest model available on your runner. The pre-f
 `pre_filter.confidence_threshold` (default `0.8`) controls how certain the pre-filter must be before dropping an event. A high threshold minimizes false positives — uncertain calls pass through to the main assessor. Lower it only after reviewing pre-filter logs to confirm accuracy on your event stream.
 
 Events that fail the pre-filter receive a `reject` verdict with `pre_filter: true` in the assessment, making them identifiable in the pending queue.
+
+Note: `clagentic-router` is not compatible with `pre_filter.runner` — it expects the full assessment schema. Use a model runner (`claude-cli`, `anthropic-api`, `openai-compatible`) for tier-1 filtering.

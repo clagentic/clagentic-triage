@@ -116,7 +116,7 @@ async function resolveDispatcher(entry) {
     // so the path that was validated is exactly the path that is loaded. Using the
     // raw entry.module would let ESM resolve it relative to this file's directory
     // (src/dispatchers/), not cwd — making the confinement check meaningless for
-    // relative paths (Peaches finding #1, lr-9e79 review).
+    // relative paths.
     specifier = check.resolvedPath
       ? pathToFileURL(check.resolvedPath).href
       : entry.module;

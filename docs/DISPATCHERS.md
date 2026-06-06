@@ -134,3 +134,89 @@ The module must implement the interface above. This is the supported path for
 internal tools: keep the dispatcher in your own package, outside this repo, and
 load it by module path. The triage core stays generic and ships nothing
 backend-specific.
+
+## Building a dispatcher
+
+Use the scaffold at `src/dispatchers/scaffold.js` as your starting point. It
+contains the full interface with every field documented inline.
+
+### Steps
+
+**1. Copy the scaffold**
+
+```
+cp src/dispatchers/scaffold.js /path/to/my-pkg/src/my-backend.js
+```
+
+The scaffold is self-contained — no imports from clagentic:triage core are
+needed or expected.
+
+**2. Rename and implement**
+
+```js
+export const name = 'my-backend'; // must match config "name" key
+
+export async function create_task(config, event, assessment) {
+  const cfg = config?.dispatchers?.find((d) => d.name === name) ?? {};
+  // cfg holds your backend-specific keys (url, token_env, ...)
+  const token = process.env[cfg.token_env ?? 'MY_BACKEND_TOKEN'];
+
+  // Build your payload from structured fields — never include event.body
+  const res = await fetch(cfg.url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      title: `[triage] ${event.title ?? event.id}`,
+      source_url: event.url,
+      verdict: assessment.verdict,
+      confidence: assessment.confidence,
+      reasoning: assessment.reasoning,
+    }),
+  });
+  if (!res.ok) throw new Error(`backend returned ${res.status}`);
+  const data = await res.json();
+  return { id: String(data.id), url: data.url ?? null };
+}
+
+// Optional — omit if your backend has no update concept
+export async function update_task(config, task_id, patch) { }
+```
+
+**3. Register in config**
+
+```json
+{
+  "dispatchers": [
+    {
+      "name": "my-backend",
+      "module": "@myscope/triage-dispatcher-my-backend",
+      "url": "https://my-backend.example.com/api/tasks",
+      "token_env": "MY_BACKEND_TOKEN"
+    }
+  ]
+}
+```
+
+Any keys in the config entry beyond `name` and `module` are available to your
+dispatcher as `config.dispatchers.find(d => d.name === 'my-backend')`.
+
+**4. Test**
+
+Run `clagentic-triage run --dry-run` with `auto_approve: ["dispatch"]` in the
+top-level config. Check that `create_task` is called with the expected event
+shape and returns a `{ id, url }` object.
+
+### Event and assessment fields
+
+See the JSDoc in `src/dispatchers/scaffold.js` for the full field list with
+types and null behavior. The key constraint: **never include `event.body` in
+your backend payload**. The body is untrusted user content; only structured
+fields extracted by the pipeline (title, url, repo, verdict, confidence, etc.)
+are safe to forward.
+
+### Naming convention
+
+Published dispatcher packages should follow the pattern
+`@scope/triage-dispatcher-<backend>` so they are discoverable and consistent
+with the clagentic naming standard. The `name` export value should be
+`<backend>` without any scope or prefix.
