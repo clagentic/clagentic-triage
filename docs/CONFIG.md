@@ -1,9 +1,9 @@
 # clagentic:triage — Configuration Reference
 
 Configuration is loaded from (in priority order):
-1. Environment variables (prefix: `TRIAGE_`)
+1. Environment variables (prefix: `CLAGENTIC_TRIAGE_`)
 2. `triage.config.json` in the working directory
-3. `~/.config/clagentic-triage/config.json`
+3. `~/.config/clagentic/triage/config.json`
 
 ## Full config schema
 
@@ -15,7 +15,7 @@ Configuration is loaded from (in priority order):
     "repos": ["*"],
     "poll_interval_seconds": 60
   },
-  "intent_file": ".github/TRIAGE_INTENT.md",
+  "intent_file": ".github/CLAGENTIC_TRIAGE_INTENT.md",
   "model": "clagentic:router",
   "model_fallback": "claude-sonnet-4-5",
   "auto_approve": [],
@@ -53,7 +53,7 @@ The intent file (`intent_file`) is a Markdown file committed to each watched rep
 
 If no intent file is found, the assessor falls back to a generic intent (no spam, must include reproduction steps, etc.).
 
-Example `.github/TRIAGE_INTENT.md`:
+Example `.github/CLAGENTIC_TRIAGE_INTENT.md`:
 
 ```markdown
 # Triage Intent
@@ -80,10 +80,10 @@ Example `.github/TRIAGE_INTENT.md`:
 
 | Variable | Config key |
 |---|---|
-| `TRIAGE_ADAPTER` | `source.adapter` |
-| `TRIAGE_ORG` | `source.org` |
-| `TRIAGE_REPOS` | `source.repos` (comma-separated) |
-| `TRIAGE_MODEL` | `model` |
-| `TRIAGE_GITHUB_TOKEN` | GitHub PAT |
-| `TRIAGE_AUTO_APPROVE` | `auto_approve` (comma-separated) |
-| `TRIAGE_WEBHOOK_SECRET` | `webhooks.secret` |
+| `CLAGENTIC_TRIAGE_ADAPTER` | `source.adapter` |
+| `CLAGENTIC_TRIAGE_ORG` | `source.org` |
+| `CLAGENTIC_TRIAGE_REPOS` | `source.repos` (comma-separated) |
+| `CLAGENTIC_TRIAGE_MODEL` | `model` |
+| `CLAGENTIC_TRIAGE_GITHUB_TOKEN` | GitHub PAT |
+| `CLAGENTIC_TRIAGE_AUTO_APPROVE` | `auto_approve` (comma-separated) |
+| `CLAGENTIC_TRIAGE_WEBHOOK_SECRET` | `webhooks.secret` |

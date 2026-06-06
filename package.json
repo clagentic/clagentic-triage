@@ -5,7 +5,7 @@
   "type": "module",
   "main": "src/index.js",
   "bin": {
-    "triage": "src/cli.js"
+    "clagentic-triage": "src/cli.js"
   },
   "scripts": {
     "test": "node --test 'tests/**/*.test.js'"

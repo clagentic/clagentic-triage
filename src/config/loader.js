@@ -2,11 +2,11 @@
  * Config loader for clagentic:triage.
  *
  * Load order (highest priority first):
- *   1. Environment variables (TRIAGE_* prefix)
+ *   1. Environment variables (CLAGENTIC_TRIAGE_* prefix)
  *   2. triage.config.json in cwd
- *   3. ~/.config/clagentic-triage/config.json
+ *   3. ~/.config/clagentic/triage/config.json
  *
- * TRIAGE_GITHUB_TOKEN is never stored in the returned config object.
+ * CLAGENTIC_TRIAGE_GITHUB_TOKEN is never stored in the returned config object.
  * Access it via config.github_token() which reads the env var at call time.
  */
 
@@ -117,46 +117,46 @@ function splitCsv(value) {
 }
 
 /**
- * Build a partial config object from TRIAGE_* environment variables.
+ * Build a partial config object from CLAGENTIC_TRIAGE_* environment variables.
  * Only fields that are present in the env are included — absent vars do not
  * override file config with undefined values.
  */
 function configFromEnv(env) {
   const out = {};
 
-  if (env.TRIAGE_ADAPTER !== undefined) {
+  if (env.CLAGENTIC_TRIAGE_ADAPTER !== undefined) {
     out.source = out.source || {};
-    out.source.adapter = env.TRIAGE_ADAPTER;
+    out.source.adapter = env.CLAGENTIC_TRIAGE_ADAPTER;
   }
 
-  if (env.TRIAGE_ORG !== undefined) {
+  if (env.CLAGENTIC_TRIAGE_ORG !== undefined) {
     out.source = out.source || {};
-    out.source.org = env.TRIAGE_ORG;
+    out.source.org = env.CLAGENTIC_TRIAGE_ORG;
   }
 
-  if (env.TRIAGE_REPOS !== undefined) {
+  if (env.CLAGENTIC_TRIAGE_REPOS !== undefined) {
     out.source = out.source || {};
-    out.source.repos = splitCsv(env.TRIAGE_REPOS);
+    out.source.repos = splitCsv(env.CLAGENTIC_TRIAGE_REPOS);
   }
 
-  if (env.TRIAGE_MODEL !== undefined) {
-    out.model = env.TRIAGE_MODEL;
+  if (env.CLAGENTIC_TRIAGE_MODEL !== undefined) {
+    out.model = env.CLAGENTIC_TRIAGE_MODEL;
   }
 
-  if (env.TRIAGE_AUTO_APPROVE !== undefined) {
-    out.auto_approve = splitCsv(env.TRIAGE_AUTO_APPROVE);
+  if (env.CLAGENTIC_TRIAGE_AUTO_APPROVE !== undefined) {
+    out.auto_approve = splitCsv(env.CLAGENTIC_TRIAGE_AUTO_APPROVE);
   }
 
-  if (env.TRIAGE_WEBHOOK_SECRET !== undefined) {
+  if (env.CLAGENTIC_TRIAGE_WEBHOOK_SECRET !== undefined) {
     out.webhooks = out.webhooks || {};
-    out.webhooks.secret = env.TRIAGE_WEBHOOK_SECRET;
+    out.webhooks.secret = env.CLAGENTIC_TRIAGE_WEBHOOK_SECRET;
   }
 
-  if (env.TRIAGE_CONFIDENCE_THRESHOLD !== undefined) {
-    const parsed = parseFloat(env.TRIAGE_CONFIDENCE_THRESHOLD);
+  if (env.CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD !== undefined) {
+    const parsed = parseFloat(env.CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD);
     if (isNaN(parsed)) {
       throw new ConfigError(
-        `TRIAGE_CONFIDENCE_THRESHOLD must be a number, got: ${env.TRIAGE_CONFIDENCE_THRESHOLD}`,
+        `CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD must be a number, got: ${env.CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD}`,
       );
     }
     out.confidence_threshold = parsed;
@@ -215,7 +215,7 @@ export async function loadConfig(opts = {}) {
   const env = opts._env || process.env;
 
   // Layer 3 (lowest priority): user-level config file
-  const userConfigPath = join(homedir(), '.config', 'clagentic-triage', 'config.json');
+  const userConfigPath = join(homedir(), '.config', 'clagentic', 'triage', 'config.json');
   const userConfig = await tryReadJson(userConfigPath);
 
   // Layer 2: project-level config file
@@ -252,7 +252,7 @@ export async function loadConfig(opts = {}) {
   Object.defineProperty(merged, 'github_token', {
     enumerable: false,
     configurable: false,
-    value: () => env.TRIAGE_GITHUB_TOKEN || null,
+    value: () => env.CLAGENTIC_TRIAGE_GITHUB_TOKEN || null,
   });
 
   return merged;

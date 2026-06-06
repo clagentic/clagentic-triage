@@ -37,6 +37,21 @@ docs/
 - Human-in-the-loop by default: assessment produces a verdict + suggested action. Execution requires approval unless auto-mode is explicitly enabled per action type.
 - Dispatch hooks are declared in config as a list; each hook is a module that exports a standard interface.
 
+## CLI Naming
+
+This project follows the clagentic CLI Naming Standard:
+`clagentic-brand/docs/CLI-NAMING-STANDARD.md`
+
+Binary names, env vars, syslog identifiers, and config paths are governed by that doc.
+Violations are a review blocker.
+
+- **Tier:** 2 (builder tool — developer-facing, standalone, no Tier 1 dependency required)
+- **Binary:** `clagentic-triage`
+- **Env vars:** `CLAGENTIC_TRIAGE_*` prefix (not `TRIAGE_*`)
+- **Config:** `~/.config/clagentic/triage/config.json` (not `~/.config/clagentic-triage/`)
+- **GitHub topics:** `clagentic-tool` (Tier 2)
+- **No Forgejo remote** — GitHub only (`github.com/clagentic/triage`)
+
 ## LORE
 
 Project: `clagentic-triage`. Run `lore task list --project clagentic-triage` to see open work.

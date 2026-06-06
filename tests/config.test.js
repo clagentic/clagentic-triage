@@ -30,7 +30,7 @@ async function cleanup(dir) {
 }
 
 /**
- * Load config with a temp cwd and an isolated env that has no TRIAGE_* vars
+ * Load config with a temp cwd and an isolated env that has no CLAGENTIC_TRIAGE_* vars
  * unless the caller provides them.
  */
 async function load(opts = {}) {
@@ -86,11 +86,11 @@ test('1. default config loads with no files and no env vars', async () => {
 test('2. env vars override defaults', async () => {
   const cfg = await load({
     env: {
-      TRIAGE_ADAPTER: 'gitlab',
-      TRIAGE_ORG: 'my-org',
-      TRIAGE_MODEL: 'claude-opus-4',
-      TRIAGE_CONFIDENCE_THRESHOLD: '0.9',
-      TRIAGE_WEBHOOK_SECRET: 'hunter2',
+      CLAGENTIC_TRIAGE_ADAPTER: 'gitlab',
+      CLAGENTIC_TRIAGE_ORG: 'my-org',
+      CLAGENTIC_TRIAGE_MODEL: 'claude-opus-4',
+      CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD: '0.9',
+      CLAGENTIC_TRIAGE_WEBHOOK_SECRET: 'hunter2',
     },
   });
 
@@ -101,20 +101,20 @@ test('2. env vars override defaults', async () => {
   assert.equal(cfg.webhooks.secret, 'hunter2');
 });
 
-test('3. TRIAGE_REPOS comma-separated string → array', async () => {
+test('3. CLAGENTIC_TRIAGE_REPOS comma-separated string → array', async () => {
   const cfg = await load({
     env: {
-      TRIAGE_REPOS: 'repo-a, repo-b,  repo-c  ',
+      CLAGENTIC_TRIAGE_REPOS: 'repo-a, repo-b,  repo-c  ',
     },
   });
 
   assert.deepEqual(cfg.source.repos, ['repo-a', 'repo-b', 'repo-c']);
 });
 
-test('4. TRIAGE_AUTO_APPROVE comma-separated string → array', async () => {
+test('4. CLAGENTIC_TRIAGE_AUTO_APPROVE comma-separated string → array', async () => {
   const cfg = await load({
     env: {
-      TRIAGE_AUTO_APPROVE: 'approve,respond, close',
+      CLAGENTIC_TRIAGE_AUTO_APPROVE: 'approve,respond, close',
     },
   });
 
@@ -125,7 +125,7 @@ test('5. invalid adapter value throws ConfigError', async () => {
   await assert.rejects(
     () =>
       load({
-        env: { TRIAGE_ADAPTER: 'bitbucket' },
+        env: { CLAGENTIC_TRIAGE_ADAPTER: 'bitbucket' },
       }),
     (err) => {
       assert.ok(err instanceof ConfigError, `expected ConfigError, got ${err.constructor.name}`);
@@ -139,7 +139,7 @@ test('6. confidence_threshold out of range throws ConfigError', async () => {
   await assert.rejects(
     () =>
       load({
-        env: { TRIAGE_CONFIDENCE_THRESHOLD: '1.5' },
+        env: { CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD: '1.5' },
       }),
     (err) => {
       assert.ok(err instanceof ConfigError, `expected ConfigError, got ${err.constructor.name}`);
@@ -153,7 +153,7 @@ test('6b. confidence_threshold below 0 throws ConfigError', async () => {
   await assert.rejects(
     () =>
       load({
-        env: { TRIAGE_CONFIDENCE_THRESHOLD: '-0.1' },
+        env: { CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD: '-0.1' },
       }),
     (err) => {
       assert.ok(err instanceof ConfigError);
@@ -163,11 +163,11 @@ test('6b. confidence_threshold below 0 throws ConfigError', async () => {
 });
 
 test('7. github_token() reads from env at call time — not stored in config object', async () => {
-  const env = { TRIAGE_GITHUB_TOKEN: 'ghp_test_token_abc' };
+  const env = { CLAGENTIC_TRIAGE_GITHUB_TOKEN: 'ghp_test_token_abc' };
   const cfg = await load({ env });
 
   // Must not appear as an enumerable property on the config object
-  assert.ok(!Object.keys(cfg).includes('TRIAGE_GITHUB_TOKEN'), 'token must not be a direct key');
+  assert.ok(!Object.keys(cfg).includes('CLAGENTIC_TRIAGE_GITHUB_TOKEN'), 'token must not be a direct key');
   assert.ok(!Object.keys(cfg).includes('github_token_value'), 'token value must not be stored');
 
   // JSON serialization must not leak the token
@@ -192,8 +192,8 @@ test('8. config file is merged — env vars win over file values', async () => {
     const cfg = await load({
       cwd: dir,
       env: {
-        TRIAGE_ADAPTER: 'github', // overrides file's forgejo
-        TRIAGE_ORG: 'env-org',   // overrides file's file-org
+        CLAGENTIC_TRIAGE_ADAPTER: 'github', // overrides file's forgejo
+        CLAGENTIC_TRIAGE_ORG: 'env-org',   // overrides file's file-org
         // model intentionally not set — file value should win over default
       },
     });

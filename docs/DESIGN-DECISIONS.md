@@ -30,7 +30,7 @@ Auto-approve must be explicitly opted into, per action class, in config.
 }
 ```
 
-**Env var:** `TRIAGE_AUTO_APPROVE` (comma-separated action classes), `TRIAGE_CONFIDENCE_THRESHOLD`.
+**Env var:** `CLAGENTIC_TRIAGE_AUTO_APPROVE` (comma-separated action classes), `CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD`.
 
 ---
 
