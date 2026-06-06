@@ -247,6 +247,13 @@ async function _runAnthropicApi(prompt, model, timeoutMs, config) {
   const apiKeyEnv = config?.runner_api_key_env ?? 'ANTHROPIC_API_KEY';
   const apiKey = process.env[apiKeyEnv];
 
+  if (!apiKey) {
+    throw new LlmError(
+      `anthropic-api runner: API key not configured. Set the env var named by runner_api_key_env (default: ANTHROPIC_API_KEY).`,
+      'exit_nonzero',
+    );
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 

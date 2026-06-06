@@ -156,6 +156,10 @@ function configFromEnv(env) {
     out.runner_url = env.CLAGENTIC_TRIAGE_RUNNER_URL;
   }
 
+  if (env.CLAGENTIC_TRIAGE_RUNNER_API_KEY_ENV !== undefined) {
+    out.runner_api_key_env = env.CLAGENTIC_TRIAGE_RUNNER_API_KEY_ENV;
+  }
+
   if (env.CLAGENTIC_TRIAGE_AUTO_APPROVE !== undefined) {
     out.auto_approve = splitCsv(env.CLAGENTIC_TRIAGE_AUTO_APPROVE);
   }

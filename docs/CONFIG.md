@@ -192,6 +192,7 @@ a reverse proxy — the default bind address is `127.0.0.1`, not `0.0.0.0`.
 | `CLAGENTIC_TRIAGE_MODEL` | `model` | |
 | `CLAGENTIC_TRIAGE_RUNNER` | `runner` | `claude-cli`, `anthropic-api`, `openai-compatible`, `clagentic-router` |
 | `CLAGENTIC_TRIAGE_RUNNER_URL` | `runner_url` | Base URL for openai-compatible / clagentic-router |
+| `CLAGENTIC_TRIAGE_RUNNER_API_KEY_ENV` | `runner_api_key_env` | Name of the env var holding the API key (never the key itself) |
 | `CLAGENTIC_TRIAGE_GITHUB_TOKEN` | *(token getter)* | Never stored in config object |
 | `CLAGENTIC_TRIAGE_AUTO_APPROVE` | `auto_approve` | comma-separated |
 | `CLAGENTIC_TRIAGE_WEBHOOK_SECRET` | `webhooks.secret` | |

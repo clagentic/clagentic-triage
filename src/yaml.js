@@ -300,7 +300,7 @@ export function parseYaml(yaml) {
     return result;
   } catch (err) {
     // If parsing fails for any reason, return the raw input as a description.
-    console.warn(`[enricher] YAML parse error: ${err.message}`);
+    console.warn(`[yaml] YAML parse error: ${err.message}`);
     return { description: yaml };
   }
 }

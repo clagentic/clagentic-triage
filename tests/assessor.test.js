@@ -393,28 +393,32 @@ describe('assess() — degraded paths', () => {
 // ---------------------------------------------------------------------------
 
 describe('assess() — model selection', () => {
-  it('uses model_fallback when clagentic:router is unreachable (legacy path)', async () => {
-    // Override fetch so the health check fails.
-    globalThis._fetchBackup = globalThis.fetch;
-    globalThis.fetch = async () => {
-      throw new Error('connection refused');
-    };
-
-    const payload = validLlmPayload({ model_used: 'claude-haiku-3-5' });
+  it('passes config.model to the claude-cli runner and returns a valid assessment', async () => {
+    const payload = validLlmPayload({ model_used: 'claude-opus-4' });
     _setSpawnFn(makeSpawn({ stdout: cliEnvelope(payload), code: 0 }));
 
-    const config = makeConfig({
-      model: 'clagentic:router',
-      model_fallback: 'claude-haiku-3-5',
-    });
-
+    const config = makeConfig({ model: 'claude-opus-4', runner: 'claude-cli' });
     const result = await assess(config, makeEvent());
 
-    // We can't directly assert which --model flag was passed to the fake spawn,
-    // but the assessment should succeed and use the fallback (reported via model_used).
-    assert.equal(result.verdict, 'accept', 'should return valid assessment');
-    // The model_used in the payload matches the fallback.
-    assert.equal(result.model_used, 'claude-haiku-3-5');
+    assert.equal(result.verdict, 'accept');
+    assert.equal(result.model_used, 'claude-opus-4');
+  });
+
+  it('produces degraded assessment when anthropic-api runner has no API key configured', async () => {
+    // anthropic-api runner requires an API key env var — omitting it should
+    // throw LlmError and the assessor should degrade to escalate/confidence=0.
+    const prevKey = process.env.ANTHROPIC_API_KEY;
+    delete process.env.ANTHROPIC_API_KEY;
+
+    const config = makeConfig({ runner: 'anthropic-api', model: 'claude-opus-4' });
+    const result = await assess(config, makeEvent());
+
+    if (prevKey !== undefined) {
+      process.env.ANTHROPIC_API_KEY = prevKey;
+    }
+
+    assert.equal(result.verdict, 'escalate', 'missing API key → degraded escalate');
+    assert.equal(result.confidence, 0);
   });
 });
 
@@ -471,6 +475,8 @@ describe('callLlm() — anthropic-api runner', () => {
     let capturedBody = null;
     let capturedHeaders = null;
 
+    process.env.TEST_ANTHROPIC_KEY = 'test-key-for-unit-test';
+
     globalThis._fetchBackup = globalThis.fetch;
     globalThis.fetch = async (url, opts) => {
       capturedUrl = url;
@@ -499,6 +505,8 @@ describe('callLlm() — anthropic-api runner', () => {
   });
 
   it('throws LlmError with code exit_nonzero on non-200 response', async () => {
+    process.env.TEST_ANTHROPIC_KEY = 'test-key-for-unit-test';
+
     globalThis._fetchBackup = globalThis.fetch;
     globalThis.fetch = async () => ({
       ok: false,
@@ -508,7 +516,7 @@ describe('callLlm() — anthropic-api runner', () => {
     });
 
     await assert.rejects(
-      () => callLlm('test prompt', { runner: 'anthropic-api', config: {} }),
+      () => callLlm('test prompt', { runner: 'anthropic-api', config: { runner_api_key_env: 'TEST_ANTHROPIC_KEY' } }),
       (err) => {
         assert.ok(err instanceof LlmError, 'should be LlmError');
         assert.equal(err.code, 'exit_nonzero');
