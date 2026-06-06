@@ -69,18 +69,35 @@ triage_rules:
 
 ---
 
-## DD-003: LLM calls via `claude` CLI subprocess only
+## DD-003: LLM calls via `claude` CLI subprocess; multi-provider via clagentic:router
 
 **Decision:** All LLM calls go through the `claude` CLI as a child process.
 The `anthropic` SDK is not a dependency.
 
-**Rationale:** Workspace-wide rule. CLI is the default path. Marginal speed/cost wins do not
-justify an SDK dependency. Deviation requires explicit sign-off.
+**Rationale:** CLI is the default path. Marginal speed/cost wins do not justify an SDK
+dependency. Deviation requires explicit sign-off.
 
-**Implementation:** `src/llm.js` is a standalone utility that wraps the subprocess call,
-constructs the prompt, invokes `claude`, parses JSON from stdout, and validates the output
-schema. If output fails to parse or is missing required fields, `llm.js` returns an error
-result — it does not retry silently. The caller (assessor) routes parse errors to HITL.
+**Implementation:** `src/llm.js` wraps the subprocess call, constructs the prompt,
+invokes `claude`, parses JSON from stdout, and validates the output schema. If output
+fails to parse or is missing required fields, `llm.js` returns an error result — it
+does not retry silently. The caller (assessor) routes parse errors to HITL.
+
+**Model selection and provider support:**
+
+`config.model` controls which model is used:
+
+| Value | Behavior |
+|---|---|
+| `"clagentic:router"` | Delegates to the clagentic router service (`config.router_url`). The router handles multi-provider routing — it can use Claude, GPT-4o, Codex, Gemini, or any other configured backend. Falls back to `model_fallback` if router is unreachable. |
+| Any Claude model ID (e.g. `"claude-sonnet-4-5"`) | Passed directly as `--model` to the `claude` CLI. Requires `claude` CLI with that model available. |
+
+**For non-Claude models (GPT, Codex, Gemini, etc.):** set `model: "clagentic:router"` and
+configure the router to route to the desired provider. The router is the multi-provider
+abstraction layer — `src/llm.js` only speaks to the `claude` CLI directly.
+
+The `clagentic:router` is optional. Without it, set `model` to any valid Claude model ID
+and the tool works standalone. The router adds: multi-provider support, cost routing,
+fallback chains, and load balancing across models.
 
 ---
 
