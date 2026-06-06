@@ -10,9 +10,10 @@
 import { argv } from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, ConfigError } from './config/loader.js';
-import { listItems, resolveItem, QueueError } from './queue.js';
+import { listItems, readAll, resolveItem, QueueError } from './queue.js';
 import { runPipeline, processEvent } from './pipeline.js';
 import { startWebhookServer } from './webhooks/server.js';
+import { dispatch } from './dispatchers/index.js';
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -233,7 +234,19 @@ async function cmdApprove(args, flags) {
   }
 
   const config = await getConfig(flags);
-  const updated = await resolveItem(config, id, { action: 'approved' });
+
+  // Read the item before resolving so we can inspect its action class.
+  const all = await readAll(config);
+  const item = all.find((i) => i.id === id);
+
+  // Fire dispatchers when the assessment's suggested action class is 'dispatch'.
+  // dispatch() handles per-dispatcher errors internally — it never throws.
+  let dispatchResults = null;
+  if (item?.assessment?.suggested_action?.class === 'dispatch') {
+    dispatchResults = await dispatch(config, item.event, item.assessment);
+  }
+
+  const updated = await resolveItem(config, id, { action: 'approved', dispatch_results: dispatchResults });
   out(`Approved: ${updated.id}`);
 }
 
@@ -251,9 +264,23 @@ async function cmdOverride(args, flags) {
   }
 
   const config = await getConfig(flags);
+
+  // When the operator overrides to 'dispatch', run dispatchers before resolving
+  // so the results are recorded on the queue entry.
+  // dispatch() handles per-dispatcher errors internally — it never throws.
+  let dispatchResults = null;
+  if (actionClass === 'dispatch') {
+    const all = await readAll(config);
+    const item = all.find((i) => i.id === id);
+    if (item) {
+      dispatchResults = await dispatch(config, item.event, item.assessment);
+    }
+  }
+
   const updated = await resolveItem(config, id, {
     action: 'overridden',
     resolved_action_class: actionClass,
+    dispatch_results: dispatchResults,
   });
   out(`Overridden: ${updated.id} (action_class=${updated.resolved_action})`);
 }
