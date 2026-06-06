@@ -148,9 +148,10 @@ behind each security decision (DD-001 through DD-007).
 |---|---|
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Pipeline stages, module layout, interfaces |
 | [docs/CONFIG.md](docs/CONFIG.md) | Full config schema and environment variable reference |
+| [docs/GITHUB_APP.md](docs/GITHUB_APP.md) | GitHub integration: PAT vs GitHub App, setup, webhook ingress, reverse proxy |
 | [docs/ADAPTERS.md](docs/ADAPTERS.md) | Source adapter interface (poll + webhook), how to write one |
 | [docs/DISPATCHERS.md](docs/DISPATCHERS.md) | Dispatch backend interface, reference dispatchers, third-party plugins |
-| [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) | DD-001..DD-007 rationale and security decisions |
+| [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) | DD-001..DD-008 rationale and security decisions |
 
 ## License
 
