@@ -342,3 +342,50 @@ operator's `process.cwd()` — effectively the project directory.
 **Scope note:** The hook module loader (`config.hooks`) is not yet implemented. When it is,
 the same guard (`_validate_module_path` + import-from-resolvedPath) must be applied there.
 This is noted in `src/cli.js` where hook loading will be wired.
+
+---
+
+## DD-011: Two-tier LLM assessment — cheap pre-filter before full assessor
+
+**Decision:** An optional tier-1 pre-filter (`src/assessors/pre_filter.js`) runs before the
+main assessor. It classifies events as `NOISE` or `REAL` using a short binary-classification
+prompt. Noise events are rejected immediately without calling the main assessor. The pre-filter
+is opt-in (`pre_filter.enabled: false` by default) and uses a separate `runner`/`model` config
+so it can be routed to a cheap model independently of the main assessment model.
+
+**Rationale:**
+- Full assessment prompts are large (intent context, contributor profile, structured schema,
+  chain-of-thought instruction). Running them on spam, gibberish, or auto-generated dependency
+  bumps wastes tokens and adds latency with no triage value.
+- A cheap model (Haiku, GPT-4o-mini, Gemini Flash) can reliably classify obvious noise at a
+  fraction of the cost. The main assessor only runs on events that passed the filter.
+- Pre-filter is opt-in because false positives (dropping a real event as noise) are worse than
+  false negatives (letting noise reach the main assessor). Operators enable it once they have
+  confidence in the threshold for their event stream.
+
+**Failure behavior:**
+- Any pre-filter failure (LLM error, parse error, timeout, model unavailable) degrades silently
+  to pass-through: `noise: false`. The main assessor runs as if the pre-filter did not exist.
+  Pre-filter failures are logged as warnings but are never fatal to the pipeline.
+- Confidence below `pre_filter.confidence_threshold` (default 0.8) also passes through. The
+  threshold is intentionally high: uncertain classifications pass, certain classifications gate.
+
+**Security:**
+- The pre-filter applies the full `redact()` suite (DD-004 credential patterns + RT-001
+  injection markers) before prompt construction, identical to the main assessor. It is a new
+  LLM egress path and must be treated as such.
+- Pre-filter body input is capped at 1500 characters; title at 500. The full body is available
+  to the main assessor if the event passes through.
+
+**Implementation:**
+- `preFilter(config, enrichedEvent)` in `src/assessors/pre_filter.js`. Returns
+  `{ noise, reason, confidence, model_used }`.
+- `noiseAssessment(enrichedEvent, preFilterResult)` builds a uniform Assessment (verdict:
+  `reject`, action: `close`, `pre_filter: true`) for events flagged as noise.
+- Pipeline wiring in `src/pipeline.js`: after `enrich()`, before `assess()`. Controlled by
+  `config.pre_filter.enabled`.
+- Config block: `pre_filter.{ enabled, runner, model, timeout_ms, confidence_threshold }`.
+  `runner` and `model` fall back to the main runner/model if unset.
+- `clagentic-router` is not compatible as a `pre_filter.runner` — the router endpoint expects
+  the full assessment schema, not the binary `NOISE|REAL` response. Use a direct model runner
+  for tier-1 filtering.

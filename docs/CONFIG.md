@@ -147,6 +147,35 @@ approval carries real consequences on live repos. See DD-001 and DD-002 in
 Default: `false`. When `true`, labels suggested by the LLM are applied to
 queued items immediately (without waiting for human approval of the full action).
 
+### `pre_filter`
+
+Optional tier-1 cheap LLM pass that classifies events as noise or real before
+running the full assessor. Off by default. See DD-011 in `docs/DESIGN-DECISIONS.md`
+and `docs/SPAM_PROTECTION.md` for when and how to enable it.
+
+```json
+{
+  "pre_filter": {
+    "enabled": false,
+    "runner": "claude-cli",
+    "model": "claude-haiku-4-5",
+    "timeout_ms": 15000,
+    "confidence_threshold": 0.8
+  }
+}
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `enabled` | `false` | Enable the pre-filter. Off by default — enable once you have confidence in the threshold for your event stream. |
+| `runner` | main `runner` | Runner to use for tier-1 calls. Route to a cheap model here. `clagentic-router` is not compatible — use a direct runner. |
+| `model` | main `model` | Model for tier-1 calls. |
+| `timeout_ms` | main `llm_timeout_ms` | Timeout for pre-filter calls. |
+| `confidence_threshold` | `0.8` | Minimum confidence to drop an event as noise. Below this threshold the event passes through to the main assessor. Intentionally high — uncertain classifications pass. |
+
+Pre-filter failures (LLM error, parse error, timeout) always degrade to pass-through.
+A failing pre-filter never blocks the pipeline.
+
 ## Intent file
 
 The primary intent file is a YAML file committed to each watched repo at
