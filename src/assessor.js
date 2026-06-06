@@ -81,7 +81,10 @@ export function redact(text) {
 // Router health check
 // ---------------------------------------------------------------------------
 
-const ROUTER_HEALTH_URL = 'http://localhost:4200/health';
+// Router URL is config-driven: config.router_url, defaulting to localhost:4200.
+// Never hardcode a specific host in business logic — operators may run the
+// router on a different address. The constant below is the fallback default only.
+const ROUTER_HEALTH_URL_DEFAULT = 'http://localhost:4200/health';
 const ROUTER_HEALTH_TIMEOUT_MS = 500;
 
 /**
@@ -91,11 +94,14 @@ const ROUTER_HEALTH_TIMEOUT_MS = 500;
  *
  * @returns {Promise<boolean>}
  */
-async function _routerReachable() {
+async function _routerReachable(config) {
+  const healthUrl = config?.router_url
+    ? `${config.router_url.replace(/\/$/, '')}/health`
+    : ROUTER_HEALTH_URL_DEFAULT;
   try {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ROUTER_HEALTH_TIMEOUT_MS);
-    const res = await globalThis.fetch(ROUTER_HEALTH_URL, {
+    const res = await globalThis.fetch(healthUrl, {
       signal: controller.signal,
     });
     clearTimeout(timer);
@@ -120,7 +126,7 @@ async function _resolveModel(config) {
   const model = config.model;
 
   if (model === 'clagentic:router') {
-    const reachable = await _routerReachable();
+    const reachable = await _routerReachable(config);
     if (reachable) {
       return 'clagentic:router';
     }

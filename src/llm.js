@@ -66,7 +66,7 @@ export function _setSpawnFn(fn) {
 export class LlmError extends Error {
   /**
    * @param {string} message
-   * @param {'parse_error'|'timeout'|'exit_nonzero'|'missing_fields'|null} [code]
+   * @param {'parse_error'|'timeout'|'exit_nonzero'|'missing_fields'|'bad_response'|null} [code]
    */
   constructor(message, code) {
     super(message);

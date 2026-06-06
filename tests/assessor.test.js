@@ -342,6 +342,50 @@ describe('assess() — degraded paths', () => {
     assert.equal(result.confidence, 0);
     assert.equal(result.suggested_action.class, 'escalate');
   });
+
+  // RT-007: strict schema validation — bad_response code paths
+  it('returns degraded Assessment when verdict is not a valid enum value (RT-007)', async () => {
+    const bad = validLlmPayload({ verdict: 'approve_everything' });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(bad), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent());
+
+    assert.equal(result.verdict, 'escalate', 'invalid verdict → degraded escalate');
+    assert.equal(result.confidence, 0);
+  });
+
+  it('returns degraded Assessment when confidence is a string, not a number (RT-007)', async () => {
+    // String "1.0" bypasses numeric comparison — must be caught as bad_response
+    const bad = validLlmPayload({ confidence: '1.0' });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(bad), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent());
+
+    assert.equal(result.verdict, 'escalate', 'string confidence → degraded escalate');
+    assert.equal(result.confidence, 0);
+  });
+
+  it('returns degraded Assessment when confidence is out of range (RT-007)', async () => {
+    const bad = validLlmPayload({ confidence: 1.5 });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(bad), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent());
+
+    assert.equal(result.verdict, 'escalate', 'out-of-range confidence → degraded escalate');
+    assert.equal(result.confidence, 0);
+  });
+
+  it('returns degraded Assessment when suggested_action.class is not a valid enum (RT-007)', async () => {
+    const bad = validLlmPayload({
+      suggested_action: { class: 'do_everything', body: null, dispatch_target: null, labels: [] },
+    });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(bad), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent());
+
+    assert.equal(result.verdict, 'escalate', 'invalid action class → degraded escalate');
+    assert.equal(result.confidence, 0);
+  });
 });
 
 // ---------------------------------------------------------------------------

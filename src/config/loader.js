@@ -49,6 +49,7 @@ function defaults() {
     intent_file_fallback: '.github/TRIAGE_INTENT.md',
     model: 'clagentic:router',
     model_fallback: 'claude-sonnet-4-5',
+    router_url: 'http://localhost:4200',  // clagentic:router base URL; override if running on non-default host/port
     confidence_threshold: 0.7,
     auto_approve: [],
     allow_auto_pr_approval: false,  // RT-002: explicit opt-in required before approve class works
