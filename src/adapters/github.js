@@ -145,6 +145,7 @@ async function _fetchPaginated(url, token, cacheKey) {
   const items = [];
   let nextUrl = url;
   let firstPage = true;
+  let pendingEtag = null;
 
   while (nextUrl && items.length < PER_REPO_SAFETY_CAP) {
     // Only send ETag on first page of a paginated series, and only if not expired.
@@ -190,13 +191,14 @@ async function _fetchPaginated(url, token, cacheKey) {
       return { items: [], status: res.status };
     }
 
-    // Capture ETag from first page for next call
+    // Capture ETag from first page. We do NOT write the cache entry here —
+    // the caller writes it only after normalization succeeds, so a 304 replay
+    // can never return a stale empty result from a partially-written entry.
+    // The etag is threaded back via the return value's pendingEtag field.
     if (firstPage && cacheKey) {
       const newEtag = res.headers.get('ETag');
       if (newEtag) {
-        // Placeholder result — updated after we collect all pages.
-        // cached_at records when the entry was written for TTL enforcement.
-        _etagCache.set(cacheKey, { etag: newEtag, result: [], cached_at: Date.now() });
+        pendingEtag = newEtag;
       }
     }
 
@@ -210,7 +212,7 @@ async function _fetchPaginated(url, token, cacheKey) {
     firstPage = false;
   }
 
-  return { items, status: 200 };
+  return { items, status: 200, pendingEtag };
 }
 
 // ---------------------------------------------------------------------------
@@ -440,11 +442,16 @@ export async function list_events(config, since) {
         normalized.push(_normalize(raw, repo));
       }
 
-      // Persist normalized events into the ETag cache entry so a subsequent
-      // 304 can return them without re-normalizing.
-      const cached = _etagCache.get(cacheKey);
-      if (cached) {
-        cached.result = normalized;
+      // Persist normalized events into the ETag cache so a subsequent 304 can
+      // replay them without re-normalizing. The entry is written here — after
+      // normalization succeeds — not inside _fetchPaginated, so the cache never
+      // contains a stale empty result from a partially-processed fetch.
+      if (result.pendingEtag) {
+        _etagCache.set(cacheKey, {
+          etag: result.pendingEtag,
+          result: normalized,
+          cached_at: Date.now(),
+        });
       }
 
       events.push(...normalized);
