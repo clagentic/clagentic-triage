@@ -768,3 +768,78 @@ export function actor_allowed(config, event) {
     author_association: event.metadata?.author_association ?? null,
   });
 }
+
+// ---------------------------------------------------------------------------
+// check_token_scopes (RT-006)
+// ---------------------------------------------------------------------------
+
+/**
+ * Scopes that indicate a classic PAT is over-privileged for triage use.
+ * Fine-grained tokens don't return x-oauth-scopes and are already scoped by
+ * construction — they need no check here.
+ */
+const BROAD_SCOPES = new Set([
+  'repo',
+  'admin:org',
+  'delete_repo',
+  'write:packages',
+  'admin:repo_hook',
+]);
+
+/**
+ * Check whether the configured GitHub token carries overly broad OAuth scopes.
+ *
+ * Uses the GitHub root endpoint (GET https://api.github.com/) which returns
+ * `x-oauth-scopes` in the response headers without consuming any rate-limit
+ * budget. Fine-grained PATs do not return this header — their absence signals
+ * that the token is already repository-scoped, so no warning is warranted.
+ *
+ * This function never throws. All error conditions are returned as
+ * `{ ok: false, error: string }` so a scope-check failure cannot block startup.
+ *
+ * @param {object} config - Loaded triage config (must expose github_token())
+ * @returns {Promise<
+ *   | { ok: true, type: 'fine-grained', scopes: null }
+ *   | { ok: true, type: 'classic', scopes: string[], warned: boolean }
+ *   | { ok: false, error: string }
+ * >}
+ */
+export async function check_token_scopes(config) {
+  const token = config.github_token();
+  if (!token) {
+    return { ok: false, error: 'no token configured' };
+  }
+
+  try {
+    const res = await globalThis.fetch(`${GITHUB_API}/`, {
+      headers: _headers(token),
+    });
+
+    const scopeHeader = res.headers.get('x-oauth-scopes');
+
+    // Fine-grained PATs do not set x-oauth-scopes. Treat absence as
+    // already-scoped — no warning needed.
+    if (scopeHeader === null) {
+      return { ok: true, type: 'fine-grained', scopes: null };
+    }
+
+    // Classic token: parse the comma-separated scope list.
+    const scopes = scopeHeader
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const broadFound = scopes.filter((s) => BROAD_SCOPES.has(s));
+    const warned = broadFound.length > 0;
+
+    if (warned) {
+      process.stderr.write(
+        `[clagentic:triage] WARNING: GitHub token has broad scope(s): ${broadFound.join(', ')}. Consider using a fine-grained token scoped to specific repos. See docs/GITHUB_APP.md.\n`,
+      );
+    }
+
+    return { ok: true, type: 'classic', scopes, warned };
+  } catch (err) {
+    return { ok: false, error: err.message ?? String(err) };
+  }
+}

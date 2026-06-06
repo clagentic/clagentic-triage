@@ -14,6 +14,7 @@ import { listItems, readAll, resolveItem, QueueError } from './queue.js';
 import { runPipeline, processEvent } from './pipeline.js';
 import { startWebhookServer } from './webhooks/server.js';
 import { dispatch } from './dispatchers/index.js';
+import { check_token_scopes } from './adapters/github.js';
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -137,6 +138,13 @@ export async function loadAdapter(config) {
 
 async function cmdWatch(flags) {
   const config = await getConfig(flags);
+
+  // RT-006: warn on over-privileged tokens before entering the loop.
+  const scopeResult = await check_token_scopes(config);
+  if (!scopeResult.ok) {
+    err(`[clagentic:triage] WARNING: Could not verify GitHub token scopes: ${scopeResult.error}`);
+  }
+
   const intervalSec = flags.has('interval')
     ? parseInt(flags.get('interval'), 10)
     : (config.source?.poll_interval_seconds ?? 60);
@@ -194,6 +202,13 @@ async function cmdWatch(flags) {
 
 async function cmdRun(flags) {
   const config = await getConfig(flags);
+
+  // RT-006: warn on over-privileged tokens before the run pass.
+  const scopeResult = await check_token_scopes(config);
+  if (!scopeResult.ok) {
+    err(`[clagentic:triage] WARNING: Could not verify GitHub token scopes: ${scopeResult.error}`);
+  }
+
   const adapter = await loadAdapter(config);
 
   const events = await adapter.list_events(config);
