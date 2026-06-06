@@ -45,6 +45,34 @@ changing core code.
 Each entry names a dispatcher and carries its own backend-specific config keys.
 The pipeline runs cleanly with an empty `dispatchers` list (no dispatch).
 
+## How dispatchers are resolved
+
+The loader (`src/dispatchers/index.js`) walks the `dispatchers` list and
+resolves each entry to a module:
+
+- **`module` set** — the value is dynamic-imported as given. This is the path
+  for third-party and private backends. Resolution is whatever Node's module
+  resolver does for that specifier (package name, absolute path, file URL). The
+  operator is trusting that module; the core does not sandbox it.
+- **`name` only** — resolves a bundled reference dispatcher at
+  `./<name>.js` inside the dispatchers directory. The name is validated against
+  `^[a-z][a-z0-9-]*$` first: a name containing slashes, dots, a leading hyphen,
+  uppercase, or any path-traversal sequence is rejected and the entry is
+  skipped. A config-supplied `name` can therefore never escape the dispatchers
+  directory. To load anything that is not a bundled dispatcher, use `module`.
+
+A dispatcher that fails to import, or that loads but does not export a
+`create_task` function, is logged as a warning and skipped — it never crashes
+the loader. The loader returns the resolved modules in config order.
+
+## Running dispatchers
+
+`dispatch(config, event, assessment)` loads the configured dispatchers and runs
+`create_task` on each. Dispatchers are isolated from one another: it returns one
+entry per dispatcher, either `{ name, result }` on success or `{ name, error }`
+on failure, so a single throwing dispatcher does not stop the others. With an
+empty `dispatchers` list it is a clean no-op returning `[]`.
+
 ## Reference dispatchers
 
 clagentic:triage ships a small set of generic reference dispatchers. They are
@@ -54,7 +82,7 @@ first-class once you point config at its module.
 | Dispatcher | Status  | Notes                                   |
 |---|---|---|
 | `webhook`  | planned | Generic outbound HTTP POST              |
-| `noop`     | planned | Logs only — useful for dry-run          |
+| `noop`     | shipped | Logs only — dry-run; copy as a template |
 
 Common ticketing backends (Jira, Linear, GitHub Issues, etc.) are implemented
 as dispatchers using the same interface; see each integration's own
