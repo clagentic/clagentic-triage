@@ -114,11 +114,24 @@ test('3. CLAGENTIC_TRIAGE_REPOS comma-separated string → array', async () => {
 test('4. CLAGENTIC_TRIAGE_AUTO_APPROVE comma-separated string → array', async () => {
   const cfg = await load({
     env: {
-      CLAGENTIC_TRIAGE_AUTO_APPROVE: 'approve,respond, close',
+      // RT-002: 'approve' requires allow_auto_pr_approval:true — use safer classes here
+      CLAGENTIC_TRIAGE_AUTO_APPROVE: 'respond, close',
     },
   });
 
-  assert.deepEqual(cfg.auto_approve, ['approve', 'respond', 'close']);
+  assert.deepEqual(cfg.auto_approve, ['respond', 'close']);
+});
+
+test('4b. auto_approve with approve class requires allow_auto_pr_approval (RT-002)', async () => {
+  // Without allow_auto_pr_approval, including 'approve' must throw ConfigError
+  await assert.rejects(
+    () => load({ env: { CLAGENTIC_TRIAGE_AUTO_APPROVE: 'approve' } }),
+    (err) => {
+      assert.ok(err instanceof ConfigError, 'should be ConfigError');
+      assert.ok(err.message.includes('allow_auto_pr_approval'), 'should mention the guard key');
+      return true;
+    },
+  );
 });
 
 test('5. invalid adapter value throws ConfigError', async () => {

@@ -236,17 +236,19 @@ describe('enrich', () => {
   // -------------------------------------------------------------------------
 
   it('fetches repo_context_files and injects them into _resolved_files', async () => {
+    // RT-005: only .md/.yml/.json etc. are allowed — CODEOWNERS (no ext) is now
+    // blocked by the extension allowlist. Use two .md files instead.
     const yamlContent = [
       'repo_context_files:',
       '  - path: CONTRIBUTING.md',
-      '  - path: .github/CODEOWNERS',
+      '  - path: docs/GUIDELINES.md',
       'triage_rules:',
       '  - id: default',
       '    description: Rules.',
     ].join('\n');
 
     const contributingContent = '# Contributing\nPlease read this.';
-    const codeownersContent = '* @org/maintainers';
+    const guidelinesContent = '# Guidelines\nBe respectful.';
 
     mockUrl(
       '/repos/owner/repo/contents/.github/triage-intent.yml',
@@ -257,8 +259,8 @@ describe('enrich', () => {
       contentsResponse(contributingContent),
     );
     mockUrl(
-      '/repos/owner/repo/contents/.github/CODEOWNERS',
-      contentsResponse(codeownersContent),
+      '/repos/owner/repo/contents/docs/GUIDELINES.md',
+      contentsResponse(guidelinesContent),
     );
     mockUrl('/users/testuser', { login: 'testuser', name: null, public_repos: 0, followers: 0, created_at: null, company: null, bio: null });
 
@@ -269,10 +271,7 @@ describe('enrich', () => {
     assert.equal(enriched.context.intent._source, 'yaml');
     assert.ok(enriched.context.intent._resolved_files);
     assert.equal(enriched.context.intent._resolved_files['CONTRIBUTING.md'], contributingContent);
-    assert.equal(
-      enriched.context.intent._resolved_files['.github/CODEOWNERS'],
-      codeownersContent,
-    );
+    assert.equal(enriched.context.intent._resolved_files['docs/GUIDELINES.md'], guidelinesContent);
   });
 
   // -------------------------------------------------------------------------
