@@ -263,6 +263,8 @@ describe('webhook dispatcher', () => {
       const calls = [];
       globalThis.fetch = async (url, init) => {
         calls.push({ url, init });
+        // Assert the signal is a real AbortSignal (not just any truthy value).
+        assert.ok(init?.signal instanceof AbortSignal, 'fetch must receive an AbortSignal');
         // Wait long enough for the AbortController to fire.
         await new Promise((resolve) => setTimeout(resolve, 50));
         if (init?.signal?.aborted) {
