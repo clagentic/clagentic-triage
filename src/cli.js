@@ -115,22 +115,23 @@ async function cmdWatch(flags) {
   const intervalSec = flags.has('interval')
     ? parseInt(flags.get('interval'), 10)
     : (config.source?.poll_interval_seconds ?? 60);
+  // Spread the full adapter module rather than cherry-picking methods. The
+  // webhook server needs the webhook interface (verify_webhook, get_delivery_id,
+  // normalize_webhook, is_bot_sender) in addition to the poll/action methods;
+  // a hand-maintained subset silently drifts from the adapter interface and
+  // leaves webhook methods undefined at runtime.
   const adapterModule = await import(`./adapters/${config.source.adapter}.js`);
-  const adapter = {
-    list_events: adapterModule.list_events,
-    post_comment: adapterModule.post_comment,
-    close_item: adapterModule.close_item,
-    request_changes: adapterModule.request_changes,
-    approve_pr: adapterModule.approve_pr,
-    label_item: adapterModule.label_item,
-  };
+  const adapter = { ...adapterModule };
+
+  let webhookServer = null;
 
   // Webhook mode: if webhooks.enabled, start the inbound webhook server so that
   // real-time deliveries from GitHub feed directly into the pipeline.
-  // The poll loop continues running in parallel as a belt-and-suspenders fallback
-  // (e.g. for events that arrived while the process was down). If double-processing
-  // is a concern for a particular deployment, operators can set poll_interval_seconds
-  // to a very large value to effectively disable polling without removing it.
+  // The poll loop continues running in parallel as a fallback (e.g. for events
+  // that arrived while the process was down). The webhook replay set de-dups
+  // within the webhook path only; cross-path (webhook vs poll) dedup is the
+  // pipeline's responsibility. Operators who want webhook-only delivery set
+  // poll_interval_seconds to a large value.
   if (config.webhooks?.enabled) {
     const webhookOnEvent = async (event) => {
       const result = await processEvent(config, event, adapter);
@@ -138,15 +139,9 @@ async function cmdWatch(flags) {
         `[clagentic-triage] webhook event: id=${result.event_id} status=${result.status}`,
       );
     };
-    const webhookServer = await startWebhookServer(config, adapter, { onEvent: webhookOnEvent });
+    webhookServer = await startWebhookServer(config, adapter, { onEvent: webhookOnEvent });
     const addr = webhookServer.address();
     out(`[clagentic-triage] webhook server started on ${addr.address}:${addr.port}`);
-
-    process.on('SIGINT', () => {
-      webhookServer.close();
-      out('[clagentic-triage] watch: stopped.');
-      process.exit(0);
-    });
   }
 
   out(`[clagentic-triage] watch: polling every ${intervalSec}s. Ctrl-C to stop.`);
@@ -166,17 +161,16 @@ async function cmdWatch(flags) {
   await tick();
   const timer = setInterval(tick, intervalSec * 1000);
 
-  // Only register SIGINT for poll teardown if webhooks mode didn't register it.
-  if (!config.webhooks?.enabled) {
-    process.on('SIGINT', () => {
-      clearInterval(timer);
-      out('[clagentic-triage] watch: stopped.');
-      process.exit(0);
-    });
-  } else {
-    // Webhook handler already registered SIGINT; just clear the poll timer too.
-    process.once('SIGINT', () => clearInterval(timer));
-  }
+  // Single teardown handler tears down both the poll timer and (if running)
+  // the webhook server.
+  process.on('SIGINT', () => {
+    clearInterval(timer);
+    if (webhookServer) {
+      webhookServer.close();
+    }
+    out('[clagentic-triage] watch: stopped.');
+    process.exit(0);
+  });
 }
 
 async function cmdRun(flags) {

@@ -546,9 +546,10 @@ export async function label_item(config, event, labels) {
  * GitHub signs each delivery with `HMAC-SHA256(secret, rawBody)` and sends the
  * result as `sha256=<hex>` in the `x-hub-signature-256` header.
  * Comparison uses `crypto.timingSafeEqual` to prevent timing side-channels.
- * A length guard runs before `timingSafeEqual` because Node throws on unequal
- * buffer lengths — the guard is NOT a timing shortcut, the comparison terminates
- * via the signature-absent path above the caller when no header is present.
+ * A missing signature header returns false up front. A length guard runs before
+ * `timingSafeEqual` because Node throws on unequal-length buffers; it is a
+ * correctness requirement, not a timing shortcut, since a length mismatch
+ * already guarantees the signatures differ.
  *
  * @param {Buffer} rawBody   - The raw request body as a Buffer (before any parsing)
  * @param {object} headers   - Lowercase HTTP request headers object

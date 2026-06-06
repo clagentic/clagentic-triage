@@ -771,3 +771,72 @@ describe('github adapter webhook interface', () => {
     });
   });
 });
+
+// ---------------------------------------------------------------------------
+// Adapter wiring contract (regression guard)
+//
+// cli.js builds the adapter for the webhook server by spreading the whole
+// adapter module: `const adapter = { ...adapterModule }`. If the adapter is
+// ever built as a hand-picked subset that omits the webhook methods, the
+// webhook server calls adapter.verify_webhook (undefined) and every delivery
+// 500s. These tests pin the contract the cli relies on.
+// ---------------------------------------------------------------------------
+
+describe('adapter wiring contract', () => {
+  const SECRET = 'test-secret';
+  const WEBHOOK_METHODS = ['verify_webhook', 'get_delivery_id', 'normalize_webhook', 'is_bot_sender'];
+
+  it('github adapter module exports every webhook interface method', () => {
+    for (const m of WEBHOOK_METHODS) {
+      assert.equal(
+        typeof githubAdapter[m],
+        'function',
+        `github adapter must export ${m}() for the webhook server`,
+      );
+    }
+  });
+
+  it('a spread-module adapter (as cli builds it) serves a signed delivery end to end', async () => {
+    // Mirror cli.js exactly: spread the module into a plain object.
+    const adapter = { ...githubAdapter };
+    const config = makeConfig({ webhooks: { secret: SECRET, path: '/webhook' } });
+
+    let received = null;
+    const { server, port } = await startServer(config, adapter, {
+      onEvent: (event) => { received = event; },
+    });
+    try {
+      const body = JSON.stringify({
+        repository: { full_name: 'org/repo' },
+        issue: { number: 7, title: 'Wired', body: 'b', user: { login: 'alice' }, state: 'open', labels: [] },
+      });
+      const buf = Buffer.from(body, 'utf8');
+      const res = await sendWebhook(port, buf, {
+        'x-github-event': 'issues',
+        'x-github-delivery': 'wire-1',
+        'x-hub-signature-256': githubSig(SECRET, buf),
+      });
+      assert.equal(res.status, 200);
+      assert.equal(res.body.status, 'ok');
+      assert.ok(received, 'onEvent must fire — proves verify_webhook/normalize_webhook resolved');
+      assert.equal(received.number, 7);
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('rejects an over-size body with 413 before verification', async () => {
+    const adapter = { ...githubAdapter };
+    const config = makeConfig({ webhooks: { secret: SECRET, path: '/webhook' } });
+    const { server, port } = await startServer(config, adapter);
+    try {
+      // 6 MB exceeds the 5 MB cap; no valid signature needed — it must be
+      // rejected before verification on size alone.
+      const buf = Buffer.alloc(6 * 1024 * 1024, 0x61);
+      const res = await sendWebhook(port, buf, { 'x-github-event': 'issues' });
+      assert.equal(res.status, 413);
+    } finally {
+      await closeServer(server);
+    }
+  });
+});

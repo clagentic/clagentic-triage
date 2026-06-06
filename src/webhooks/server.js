@@ -30,21 +30,37 @@
 import { createServer as _httpCreateServer } from 'node:http';
 
 // ---------------------------------------------------------------------------
+// Request body limit
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum accepted request body size (bytes). The body is buffered into memory
+ * before signature verification (verification needs the raw bytes), so an
+ * unbounded body would be a pre-auth memory-exhaustion DoS. GitHub webhook
+ * payloads are well under 1 MB; cap generously at 5 MB and reject past it with
+ * a 413 before the full body is buffered.
+ */
+const MAX_BODY_BYTES = 5 * 1024 * 1024;
+
+/** Sentinel error thrown by readBody when the body exceeds MAX_BODY_BYTES. */
+class BodyTooLargeError extends Error {}
+
+// ---------------------------------------------------------------------------
 // Replay protection
 // ---------------------------------------------------------------------------
 
 /**
- * Maximum number of delivery IDs to retain in the in-process LRU set.
+ * Maximum number of delivery IDs to retain in the in-process seen-set.
  * 10 000 entries covers well over any realistic burst before the oldest entries
  * are safe to evict.
  */
 const REPLAY_SET_MAX = 10_000;
 
 /**
- * A capped set of recently-seen delivery IDs.
- * Order of insertion is preserved; the oldest entry is evicted when the cap
- * is hit. This is a simple insertion-order LRU using a Map (JS Maps are
- * ordered by insertion).
+ * A capped, bounded FIFO set of recently-seen delivery IDs. The oldest entry
+ * is evicted when the cap is hit (insertion-order, via a Map). Not an LRU —
+ * re-seeing an ID does not refresh its position, which is correct here because
+ * a seen ID is rejected as a duplicate and never re-inserted.
  */
 class DeliveryIdSet {
   constructor(maxSize = REPLAY_SET_MAX) {
@@ -80,7 +96,17 @@ class DeliveryIdSet {
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (chunk) => chunks.push(chunk));
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        // Stop accumulating immediately and tear down the stream.
+        req.destroy();
+        reject(new BodyTooLargeError());
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
@@ -216,7 +242,26 @@ export function startWebhookServer(config, adapter, { onEvent } = {}) {
  * @param {function|undefined} onEvent
  */
 async function handleWebhookRequest(req, res, secret, adapter, seenDeliveries, allowBotLogins, onEvent) {
-  const rawBody = await readBody(req);
+  // Fast path: reject on a declared Content-Length over the cap before reading
+  // any body bytes. A well-behaved client gets a clean 413 it can read. The
+  // streaming guard in readBody is the backstop for chunked / lying clients.
+  const declaredLen = Number(req.headers['content-length']);
+  if (Number.isFinite(declaredLen) && declaredLen > MAX_BODY_BYTES) {
+    sendJson(res, 413, { error: 'payload too large' });
+    req.destroy();
+    return;
+  }
+
+  let rawBody;
+  try {
+    rawBody = await readBody(req);
+  } catch (e) {
+    if (e instanceof BodyTooLargeError) {
+      sendJson(res, 413, { error: 'payload too large' });
+      return;
+    }
+    throw e;
+  }
 
   // RT-004: verify signature before touching any payload content.
   // The adapter owns the provider-specific HMAC/token scheme entirely.
