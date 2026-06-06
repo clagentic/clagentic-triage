@@ -212,3 +212,70 @@ tells the server how to extract the ID; the server decides what to do with it.
 - Literal strings `x-hub-signature-256`, `x-github-delivery`, `x-github-event`, `sha256=`
 - Any HMAC computation
 - Any provider-specific payload field access
+
+---
+
+## DD-008: Actor-association trust boundary — external contributors only by default
+
+**Decision:** Events are filtered at adapter ingress by the actor's GitHub
+`author_association`. The default policy triages **external contributors only** —
+PRs and issues from the operator's own org members, owners, and collaborators are
+filtered out unless explicitly opted in. The policy is config-driven via three
+`source` fields and is **orthogonal to** the bot filter (DD-005): both filters
+apply, and an event must pass both to be processed.
+
+**Rationale:**
+- The tool's purpose is to triage inbound signals from people outside the trusted
+  circle — drive-by issues, first-time PRs, community contributions. PRs the
+  operator opens themselves, or PRs from trusted internal automation, are noise
+  for a triage agent: they are already going through the team's normal review.
+- GitHub's `author_association` is the native signal for this distinction. It is
+  present on both the REST issues/PRs API and webhook payloads, so the same filter
+  works identically on the poll path and the webhook path.
+- Defaulting to external-only is the conservative choice: it minimizes the surface
+  the agent acts on and avoids the agent commenting on or assessing its own
+  operators' work.
+
+**Config (`source`):**
+
+| Field | Default | Meaning |
+|---|---|---|
+| `watch_associations` | `['CONTRIBUTOR', 'FIRST_TIME_CONTRIBUTOR', 'FIRST_TIMER', 'NONE', 'MANNEQUIN']` | The external set. An event whose `author_association` is in this list passes the association check. |
+| `ignore_logins` | `[]` | Logins ALWAYS skipped, regardless of association (e.g. the operator's own username, or a non-`[bot]`-suffixed automation account such as `naomi`). |
+| `watch_logins` | `[]` | Logins ALWAYS processed, even if their association is not in `watch_associations` (lets the operator watch a specific internal person). |
+
+**Precedence (highest first):**
+1. `ignore_logins` (deny) — wins over everything.
+2. `watch_logins` (allow) — overrides the association bucket.
+3. `watch_associations` bucket check.
+
+**Known `author_association` values** (validated; unknown values in
+`watch_associations` are rejected with `ConfigError`):
+`OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`,
+`FIRST_TIMER`, `NONE`, `MANNEQUIN`.
+
+**Null-association fail-open choice:** if `author_association` is `null` or missing
+(not present on the payload, or an unrecognized value), the event is **processed**
+(treated as external). A missing association on a real inbound event is far more
+likely to be an external contributor than a trusted member, and the conservative
+failure mode for a triage tool is to triage rather than to silently drop a
+legitimate inbound signal. The deny list still applies first, so an operator can
+always force-skip a specific login regardless of its association.
+
+**Composition with DD-005:** the bot filter and the actor filter are independent.
+The bot filter removes automated senders (`sender.type === 'Bot'` or `[bot]`
+suffix); the actor filter removes internal humans. An event must pass both. The
+actor filter does NOT replace the bot filter — a `[bot]` account with a
+`COLLABORATOR` association is still dropped by the bot filter even though it would
+also fail the actor filter.
+
+**Placement:** the filter runs at adapter ingress on both paths, mirroring DD-005.
+On the poll path, `list_events` excludes filtered items from the returned array.
+On the webhook path, the filter runs after `normalize_webhook` (so
+`author_association` is available on `event.metadata`); a filtered delivery is
+acknowledged with `200 { status: 'ignored', reason: 'actor' }`, logged, and
+`onEvent` is NOT called. The provider-agnostic server delegates the check to the
+adapter via `actor_allowed(config, event)`, keeping the actor policy co-located
+with the adapter that produced the association signal. The pure decision function
+`should_process_actor(config, { author, author_association })` is exported for
+reuse and testing.

@@ -185,7 +185,7 @@ export function createServer(config, adapter, { onEvent } = {}) {
 
     // Async handler — errors are caught and returned as 500 to avoid
     // uncaught promise rejections hanging the server.
-    handleWebhookRequest(req, res, secret, adapter, seenDeliveries, allowBotLogins, onEvent)
+    handleWebhookRequest(req, res, config, secret, adapter, seenDeliveries, allowBotLogins, onEvent)
       .catch((err) => {
         console.error('[webhook] unhandled error:', err.message);
         if (!res.headersSent) {
@@ -235,13 +235,14 @@ export function startWebhookServer(config, adapter, { onEvent } = {}) {
  *
  * @param {import('node:http').IncomingMessage} req
  * @param {import('node:http').ServerResponse} res
+ * @param {object} config
  * @param {string} secret
  * @param {object} adapter
  * @param {DeliveryIdSet} seenDeliveries
  * @param {string[]} allowBotLogins
  * @param {function|undefined} onEvent
  */
-async function handleWebhookRequest(req, res, secret, adapter, seenDeliveries, allowBotLogins, onEvent) {
+async function handleWebhookRequest(req, res, config, secret, adapter, seenDeliveries, allowBotLogins, onEvent) {
   // Fast path: reject on a declared Content-Length over the cap before reading
   // any body bytes. A well-behaved client gets a clean 413 it can read. The
   // streaming guard in readBody is the backstop for chunked / lying clients.
@@ -308,6 +309,17 @@ async function handleWebhookRequest(req, res, secret, adapter, seenDeliveries, a
     // Unsupported event type — ack without processing.
     console.log(`[webhook] unsupported event type ignored`);
     sendJson(res, 200, { status: 'ignored', reason: 'unsupported_event_type' });
+    return;
+  }
+
+  // DD-008: actor-association filter at webhook ingress, parallel to the poll
+  // path. Runs after normalize so the author/author_association are on the Event.
+  // Orthogonal to the DD-005 bot filter above — both must pass. Delegated to the
+  // adapter so the server stays provider-agnostic; adapters that do not implement
+  // it default to processing (no actor policy).
+  if (typeof adapter.actor_allowed === 'function' && !adapter.actor_allowed(config, event)) {
+    console.log(`[webhook] actor filtered: ${event.author}`);
+    sendJson(res, 200, { status: 'ignored', reason: 'actor' });
     return;
   }
 

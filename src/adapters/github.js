@@ -210,6 +210,73 @@ function _isBot(payload, allowList) {
 }
 
 // ---------------------------------------------------------------------------
+// Actor-association filtering (DD-008)
+// ---------------------------------------------------------------------------
+
+/**
+ * Decide whether an event from a given actor should be processed, based on the
+ * actor's GitHub `author_association` and the operator's configured allow/deny
+ * login lists. This filter is ORTHOGONAL to the bot filter (DD-005): both apply,
+ * and an event must pass both to be processed.
+ *
+ * Precedence (highest first):
+ *   1. ignore_logins (deny) — always skipped, regardless of association.
+ *   2. watch_logins (allow) — always processed, regardless of association.
+ *   3. watch_associations bucket — processed only if the association is in the set.
+ *
+ * Fail-open on unknown association: a null/missing association is treated as
+ * external (processed). A missing association on a real inbound event is far
+ * more likely to be an external contributor than a trusted member, and the
+ * conservative failure mode for a triage tool is to triage rather than silently
+ * drop. See DD-008.
+ *
+ * @param {object} config
+ * @param {object} actor
+ * @param {string} [actor.author]                  - The actor's login.
+ * @param {string|null} [actor.author_association] - GitHub author_association value.
+ * @returns {boolean} true if the event should be processed.
+ */
+export function should_process_actor(config, { author = '', author_association = null } = {}) {
+  const src = config.source ?? {};
+  const ignoreLogins = src.ignore_logins ?? [];
+  const watchLogins = src.watch_logins ?? [];
+  const watchAssociations = src.watch_associations ?? [];
+
+  // 1. Deny list wins over everything.
+  if (author && ignoreLogins.includes(author)) {
+    return false;
+  }
+
+  // 2. Allow list overrides the association bucket.
+  if (author && watchLogins.includes(author)) {
+    return true;
+  }
+
+  // 3. Fail-open on unknown/missing association — treat as external (process).
+  if (author_association === null || author_association === undefined) {
+    return true;
+  }
+
+  // 4. Association bucket check.
+  return watchAssociations.includes(author_association);
+}
+
+/**
+ * Extract the actor descriptor ({ author, author_association }) from a raw
+ * GitHub issue/PR object (REST list item or webhook sub-object) for use with
+ * should_process_actor.
+ *
+ * @param {object} raw
+ * @returns {{ author: string, author_association: string|null }}
+ */
+function _actorOf(raw) {
+  return {
+    author: raw.user?.login ?? '',
+    author_association: raw.author_association ?? null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Normalizer
 // ---------------------------------------------------------------------------
 
@@ -241,6 +308,7 @@ function _normalize(raw, repo, forceType = null) {
     metadata: {
       node_id: raw.node_id ?? '',
       labels: (raw.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name)),
+      author_association: raw.author_association ?? null,
       state: raw.state ?? '',
       draft: isPr ? Boolean(raw.draft) : false,
       merged: isPr ? Boolean(raw.pull_request?.merged_at ?? raw.merged) : false,
@@ -318,7 +386,12 @@ export async function list_events(config, since) {
       // Normalize and filter the raw items for this repo.
       const normalized = [];
       for (const raw of result.items) {
+        // DD-005 bot filter and DD-008 actor-association filter are orthogonal;
+        // an item must pass both to be processed.
         if (_isBot(raw, allowBotLogins)) {
+          continue;
+        }
+        if (!should_process_actor(config, _actorOf(raw))) {
           continue;
         }
         normalized.push(_normalize(raw, repo));
@@ -632,6 +705,10 @@ export function normalize_webhook(headers, payload) {
       created_at: comment.created_at ?? issue.created_at,
       html_url: comment.html_url ?? issue.html_url,
       node_id: comment.node_id ?? issue.node_id,
+      // Carry the association of the comment author if present, else fall back
+      // to the parent issue/PR's association so the actor filter (DD-008) has a
+      // signal to work with on the comment path.
+      author_association: comment.author_association ?? issue.author_association ?? null,
     };
     return _normalize(synthetic, repo, isPr ? 'pr' : 'issue');
   }
@@ -647,6 +724,8 @@ export function normalize_webhook(headers, payload) {
       created_at: review.submitted_at ?? pr.created_at,
       html_url: review.html_url ?? pr.html_url,
       node_id: review.node_id ?? pr.node_id,
+      // Carry the review author's association if present, else the parent PR's.
+      author_association: review.author_association ?? pr.author_association ?? null,
     };
     return _normalize(synthetic, repo, 'pr');
   }
@@ -668,4 +747,24 @@ export function normalize_webhook(headers, payload) {
  */
 export function is_bot_sender(payload, allowList) {
   return _isBot(payload, allowList);
+}
+
+/**
+ * Return true if a normalized webhook Event should be processed under the
+ * actor-association filter (DD-008). The server calls this AFTER normalize_webhook
+ * so the author and author_association are available on the Event.
+ *
+ * Exported so the provider-agnostic server can delegate actor-filtering to the
+ * adapter rather than reaching into the Event schema itself, keeping the actor
+ * policy co-located with the adapter that produced the association signal.
+ *
+ * @param {object} config - Loaded triage config
+ * @param {object} event  - Normalized Event (from normalize_webhook)
+ * @returns {boolean}
+ */
+export function actor_allowed(config, event) {
+  return should_process_actor(config, {
+    author: event.author ?? '',
+    author_association: event.metadata?.author_association ?? null,
+  });
 }

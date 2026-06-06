@@ -5,6 +5,11 @@ LLM-powered triage agent for GitHub issues and PRs.
 ## What it does
 
 clagentic:triage watches a GitHub org or repo for new issues and pull requests.
+By default only **external contributors** are triaged — issues and PRs from the
+operator's own org members, owners, and collaborators are filtered out, along with
+any logins the operator chooses to ignore. This is configurable via
+`source.watch_associations`, `source.ignore_logins`, and `source.watch_logins`
+(see docs/CONFIG.md).
 Each inbound event is enriched with repo context (a per-repo intent file plus
 referenced documentation), then assessed by an LLM against the stated intent —
 does this issue belong here, does this PR meet the bar, what action should follow?

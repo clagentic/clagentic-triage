@@ -33,6 +33,30 @@ const VALID_AUTO_APPROVE_CLASSES = [
   'escalate',
 ];
 
+// DD-008: known GitHub author_association values. watch_associations entries
+// are validated against this enum.
+const VALID_ASSOCIATIONS = [
+  'OWNER',
+  'MEMBER',
+  'COLLABORATOR',
+  'CONTRIBUTOR',
+  'FIRST_TIME_CONTRIBUTOR',
+  'FIRST_TIMER',
+  'NONE',
+  'MANNEQUIN',
+];
+
+// DD-008: the default "external contributor" association set. Events whose
+// author_association is in this set pass the association check by default;
+// internal associations (OWNER/MEMBER/COLLABORATOR) are filtered out.
+const DEFAULT_WATCH_ASSOCIATIONS = [
+  'CONTRIBUTOR',
+  'FIRST_TIME_CONTRIBUTOR',
+  'FIRST_TIMER',
+  'NONE',
+  'MANNEQUIN',
+];
+
 /**
  * The default config. All fields must be present here so callers
  * can rely on structural completeness without null-checking every path.
@@ -45,6 +69,10 @@ function defaults() {
       repos: ['*'],
       poll_interval_seconds: 60,
       allow_bot_logins: [],
+      // DD-008: actor-association filter. Default = external contributors only.
+      watch_associations: DEFAULT_WATCH_ASSOCIATIONS.slice(),
+      ignore_logins: [],   // always skipped, regardless of association (deny)
+      watch_logins: [],    // always processed, regardless of association (allow)
     },
     intent_file: '.github/triage-intent.yml',
     intent_file_fallback: '.github/TRIAGE_INTENT.md',
@@ -146,6 +174,21 @@ function configFromEnv(env) {
     out.source.repos = splitCsv(env.CLAGENTIC_TRIAGE_REPOS);
   }
 
+  if (env.CLAGENTIC_TRIAGE_WATCH_ASSOCIATIONS !== undefined) {
+    out.source = out.source || {};
+    out.source.watch_associations = splitCsv(env.CLAGENTIC_TRIAGE_WATCH_ASSOCIATIONS);
+  }
+
+  if (env.CLAGENTIC_TRIAGE_IGNORE_LOGINS !== undefined) {
+    out.source = out.source || {};
+    out.source.ignore_logins = splitCsv(env.CLAGENTIC_TRIAGE_IGNORE_LOGINS);
+  }
+
+  if (env.CLAGENTIC_TRIAGE_WATCH_LOGINS !== undefined) {
+    out.source = out.source || {};
+    out.source.watch_logins = splitCsv(env.CLAGENTIC_TRIAGE_WATCH_LOGINS);
+  }
+
   if (env.CLAGENTIC_TRIAGE_MODEL !== undefined) {
     out.model = env.CLAGENTIC_TRIAGE_MODEL;
   }
@@ -238,6 +281,18 @@ function validate(cfg) {
       'Set allow_auto_pr_approval: true in your config to confirm this is intentional. ' +
       'See docs/DESIGN-DECISIONS.md DD-002 for the security implications.',
     );
+  }
+
+  // DD-008: validate actor-association config. watch_associations entries must
+  // be known GitHub author_association values; ignore_logins / watch_logins are
+  // free-form login arrays and are not enumerated.
+  for (const assoc of cfg.source.watch_associations ?? []) {
+    if (!VALID_ASSOCIATIONS.includes(assoc)) {
+      throw new ConfigError(
+        `source.watch_associations contains invalid association "${assoc}". ` +
+        `Valid values: ${VALID_ASSOCIATIONS.join(', ')}`,
+      );
+    }
   }
 
   const port = cfg.webhooks.port;

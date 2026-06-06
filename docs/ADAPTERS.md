@@ -79,3 +79,13 @@ so the Event shape is identical regardless of ingress path.
 Return `true` if the webhook payload represents a bot sender (DD-005). The server
 filters bot deliveries at ingress using this method, consistent with the poll path filter
 in `list_events`. `allowList` is `config.source.allow_bot_logins`.
+
+**`actor_allowed(config, event) -> boolean`** (optional)
+
+Return `true` if a normalized Event should be processed under the actor-association
+filter (DD-008). The server calls this AFTER `normalize_webhook`, so the Event's
+`author` and `metadata.author_association` are available. Orthogonal to
+`is_bot_sender` — both must pass. If an adapter does not export this method, the
+server processes all (non-bot) events (no actor policy). The github adapter also
+applies the same decision on the poll path inside `list_events`, and exports the
+pure decision function `should_process_actor(config, { author, author_association })`.

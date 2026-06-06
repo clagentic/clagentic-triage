@@ -14,7 +14,10 @@ Configuration is loaded from (in priority order):
     "org": "your-org",
     "repos": ["*"],
     "poll_interval_seconds": 60,
-    "allow_bot_logins": []
+    "allow_bot_logins": [],
+    "watch_associations": ["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE", "MANNEQUIN"],
+    "ignore_logins": [],
+    "watch_logins": []
   },
   "intent_file": ".github/triage-intent.yml",
   "intent_file_fallback": ".github/TRIAGE_INTENT.md",
@@ -63,6 +66,14 @@ Configuration is loaded from (in priority order):
 | `repos` | `["*"]` | Repos to watch in `owner/repo` format. `*` = all repos in `org`. |
 | `poll_interval_seconds` | `60` | How often to poll for new events (seconds). |
 | `allow_bot_logins` | `[]` | Bot logins exempted from the bot-event filter (DD-005). Use sparingly. |
+| `watch_associations` | `["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE", "MANNEQUIN"]` | Actor-association filter (DD-008). Only events whose GitHub `author_association` is in this list are triaged. Default = external contributors only. Valid values: `OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`, `MANNEQUIN`. Unknown values are rejected at load. |
+| `ignore_logins` | `[]` | Logins always skipped, regardless of association (deny). E.g. the operator's own username, or an automation account like `naomi`. Wins over everything. |
+| `watch_logins` | `[]` | Logins always processed, even if their association is not in `watch_associations` (allow). Lets you watch a specific internal person. |
+
+The actor-association filter is orthogonal to the bot filter — both apply, and an
+event must pass both to be triaged. Precedence: `ignore_logins` (deny) → `watch_logins`
+(allow) → `watch_associations` bucket. An event with a missing/unknown association
+is treated as external and processed (fail-open). See DD-008 for the full rationale.
 
 ### `runner` / `model` / `runner_url` / `runner_api_key_env`
 
@@ -189,6 +200,9 @@ a reverse proxy — the default bind address is `127.0.0.1`, not `0.0.0.0`.
 | `CLAGENTIC_TRIAGE_ADAPTER` | `source.adapter` | |
 | `CLAGENTIC_TRIAGE_ORG` | `source.org` | |
 | `CLAGENTIC_TRIAGE_REPOS` | `source.repos` | comma-separated |
+| `CLAGENTIC_TRIAGE_WATCH_ASSOCIATIONS` | `source.watch_associations` | comma-separated GitHub author_association values |
+| `CLAGENTIC_TRIAGE_IGNORE_LOGINS` | `source.ignore_logins` | comma-separated logins (deny) |
+| `CLAGENTIC_TRIAGE_WATCH_LOGINS` | `source.watch_logins` | comma-separated logins (allow) |
 | `CLAGENTIC_TRIAGE_MODEL` | `model` | |
 | `CLAGENTIC_TRIAGE_RUNNER` | `runner` | `claude-cli`, `anthropic-api`, `openai-compatible`, `clagentic-router` |
 | `CLAGENTIC_TRIAGE_RUNNER_URL` | `runner_url` | Base URL for openai-compatible / clagentic-router |
