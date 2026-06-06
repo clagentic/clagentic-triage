@@ -17,14 +17,65 @@ An adapter module must export:
 ```js
 // src/adapters/myadapter.js — ESM
 export const name = 'myadapter'
+
+// --- Poll interface (required) ---
 export async function list_events(config, since) { }              // returns Event[]
 export async function post_comment(config, event, body) { }
 export async function close_item(config, event) { }
 export async function request_changes(config, event, body) { }
 export async function approve_pr(config, event) { }
 export async function label_item(config, event, labels) { }
+
+// --- Webhook interface (required for inbound webhook server) ---
+export function verify_webhook(rawBody, headers, secret) { }      // returns boolean
+export function get_delivery_id(headers) { }                      // returns string|null
+export function normalize_webhook(headers, payload) { }           // returns Event|null
+export function is_bot_sender(payload, allowList) { }             // returns boolean
 ```
 
 `since` is an ISO timestamp string. Return only events newer than `since`.
 
-The adapter must not throw on auth failure — return an empty array and log a warning.
+The adapter must not throw on auth failure from `list_events` — return an empty array and log a warning.
+
+### Webhook interface
+
+The inbound webhook server (`src/webhooks/server.js`) is provider-agnostic. It delegates all
+provider-specific logic to the adapter via the four webhook interface methods:
+
+**`verify_webhook(rawBody, headers, secret) -> boolean`**
+
+Verify the authenticity of an inbound delivery. The server calls this before parsing the body
+or doing anything else with the payload. Returns `true` if the delivery is genuine.
+
+Provider examples:
+- GitHub: HMAC-SHA256 of the raw body, compared against `x-hub-signature-256` using `timingSafeEqual`.
+- GitLab: plain-text token comparison against `x-gitlab-token`.
+- Gitea: similar to GitLab; check `x-gitea-signature`.
+
+The implementation MUST use a timing-safe comparison to prevent side-channel attacks.
+
+**`get_delivery_id(headers) -> string|null`**
+
+Extract a unique delivery identifier from the headers for replay protection.
+Return `null` if the provider does not send a delivery ID — the server will skip replay
+checking for that delivery.
+
+Provider examples:
+- GitHub: `x-github-delivery` (UUID per delivery).
+- GitLab: no standard delivery ID — return `null`.
+
+**`normalize_webhook(headers, payload) -> Event|null`**
+
+Map a provider's raw webhook payload to the standard Event schema. The adapter reads
+provider-specific headers (such as an event-type header) from `headers` internally.
+Return `null` for event types the adapter does not support — the server will acknowledge
+the delivery with a 200 and log it as unsupported.
+
+This method should share normalization logic with the poll path (`list_events` / `_normalize`)
+so the Event shape is identical regardless of ingress path.
+
+**`is_bot_sender(payload, allowList) -> boolean`**
+
+Return `true` if the webhook payload represents a bot sender (DD-005). The server
+filters bot deliveries at ingress using this method, consistent with the poll path filter
+in `list_events`. `allowList` is `config.source.allow_bot_logins`.

@@ -8,6 +8,7 @@
  * read from any other env var. The token is never logged or stored.
  */
 
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
@@ -215,12 +216,15 @@ function _isBot(payload, allowList) {
 /**
  * Normalize a raw GitHub issue or pull_request payload to the Event schema.
  *
- * @param {object} raw  - Raw object from GitHub REST /repos/{owner}/{repo}/issues
- * @param {string} repo - "owner/repo" string
+ * @param {object} raw          - Raw object from GitHub REST or webhook payload
+ * @param {string} repo         - "owner/repo" string
+ * @param {string|null} [forceType] - Override type detection: 'pr' or 'issue'.
+ *   Webhook callers pass this explicitly because the webhook event type header, not
+ *   the presence of `raw.pull_request`, determines whether the item is a PR.
  * @returns {object}    - Normalized Event
  */
-function _normalize(raw, repo) {
-  const isPr = Boolean(raw.pull_request);
+function _normalize(raw, repo, forceType = null) {
+  const isPr = forceType !== null ? forceType === 'pr' : Boolean(raw.pull_request);
   const type = isPr ? 'pr' : 'issue';
 
   return {
@@ -530,4 +534,137 @@ export async function label_item(config, event, labels) {
   if (!res.ok) {
     throw new AdapterError(`label_item failed: ${res.status} ${res.statusText}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Webhook interface methods
+// ---------------------------------------------------------------------------
+
+/**
+ * Verify an inbound webhook delivery using the GitHub HMAC-SHA256 scheme.
+ *
+ * GitHub signs each delivery with `HMAC-SHA256(secret, rawBody)` and sends the
+ * result as `sha256=<hex>` in the `x-hub-signature-256` header.
+ * Comparison uses `crypto.timingSafeEqual` to prevent timing side-channels.
+ * A length guard runs before `timingSafeEqual` because Node throws on unequal
+ * buffer lengths — the guard is NOT a timing shortcut, the comparison terminates
+ * via the signature-absent path above the caller when no header is present.
+ *
+ * @param {Buffer} rawBody   - The raw request body as a Buffer (before any parsing)
+ * @param {object} headers   - Lowercase HTTP request headers object
+ * @param {string} secret    - Webhook secret configured in GitHub
+ * @returns {boolean}        - true if signature is valid
+ */
+export function verify_webhook(rawBody, headers, secret) {
+  const sigHeader = headers['x-hub-signature-256'] ?? '';
+  if (!sigHeader) {
+    return false;
+  }
+  const expected = 'sha256=' + createHmac('sha256', secret).update(rawBody).digest('hex');
+  const a = Buffer.from(expected, 'utf8');
+  const b = Buffer.from(sigHeader, 'utf8');
+  if (a.length !== b.length) {
+    // Length mismatch means the signature cannot match; return false immediately.
+    // This is not a timing leak: timingSafeEqual would throw on unequal lengths,
+    // and we cannot pad without leaking information about the expected length.
+    return false;
+  }
+  return timingSafeEqual(a, b);
+}
+
+/**
+ * Extract the delivery ID from inbound webhook headers.
+ * Used by the server for replay protection.
+ *
+ * GitHub sends a UUID in `x-github-delivery`. Other providers use different
+ * headers or none — they return null, and the server skips replay checking.
+ *
+ * @param {object} headers - Lowercase HTTP request headers object
+ * @returns {string|null}  - Delivery ID string, or null if not present
+ */
+export function get_delivery_id(headers) {
+  return headers['x-github-delivery'] ?? null;
+}
+
+/**
+ * Normalize a GitHub webhook payload to the standard Event schema.
+ *
+ * Supported GitHub event types (driven by the `x-github-event` header):
+ *   issues, pull_request, issue_comment, pull_request_review
+ *
+ * For `issue_comment` and `pull_request_review`, the parent issue/PR fields are
+ * sourced from `payload.issue` / `payload.pull_request` respectively, and the
+ * body comes from the comment or review sub-object. This matches the shape
+ * produced by `list_events` (poll path) so downstream pipeline stages see a
+ * consistent Event schema regardless of ingress path.
+ *
+ * @param {object} headers  - Lowercase HTTP request headers object
+ * @param {object} payload  - Parsed JSON webhook payload (already verified)
+ * @returns {object|null}   - Normalized Event, or null if the event type is unsupported
+ */
+export function normalize_webhook(headers, payload) {
+  const eventType = headers['x-github-event'] ?? '';
+  const repo = payload.repository?.full_name ?? '';
+
+  if (eventType === 'issues') {
+    // payload.issue has the same shape as a REST list item; pass forceType='issue'
+    // because issue webhook objects never carry a pull_request key.
+    return _normalize(payload.issue ?? {}, repo, 'issue');
+  }
+
+  if (eventType === 'pull_request') {
+    // payload.pull_request is the PR object, but lacks the REST-list's pull_request
+    // sentinel field that _normalize uses to detect PRs. Pass forceType='pr'.
+    return _normalize(payload.pull_request ?? {}, repo, 'pr');
+  }
+
+  if (eventType === 'issue_comment') {
+    const issue = payload.issue ?? {};
+    const comment = payload.comment ?? {};
+    const isPr = Boolean(issue.pull_request);
+    // Build a synthetic raw object that _normalize can process: use the issue
+    // fields for structure, overlay comment body/author/created_at/url/node_id.
+    const synthetic = {
+      ...issue,
+      body: comment.body ?? '',
+      user: comment.user ?? issue.user,
+      created_at: comment.created_at ?? issue.created_at,
+      html_url: comment.html_url ?? issue.html_url,
+      node_id: comment.node_id ?? issue.node_id,
+    };
+    return _normalize(synthetic, repo, isPr ? 'pr' : 'issue');
+  }
+
+  if (eventType === 'pull_request_review') {
+    const pr = payload.pull_request ?? {};
+    const review = payload.review ?? {};
+    // Build a synthetic raw object using PR structure but review content.
+    const synthetic = {
+      ...pr,
+      body: review.body ?? '',
+      user: review.user ?? pr.user,
+      created_at: review.submitted_at ?? pr.created_at,
+      html_url: review.html_url ?? pr.html_url,
+      node_id: review.node_id ?? pr.node_id,
+    };
+    return _normalize(synthetic, repo, 'pr');
+  }
+
+  // Unsupported event type — caller handles this case.
+  return null;
+}
+
+/**
+ * Return true if an inbound webhook payload represents a bot sender.
+ * Applies the same check as poll ingress (DD-005).
+ *
+ * Exported so the server can delegate bot-filtering to the adapter rather than
+ * reimplementing the check itself.
+ *
+ * @param {object}   payload   - Parsed JSON webhook payload (already verified)
+ * @param {string[]} allowList - Logins allowed through even if they look like bots
+ * @returns {boolean}
+ */
+export function is_bot_sender(payload, allowList) {
+  return _isBot(payload, allowList);
 }

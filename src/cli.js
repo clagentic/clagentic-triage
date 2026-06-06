@@ -9,7 +9,8 @@
 
 import { loadConfig, ConfigError } from './config/loader.js';
 import { listItems, resolveItem, QueueError } from './queue.js';
-import { runPipeline } from './pipeline.js';
+import { runPipeline, processEvent } from './pipeline.js';
+import { startWebhookServer } from './webhooks/server.js';
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -114,14 +115,45 @@ async function cmdWatch(flags) {
   const intervalSec = flags.has('interval')
     ? parseInt(flags.get('interval'), 10)
     : (config.source?.poll_interval_seconds ?? 60);
-  const { list_events } = await import(`./adapters/${config.source.adapter}.js`);
-  const adapter = { list_events };
+  const adapterModule = await import(`./adapters/${config.source.adapter}.js`);
+  const adapter = {
+    list_events: adapterModule.list_events,
+    post_comment: adapterModule.post_comment,
+    close_item: adapterModule.close_item,
+    request_changes: adapterModule.request_changes,
+    approve_pr: adapterModule.approve_pr,
+    label_item: adapterModule.label_item,
+  };
+
+  // Webhook mode: if webhooks.enabled, start the inbound webhook server so that
+  // real-time deliveries from GitHub feed directly into the pipeline.
+  // The poll loop continues running in parallel as a belt-and-suspenders fallback
+  // (e.g. for events that arrived while the process was down). If double-processing
+  // is a concern for a particular deployment, operators can set poll_interval_seconds
+  // to a very large value to effectively disable polling without removing it.
+  if (config.webhooks?.enabled) {
+    const webhookOnEvent = async (event) => {
+      const result = await processEvent(config, event, adapter);
+      out(
+        `[clagentic-triage] webhook event: id=${result.event_id} status=${result.status}`,
+      );
+    };
+    const webhookServer = await startWebhookServer(config, adapter, { onEvent: webhookOnEvent });
+    const addr = webhookServer.address();
+    out(`[clagentic-triage] webhook server started on ${addr.address}:${addr.port}`);
+
+    process.on('SIGINT', () => {
+      webhookServer.close();
+      out('[clagentic-triage] watch: stopped.');
+      process.exit(0);
+    });
+  }
 
   out(`[clagentic-triage] watch: polling every ${intervalSec}s. Ctrl-C to stop.`);
 
   const tick = async () => {
     try {
-      const events = await list_events(config);
+      const events = await adapterModule.list_events(config);
       const { dispatched, queued, errors } = await runPipeline(config, events, adapter);
       out(
         `[clagentic-triage] cycle: dispatched=${dispatched.length} queued=${queued.length} errors=${errors.length}`,
@@ -134,11 +166,17 @@ async function cmdWatch(flags) {
   await tick();
   const timer = setInterval(tick, intervalSec * 1000);
 
-  process.on('SIGINT', () => {
-    clearInterval(timer);
-    out('[clagentic-triage] watch: stopped.');
-    process.exit(0);
-  });
+  // Only register SIGINT for poll teardown if webhooks mode didn't register it.
+  if (!config.webhooks?.enabled) {
+    process.on('SIGINT', () => {
+      clearInterval(timer);
+      out('[clagentic-triage] watch: stopped.');
+      process.exit(0);
+    });
+  } else {
+    // Webhook handler already registered SIGINT; just clear the poll timer too.
+    process.once('SIGINT', () => clearInterval(timer));
+  }
 }
 
 async function cmdRun(flags) {
@@ -247,12 +285,14 @@ Usage:
     Print this usage message.
 
 Environment:
-  CLAGENTIC_TRIAGE_GITHUB_TOKEN   GitHub personal access token
-  CLAGENTIC_TRIAGE_ADAPTER        Source adapter (github, gitlab, forgejo)
-  CLAGENTIC_TRIAGE_ORG            GitHub org to watch
-  CLAGENTIC_TRIAGE_REPOS          Comma-separated repo list (default: *)
-  CLAGENTIC_TRIAGE_MODEL          LLM model name
-  CLAGENTIC_TRIAGE_RUNNER         LLM runner (claude-cli, anthropic-api, openai-compatible, clagentic-router)
+  CLAGENTIC_TRIAGE_GITHUB_TOKEN        GitHub personal access token
+  CLAGENTIC_TRIAGE_ADAPTER             Source adapter (github, gitlab, forgejo)
+  CLAGENTIC_TRIAGE_ORG                 GitHub org to watch
+  CLAGENTIC_TRIAGE_REPOS               Comma-separated repo list (default: *)
+  CLAGENTIC_TRIAGE_MODEL               LLM model name
+  CLAGENTIC_TRIAGE_RUNNER              LLM runner (claude-cli, anthropic-api, openai-compatible, clagentic-router)
+  CLAGENTIC_TRIAGE_WEBHOOK_SECRET      Webhook HMAC secret (required when webhooks.enabled)
+  CLAGENTIC_TRIAGE_WEBHOOK_PORT        Webhook server port (default: 8742)
   CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD  Float 0-1 (default: 0.7)
 
 Config file: ~/.config/clagentic/triage/config.json or triage.config.json in cwd

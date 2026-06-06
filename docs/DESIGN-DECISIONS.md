@@ -170,3 +170,45 @@ the LLM prompt without the `<UNTRUSTED_USER_CONTENT>` boundary applied to issue/
 - Repos where the default branch protection allows external contributors to push to the branch
   where `.github/triage-intent.yml` lives. Operators in this configuration should disable
   intent file loading or use a stricter branch protection policy.
+
+---
+
+## DD-007: Webhook server is provider-agnostic; verification and normalization are adapter responsibilities
+
+**Decision:** `src/webhooks/server.js` is a generic HTTP receiver shell. It never references
+provider-specific header names, HMAC schemes, or payload shapes. All provider-specific
+webhook logic is owned by the source adapter, exported as four methods that form the adapter
+webhook interface:
+
+- `verify_webhook(rawBody, headers, secret) -> boolean` — provider's signature/token scheme
+- `get_delivery_id(headers) -> string|null` — provider's replay-protection ID header
+- `normalize_webhook(headers, payload) -> Event|null` — map raw payload to Event schema
+- `is_bot_sender(payload, allowList) -> boolean` — bot-filtering at webhook ingress (DD-005)
+
+The server calls these methods; it does not implement any of them.
+
+**Rationale:**
+- The adapter-pluggable rule from `CLAUDE.md` ("Core logic must not import adapter internals
+  directly — only through the adapter interface") applies to webhook ingress too. Baking
+  GitHub's HMAC scheme or `x-github-event` parsing into a generic server file violates this
+  invariant and makes it impossible to plug in a GitLab or Forgejo adapter without modifying
+  the server.
+- GitLab uses a plain `x-gitlab-token` header (shared secret, no HMAC). Gitea uses
+  `x-gitea-signature` with HMAC-SHA256 but a different header name. Each provider's
+  verification logic is meaningfully different; the server cannot abstract over all of them
+  without becoming a provider-aware switch statement — which is worse than delegation.
+- The `normalize_webhook` method on the adapter shares internal normalization logic with the
+  poll path (`list_events`). This ensures the Event schema is identical regardless of whether
+  the event arrived via polling or webhook, preventing silent drift between the two paths.
+
+**The `adapter` parameter is required and must implement the webhook interface.**
+The server throws at call time if the adapter does not export the required methods.
+
+**Replay protection** remains in the server (not the adapter) because it is provider-agnostic:
+the `DeliveryIdSet` LRU tracks whatever opaque string `get_delivery_id` returns. The adapter
+tells the server how to extract the ID; the server decides what to do with it.
+
+**Scope:** `src/webhooks/server.js` must not contain any of the following:
+- Literal strings `x-hub-signature-256`, `x-github-delivery`, `x-github-event`, `sha256=`
+- Any HMAC computation
+- Any provider-specific payload field access

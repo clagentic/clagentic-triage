@@ -63,6 +63,8 @@ function defaults() {
       enabled: false,
       port: 8742,
       secret: '',
+      bind: '127.0.0.1',
+      path: '/webhook',
     },
     notifications: {
       webhooks: [],
@@ -169,6 +171,17 @@ function configFromEnv(env) {
     out.webhooks.secret = env.CLAGENTIC_TRIAGE_WEBHOOK_SECRET;
   }
 
+  if (env.CLAGENTIC_TRIAGE_WEBHOOK_PORT !== undefined) {
+    const parsed = parseInt(env.CLAGENTIC_TRIAGE_WEBHOOK_PORT, 10);
+    if (isNaN(parsed)) {
+      throw new ConfigError(
+        `CLAGENTIC_TRIAGE_WEBHOOK_PORT must be an integer, got: ${env.CLAGENTIC_TRIAGE_WEBHOOK_PORT}`,
+      );
+    }
+    out.webhooks = out.webhooks || {};
+    out.webhooks.port = parsed;
+  }
+
   if (env.CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD !== undefined) {
     const parsed = parseFloat(env.CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD);
     if (isNaN(parsed)) {
@@ -231,6 +244,15 @@ function validate(cfg) {
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new ConfigError(
       `webhooks.port must be an integer between 1 and 65535. Got: ${port}`,
+    );
+  }
+
+  // RT-004: webhook server must not start without a secret when enabled.
+  if (cfg.webhooks.enabled && !cfg.webhooks.secret) {
+    throw new ConfigError(
+      'webhooks.enabled is true but webhooks.secret is empty. ' +
+      'Set CLAGENTIC_TRIAGE_WEBHOOK_SECRET or webhooks.secret in your config. ' +
+      'An unauthenticated webhook server is refused.',
     );
   }
 }
