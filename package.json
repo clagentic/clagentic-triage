@@ -1,0 +1,30 @@
+{
+  "name": "@clagentic/triage",
+  "version": "0.1.0",
+  "description": "LLM-powered triage agent for GitHub issues and PRs",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "triage": "src/cli.js"
+  },
+  "scripts": {
+    "test": "node --test tests/"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "clagentic",
+    "github",
+    "triage",
+    "llm",
+    "agents",
+    "developer-tools"
+  ],
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/clagentic/triage"
+  },
+  "homepage": "https://clagentic.ai"
+}
