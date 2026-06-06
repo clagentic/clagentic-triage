@@ -70,6 +70,14 @@ const MAX_CONTEXT_FILES = 5;
 // Maximum byte size of a single fetched context file (32 KB).
 const MAX_CONTEXT_FILE_BYTES = 32 * 1024;
 
+// RT-003: Maximum byte size of the intent file itself (YAML or Markdown).
+// A legitimate triage-intent.yml is a few hundred bytes. An abnormally large
+// file is either a misconfiguration or a prompt-stuffing attempt. Cap at 64 KB
+// and truncate rather than reject — the truncated content is still useful for
+// triage; rejection would silently degrade to the generic fallback without
+// warning the operator.
+const MAX_INTENT_FILE_BYTES = 64 * 1024;
+
 /**
  * Generic fallback intent used when neither the YAML file nor the Markdown
  * fallback is found in the target repo.
@@ -189,8 +197,16 @@ async function _loadIntent(config, repo, token) {
   const mdPath = config.intent_file_fallback ?? '.github/TRIAGE_INTENT.md';
 
   // --- Attempt 1: YAML intent file ---
-  const yamlContent = await _fetchRepoFile(repo, yamlPath, token);
+  let yamlContent = await _fetchRepoFile(repo, yamlPath, token);
   if (yamlContent !== null) {
+    // RT-003: cap intent file size to prevent prompt-stuffing via a large file
+    // committed to the repo by its maintainers.
+    if (yamlContent.length > MAX_INTENT_FILE_BYTES) {
+      console.warn(
+        `[enricher] intent file "${yamlPath}" exceeds ${MAX_INTENT_FILE_BYTES} bytes (${yamlContent.length}); truncating`,
+      );
+      yamlContent = yamlContent.slice(0, MAX_INTENT_FILE_BYTES) + '\n# [truncated by clagentic-triage: file exceeds size limit]';
+    }
     const parsed = parseYaml(yamlContent);
 
     // If the parsed intent has a repo_context_files array, fetch each listed
@@ -238,8 +254,15 @@ async function _loadIntent(config, repo, token) {
   }
 
   // --- Attempt 2: Markdown fallback ---
-  const mdContent = await _fetchRepoFile(repo, mdPath, token);
+  let mdContent = await _fetchRepoFile(repo, mdPath, token);
   if (mdContent !== null) {
+    // RT-003: same size cap for the Markdown fallback.
+    if (mdContent.length > MAX_INTENT_FILE_BYTES) {
+      console.warn(
+        `[enricher] intent file "${mdPath}" exceeds ${MAX_INTENT_FILE_BYTES} bytes (${mdContent.length}); truncating`,
+      );
+      mdContent = mdContent.slice(0, MAX_INTENT_FILE_BYTES) + '\n<!-- [truncated by clagentic-triage: file exceeds size limit] -->';
+    }
     return {
       description: mdContent,
       _source: 'markdown',

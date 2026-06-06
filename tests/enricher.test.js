@@ -233,6 +233,44 @@ describe('enrich', () => {
   });
 
   // -------------------------------------------------------------------------
+  // RT-003: intent file size cap — oversized YAML is truncated, not rejected
+  // -------------------------------------------------------------------------
+
+  it('truncates an oversized YAML intent file (RT-003 size cap)', async () => {
+    // Build a YAML file well over the 64 KB cap. A valid top-level key keeps
+    // it on the YAML path; the bulk is a large block scalar.
+    const filler = 'x'.repeat(70 * 1024);
+    const yamlContent = `description: |\n  ${filler}`;
+
+    mockUrl('/repos/owner/repo/contents/.github/triage-intent.yml', contentsResponse(yamlContent));
+    mockUrl('/users/testuser', { login: 'testuser', name: null, public_repos: 0, followers: 0, created_at: null, company: null, bio: null });
+
+    const enriched = await enrich(makeConfig(), makeEvent(), null);
+
+    assert.equal(enriched.context.intent._source, 'yaml');
+    // The parsed description must be shorter than the raw 70 KB input —
+    // the cap truncated the source before parsing.
+    assert.ok(
+      enriched.context.intent.description.length < 70 * 1024,
+      'oversized intent file should be truncated below the original size',
+    );
+  });
+
+  it('truncates an oversized Markdown fallback intent file (RT-003 size cap)', async () => {
+    const mdContent = '# Intent\n' + 'y'.repeat(70 * 1024);
+
+    // YAML 404s (default handler), Markdown returns oversized content
+    mockUrl('/repos/owner/repo/contents/.github/TRIAGE_INTENT.md', contentsResponse(mdContent));
+    mockUrl('/users/testuser', { login: 'testuser', name: null, public_repos: 0, followers: 0, created_at: null, company: null, bio: null });
+
+    const enriched = await enrich(makeConfig(), makeEvent(), null);
+
+    assert.equal(enriched.context.intent._source, 'markdown');
+    assert.ok(enriched.context.intent.description.length <= 64 * 1024 + 100);
+    assert.ok(enriched.context.intent.description.includes('[truncated by clagentic-triage'));
+  });
+
+  // -------------------------------------------------------------------------
   // Test 2: repo_context_files entries fetched and injected into _resolved_files
   // -------------------------------------------------------------------------
 
