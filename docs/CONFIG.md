@@ -18,9 +18,11 @@ Configuration is loaded from (in priority order):
   },
   "intent_file": ".github/triage-intent.yml",
   "intent_file_fallback": ".github/TRIAGE_INTENT.md",
-  "model": "clagentic:router",
+  "model": "claude-sonnet-4-5",
   "model_fallback": "claude-sonnet-4-5",
-  "router_url": "http://localhost:4200",
+  "runner": "claude-cli",
+  "runner_url": null,
+  "runner_api_key_env": null,
   "confidence_threshold": 0.7,
   "auto_approve": [],
   "allow_auto_pr_approval": false,
@@ -62,22 +64,44 @@ Configuration is loaded from (in priority order):
 | `poll_interval_seconds` | `60` | How often to poll for new events (seconds). |
 | `allow_bot_logins` | `[]` | Bot logins exempted from the bot-event filter (DD-005). Use sparingly. |
 
-### `model` / `model_fallback` / `router_url`
+### `runner` / `model` / `runner_url` / `runner_api_key_env`
 
-`model` controls which LLM is used for assessment:
+`runner` selects the LLM backend. `model` is the model hint passed to that backend.
 
-| Value | Behavior |
+| `runner` | Description |
 |---|---|
-| `"clagentic:router"` | Routes through the clagentic router service at `router_url`. The router handles multi-provider selection — Claude, GPT-4o, Codex, Gemini, or any configured backend. Falls back to `model_fallback` if unreachable. |
-| Any Claude model ID (e.g. `"claude-sonnet-4-5"`) | Passed directly as `--model` to the `claude` CLI. No router needed. |
+| `"claude-cli"` | Default. Spawns the `claude` CLI as a subprocess. `model` is passed as `--model`. Requires `claude` on PATH or `CLAUDE_PATH`. |
+| `"anthropic-api"` | HTTP POST to `https://api.anthropic.com/v1/messages`. API key read from the env var named in `runner_api_key_env` (default: `ANTHROPIC_API_KEY`). |
+| `"openai-compatible"` | HTTP POST to `${runner_url}/chat/completions`. Covers OpenAI, Azure OpenAI, Ollama, and any OpenAI-compatible server. If the key env var is empty (e.g. Ollama local), the Authorization header is omitted. |
+| `"clagentic-router"` | HTTP POST to `${runner_url}/v1/assess` (default URL: `http://localhost:4200`). The router handles multi-provider routing — Claude, GPT-4o, Gemini, or any configured backend. |
 
-**To use non-Claude models (GPT-4o, Codex, Gemini, etc.):** set `model: "clagentic:router"`
-and configure the router with the desired provider. The router is the multi-provider
-abstraction layer. Direct non-Claude model IDs are not supported without the router.
+**`runner_url`** — base URL for `openai-compatible` and `clagentic-router`. Required for `openai-compatible`; optional for `clagentic-router` (defaults to `http://localhost:4200`).
 
-**The router is optional.** Without it, set `model` to any valid Claude model ID
-and the tool works standalone. Use `model_fallback` as the safety net when the
-router is configured but temporarily unreachable.
+**`runner_api_key_env`** — the **name** of the environment variable that holds the API key (never the key itself). Leave unset to use the runner's default (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `CLAGENTIC_ROUTER_TOKEN`).
+
+**Minimal standalone setup (claude CLI):**
+```json
+{ "runner": "claude-cli", "model": "claude-sonnet-4-5" }
+```
+
+**Anthropic API directly:**
+```json
+{ "runner": "anthropic-api", "model": "claude-opus-4", "runner_api_key_env": "ANTHROPIC_API_KEY" }
+```
+
+**Ollama local (no auth):**
+```json
+{ "runner": "openai-compatible", "model": "llama3", "runner_url": "http://localhost:11434" }
+```
+
+**clagentic:router:**
+```json
+{ "runner": "clagentic-router", "model": "auto", "runner_url": "http://localhost:4200" }
+```
+
+**Deprecation note:** `model: "clagentic:router"` is deprecated. On load, it is automatically
+migrated to `runner: "clagentic-router"` and `model: "auto"` with a warning. Update your config
+to use the explicit `runner` field.
 
 ### `confidence_threshold`
 
@@ -166,6 +190,8 @@ a reverse proxy — the default bind address is `127.0.0.1`, not `0.0.0.0`.
 | `CLAGENTIC_TRIAGE_ORG` | `source.org` | |
 | `CLAGENTIC_TRIAGE_REPOS` | `source.repos` | comma-separated |
 | `CLAGENTIC_TRIAGE_MODEL` | `model` | |
+| `CLAGENTIC_TRIAGE_RUNNER` | `runner` | `claude-cli`, `anthropic-api`, `openai-compatible`, `clagentic-router` |
+| `CLAGENTIC_TRIAGE_RUNNER_URL` | `runner_url` | Base URL for openai-compatible / clagentic-router |
 | `CLAGENTIC_TRIAGE_GITHUB_TOKEN` | *(token getter)* | Never stored in config object |
 | `CLAGENTIC_TRIAGE_AUTO_APPROVE` | `auto_approve` | comma-separated |
 | `CLAGENTIC_TRIAGE_WEBHOOK_SECRET` | `webhooks.secret` | |

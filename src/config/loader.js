@@ -23,6 +23,7 @@ export class ConfigError extends Error {
 }
 
 const VALID_ADAPTERS = ['github', 'gitlab', 'forgejo'];
+const VALID_RUNNERS = ['claude-cli', 'anthropic-api', 'openai-compatible', 'clagentic-router'];
 const VALID_AUTO_APPROVE_CLASSES = [
   'approve',
   'respond',
@@ -49,7 +50,9 @@ function defaults() {
     intent_file_fallback: '.github/TRIAGE_INTENT.md',
     model: 'clagentic:router',
     model_fallback: 'claude-sonnet-4-5',
-    router_url: 'http://localhost:4200',  // clagentic:router base URL; override if running on non-default host/port
+    runner: 'claude-cli',          // CLAGENTIC_TRIAGE_RUNNER — which backend to use for LLM calls
+    runner_url: null,              // CLAGENTIC_TRIAGE_RUNNER_URL — base URL for openai-compatible / clagentic-router
+    runner_api_key_env: null,      // name of the env var holding the API key (never the key itself)
     confidence_threshold: 0.7,
     auto_approve: [],
     allow_auto_pr_approval: false,  // RT-002: explicit opt-in required before approve class works
@@ -145,6 +148,14 @@ function configFromEnv(env) {
     out.model = env.CLAGENTIC_TRIAGE_MODEL;
   }
 
+  if (env.CLAGENTIC_TRIAGE_RUNNER !== undefined) {
+    out.runner = env.CLAGENTIC_TRIAGE_RUNNER;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_RUNNER_URL !== undefined) {
+    out.runner_url = env.CLAGENTIC_TRIAGE_RUNNER_URL;
+  }
+
   if (env.CLAGENTIC_TRIAGE_AUTO_APPROVE !== undefined) {
     out.auto_approve = splitCsv(env.CLAGENTIC_TRIAGE_AUTO_APPROVE);
   }
@@ -174,6 +185,12 @@ function validate(cfg) {
   if (!VALID_ADAPTERS.includes(cfg.source.adapter)) {
     throw new ConfigError(
       `source.adapter must be one of: ${VALID_ADAPTERS.join(', ')}. Got: ${cfg.source.adapter}`,
+    );
+  }
+
+  if (!VALID_RUNNERS.includes(cfg.runner)) {
+    throw new ConfigError(
+      `runner must be one of: ${VALID_RUNNERS.join(', ')}. Got: ${cfg.runner}`,
     );
   }
 
@@ -256,6 +273,34 @@ export async function loadConfig(opts = {}) {
   }
   if (Object.keys(envConfig).length > 0) {
     merged = deepMerge(merged, envConfig);
+  }
+
+  // Deprecation shim: router_url → runner_url.
+  // If a config file supplied the old router_url key and runner_url was not set,
+  // migrate the value and warn. runner_url is the canonical key going forward.
+  if (merged.router_url && !merged.runner_url) {
+    process.stderr.write(
+      '[clagentic:triage] DEPRECATED: config key "router_url" has been renamed to "runner_url". ' +
+      'Please update your config file.\n',
+    );
+    merged.runner_url = merged.router_url;
+  }
+  // Remove the legacy key so it does not appear in the validated object.
+  delete merged.router_url;
+
+  // Deprecation shim: model: "clagentic:router" without an explicit runner set.
+  // If the user has not migrated to the runner field, emit a warning and apply
+  // the equivalent runner selection automatically.
+  if (
+    merged.model === 'clagentic:router' &&
+    merged.runner === 'claude-cli'
+  ) {
+    process.stderr.write(
+      '[clagentic:triage] DEPRECATED: model: "clagentic:router" is deprecated. ' +
+      'Set runner: "clagentic-router" and model: "auto" in your config instead.\n',
+    );
+    merged.runner = 'clagentic-router';
+    merged.model = 'auto';
   }
 
   validate(merged);

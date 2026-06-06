@@ -5,7 +5,7 @@
  * via src/llm.js, and returns a structured Assessment.
  *
  * Design decisions respected:
- *   DD-003: LLM calls via claude CLI only (delegated to llm.js)
+ *   DD-003: LLM calls via runner dispatch in llm.js (delegated to callLlm)
  *   DD-004: Input sanitization before prompt construction
  */
 
@@ -78,62 +78,19 @@ export function redact(text) {
 }
 
 // ---------------------------------------------------------------------------
-// Router health check
-// ---------------------------------------------------------------------------
-
-// Router URL is config-driven: config.router_url, defaulting to localhost:4200.
-// Never hardcode a specific host in business logic — operators may run the
-// router on a different address. The constant below is the fallback default only.
-const ROUTER_HEALTH_URL_DEFAULT = 'http://localhost:4200/health';
-const ROUTER_HEALTH_TIMEOUT_MS = 500;
-
-/**
- * Check whether the clagentic:router service is reachable.
- * Returns true if it responds within ROUTER_HEALTH_TIMEOUT_MS.
- * Never throws.
- *
- * @returns {Promise<boolean>}
- */
-async function _routerReachable(config) {
-  const healthUrl = config?.router_url
-    ? `${config.router_url.replace(/\/$/, '')}/health`
-    : ROUTER_HEALTH_URL_DEFAULT;
-  try {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), ROUTER_HEALTH_TIMEOUT_MS);
-    const res = await globalThis.fetch(healthUrl, {
-      signal: controller.signal,
-    });
-    clearTimeout(timer);
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Model resolution
 // ---------------------------------------------------------------------------
 
 /**
- * Determine the model to use for this assessment call.
- * Handles clagentic:router reachability check and fallback (ARCHITECTURE.md).
+ * Determine the model to pass to callLlm for this assessment call.
+ * Runner selection is handled by callLlm based on config.runner — this
+ * function only resolves the model identifier hint.
  *
  * @param {object} config
- * @returns {Promise<string>} Resolved model identifier
+ * @returns {string} Model identifier
  */
-async function _resolveModel(config) {
-  const model = config.model;
-
-  if (model === 'clagentic:router') {
-    const reachable = await _routerReachable(config);
-    if (reachable) {
-      return 'clagentic:router';
-    }
-    return config.model_fallback;
-  }
-
-  return model;
+function _resolveModel(config) {
+  return config.model;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,12 +294,7 @@ export async function assess(config, enrichedEvent) {
     throw new AssessorError('enrichedEvent is required', 'missing_event');
   }
 
-  let resolvedModel;
-  try {
-    resolvedModel = await _resolveModel(config);
-  } catch (err) {
-    throw new AssessorError(`Failed to resolve model: ${err.message}`, 'missing_config');
-  }
+  const resolvedModel = _resolveModel(config);
 
   const prompt = _buildPrompt(config, enrichedEvent, resolvedModel);
   const eventId = enrichedEvent.id ?? '';
@@ -350,7 +302,7 @@ export async function assess(config, enrichedEvent) {
   let llmResponse;
   try {
     llmResponse = await callLlm(prompt, {
-      model: resolvedModel === 'clagentic:router' ? undefined : resolvedModel,
+      config,
       timeout_ms: config.llm_timeout_ms,
     });
   } catch (err) {

@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 
 import { redact, assess, AssessorError } from '../src/assessor.js';
-import { _setSpawnFn } from '../src/llm.js';
+import { _setSpawnFn, callLlm, LlmError } from '../src/llm.js';
 
 // ---------------------------------------------------------------------------
 // Fake process helpers
@@ -389,11 +389,11 @@ describe('assess() — degraded paths', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Model fallback
+// Model / runner selection
 // ---------------------------------------------------------------------------
 
 describe('assess() — model selection', () => {
-  it('uses model_fallback when clagentic:router is unreachable', async () => {
+  it('uses model_fallback when clagentic:router is unreachable (legacy path)', async () => {
     // Override fetch so the health check fails.
     globalThis._fetchBackup = globalThis.fetch;
     globalThis.fetch = async () => {
@@ -415,5 +415,326 @@ describe('assess() — model selection', () => {
     assert.equal(result.verdict, 'accept', 'should return valid assessment');
     // The model_used in the payload matches the fallback.
     assert.equal(result.model_used, 'claude-haiku-3-5');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// callLlm() — runner dispatch
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a fake fetch that returns the given response object.
+ *
+ * @param {object} opts
+ * @param {number}  [opts.status]   - HTTP status code (default 200)
+ * @param {object}  [opts.body]     - JSON body to return
+ * @param {boolean} [opts.throws]   - If true, throw a network error
+ * @param {string}  [opts.rawText]  - Raw text body (takes precedence over body)
+ * @returns {Function}
+ */
+function makeFetch({ status = 200, body = null, throws = false, rawText = null } = {}) {
+  return async (_url, _opts) => {
+    if (throws) {
+      const err = new Error('network error');
+      throw err;
+    }
+    const responseBody = rawText ?? JSON.stringify(body);
+    return {
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => JSON.parse(responseBody),
+      text: async () => responseBody,
+    };
+  };
+}
+
+/**
+ * Save/restore fetch around a test.
+ */
+function withFetch(fn) {
+  return async () => {
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = fn;
+    try {
+      // The test body runs inside the outer it() — nothing to call here.
+      // This wrapper is used inline.
+    } finally {
+      // Cleanup is handled by afterEach.
+    }
+  };
+}
+
+describe('callLlm() — anthropic-api runner', () => {
+  it('POSTs to Anthropic endpoint and parses content[0].text as JSON', async () => {
+    const payload = validLlmPayload();
+    let capturedUrl = null;
+    let capturedBody = null;
+    let capturedHeaders = null;
+
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      capturedUrl = url;
+      capturedBody = JSON.parse(opts.body);
+      capturedHeaders = opts.headers;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ text: JSON.stringify(payload) }] }),
+        text: async () => '',
+      };
+    };
+
+    const result = await callLlm('test prompt', {
+      runner: 'anthropic-api',
+      model: 'claude-opus-4',
+      config: { runner_api_key_env: 'TEST_ANTHROPIC_KEY' },
+    });
+
+    assert.ok(capturedUrl.includes('anthropic.com'), 'should POST to Anthropic API');
+    assert.equal(capturedBody.model, 'claude-opus-4', 'model should be forwarded');
+    assert.equal(capturedBody.messages[0].content, 'test prompt', 'prompt should be in messages');
+    assert.equal(capturedHeaders['anthropic-version'], '2023-06-01', 'API version header should be set');
+    assert.equal(result.verdict, 'accept');
+    assert.equal(result.confidence, 0.9);
+  });
+
+  it('throws LlmError with code exit_nonzero on non-200 response', async () => {
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 401,
+      json: async () => ({}),
+      text: async () => 'Unauthorized',
+    });
+
+    await assert.rejects(
+      () => callLlm('test prompt', { runner: 'anthropic-api', config: {} }),
+      (err) => {
+        assert.ok(err instanceof LlmError, 'should be LlmError');
+        assert.equal(err.code, 'exit_nonzero');
+        assert.ok(err.message.includes('401'), 'message should include status code');
+        return true;
+      },
+    );
+  });
+
+  it('reads API key from the env var named in runner_api_key_env', async () => {
+    const payload = validLlmPayload();
+    let capturedHeaders = null;
+
+    process.env.MY_TEST_ANTHROPIC_KEY = 'test-key-value-xyz';
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = async (_url, opts) => {
+      capturedHeaders = opts.headers;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ content: [{ text: JSON.stringify(payload) }] }),
+        text: async () => '',
+      };
+    };
+
+    await callLlm('test', {
+      runner: 'anthropic-api',
+      config: { runner_api_key_env: 'MY_TEST_ANTHROPIC_KEY' },
+    });
+    delete process.env.MY_TEST_ANTHROPIC_KEY;
+
+    assert.equal(capturedHeaders['x-api-key'], 'test-key-value-xyz', 'API key should be sent');
+  });
+});
+
+describe('callLlm() — openai-compatible runner', () => {
+  it('POSTs to runner_url/chat/completions and parses choices[0].message.content', async () => {
+    const payload = validLlmPayload();
+    let capturedUrl = null;
+    let capturedBody = null;
+
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      capturedUrl = url;
+      capturedBody = JSON.parse(opts.body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{ message: { content: JSON.stringify(payload) } }],
+        }),
+        text: async () => '',
+      };
+    };
+
+    const result = await callLlm('test prompt', {
+      runner: 'openai-compatible',
+      model: 'gpt-4o',
+      config: { runner_url: 'http://localhost:11434', runner_api_key_env: null },
+    });
+
+    assert.ok(capturedUrl.includes('localhost:11434'), 'should use runner_url');
+    assert.ok(capturedUrl.endsWith('/chat/completions'), 'should POST to /chat/completions');
+    assert.equal(capturedBody.model, 'gpt-4o', 'model should be forwarded');
+    assert.equal(result.verdict, 'accept');
+  });
+
+  it('omits Authorization header when api key env var is empty (Ollama local)', async () => {
+    const payload = validLlmPayload();
+    let capturedHeaders = null;
+
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = async (_url, opts) => {
+      capturedHeaders = opts.headers;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [{ message: { content: JSON.stringify(payload) } }],
+        }),
+        text: async () => '',
+      };
+    };
+
+    // runner_api_key_env points to an env var that is not set — key should be absent.
+    delete process.env.OPENAI_API_KEY;
+    await callLlm('test', {
+      runner: 'openai-compatible',
+      config: { runner_url: 'http://localhost:11434' },
+    });
+
+    assert.ok(!('Authorization' in capturedHeaders), 'Authorization should be omitted when key is missing');
+  });
+
+  it('throws LlmError when runner_url is not set', async () => {
+    await assert.rejects(
+      () => callLlm('test', { runner: 'openai-compatible', config: {} }),
+      (err) => {
+        assert.ok(err instanceof LlmError, 'should be LlmError');
+        assert.ok(err.message.includes('runner_url'), 'message should mention runner_url');
+        return true;
+      },
+    );
+  });
+
+  it('throws LlmError with status on non-200 response', async () => {
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 503,
+      json: async () => ({}),
+      text: async () => 'Service Unavailable',
+    });
+
+    await assert.rejects(
+      () => callLlm('test', { runner: 'openai-compatible', config: { runner_url: 'http://localhost:11434' } }),
+      (err) => {
+        assert.ok(err instanceof LlmError);
+        assert.equal(err.code, 'exit_nonzero');
+        assert.ok(err.message.includes('503'));
+        return true;
+      },
+    );
+  });
+});
+
+describe('callLlm() — clagentic-router runner', () => {
+  it('POSTs to runner_url/v1/assess with model and prompt', async () => {
+    const payload = validLlmPayload();
+    let capturedUrl = null;
+    let capturedBody = null;
+    let capturedHeaders = null;
+
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = async (url, opts) => {
+      capturedUrl = url;
+      capturedBody = JSON.parse(opts.body);
+      capturedHeaders = opts.headers;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => payload,
+        text: async () => '',
+      };
+    };
+
+    const result = await callLlm('test prompt', {
+      runner: 'clagentic-router',
+      model: 'fast',
+      config: { runner_url: 'http://router:4200', runner_api_key_env: null },
+    });
+
+    assert.ok(capturedUrl.includes('router:4200'), 'should use runner_url');
+    assert.ok(capturedUrl.endsWith('/v1/assess'), 'should POST to /v1/assess');
+    assert.equal(capturedBody.model, 'fast', 'model should be forwarded');
+    assert.equal(capturedBody.prompt, 'test prompt', 'prompt should be in body');
+    assert.ok(!('Authorization' in capturedHeaders), 'should omit auth when key is not set');
+    assert.equal(result.verdict, 'accept');
+  });
+
+  it('uses default router URL when runner_url is not configured', async () => {
+    const payload = validLlmPayload();
+    let capturedUrl = null;
+
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = async (url, _opts) => {
+      capturedUrl = url;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => payload,
+        text: async () => '',
+      };
+    };
+
+    await callLlm('test', {
+      runner: 'clagentic-router',
+      config: {},
+    });
+
+    assert.ok(capturedUrl.includes('localhost:4200'), 'should fall back to default URL');
+  });
+
+  it('sends Authorization header when runner_api_key_env is set and env var is present', async () => {
+    const payload = validLlmPayload();
+    let capturedHeaders = null;
+
+    process.env.MY_ROUTER_TOKEN = 'router-token-abc';
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = async (_url, opts) => {
+      capturedHeaders = opts.headers;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => payload,
+        text: async () => '',
+      };
+    };
+
+    await callLlm('test', {
+      runner: 'clagentic-router',
+      config: { runner_url: 'http://localhost:4200', runner_api_key_env: 'MY_ROUTER_TOKEN' },
+    });
+    delete process.env.MY_ROUTER_TOKEN;
+
+    assert.ok('Authorization' in capturedHeaders, 'Authorization header should be present');
+    assert.ok(capturedHeaders['Authorization'].includes('Bearer'), 'should be Bearer token');
+  });
+
+  it('throws LlmError on non-200 response', async () => {
+    globalThis._fetchBackup = globalThis.fetch;
+    globalThis.fetch = async () => ({
+      ok: false,
+      status: 502,
+      json: async () => ({}),
+      text: async () => 'Bad Gateway',
+    });
+
+    await assert.rejects(
+      () => callLlm('test', { runner: 'clagentic-router', config: {} }),
+      (err) => {
+        assert.ok(err instanceof LlmError);
+        assert.equal(err.code, 'exit_nonzero');
+        assert.ok(err.message.includes('502'));
+        return true;
+      },
+    );
   });
 });

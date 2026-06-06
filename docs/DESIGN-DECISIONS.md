@@ -69,35 +69,35 @@ triage_rules:
 
 ---
 
-## DD-003: LLM calls via `claude` CLI subprocess; multi-provider via clagentic:router
+## DD-003: LLM calls via runner dispatch in `src/llm.js`; four backends supported
 
-**Decision:** All LLM calls go through the `claude` CLI as a child process.
-The `anthropic` SDK is not a dependency.
+**Decision:** All LLM calls go through `callLlm()` in `src/llm.js`. The runner
+backend is selected by `config.runner` (or `opts.runner` per-call). The `anthropic`
+SDK is not a dependency — the `anthropic-api` runner uses raw `fetch`.
 
 **Rationale:** CLI is the default path. Marginal speed/cost wins do not justify an SDK
-dependency. Deviation requires explicit sign-off.
+dependency. Multiple runner backends are needed for operators who cannot install the CLI
+or who need to route to OpenAI-compatible endpoints or the clagentic:router service.
 
-**Implementation:** `src/llm.js` wraps the subprocess call, constructs the prompt,
-invokes `claude`, parses JSON from stdout, and validates the output schema. If output
-fails to parse or is missing required fields, `llm.js` returns an error result — it
-does not retry silently. The caller (assessor) routes parse errors to HITL.
+**Implementation:** `src/llm.js` selects a runner based on `config.runner`, delegates
+to the appropriate backend function, and applies unified schema validation before
+returning. If output fails to validate, `llm.js` throws `LlmError` — it does not retry
+silently. The caller (assessor) routes LlmErrors to HITL.
 
-**Model selection and provider support:**
+**Runner selection:**
 
-`config.model` controls which model is used:
+`config.runner` selects the backend. `config.model` is passed as a hint.
 
-| Value | Behavior |
+| Runner | Behavior |
 |---|---|
-| `"clagentic:router"` | Delegates to the clagentic router service (`config.router_url`). The router handles multi-provider routing — it can use Claude, GPT-4o, Codex, Gemini, or any other configured backend. Falls back to `model_fallback` if router is unreachable. |
-| Any Claude model ID (e.g. `"claude-sonnet-4-5"`) | Passed directly as `--model` to the `claude` CLI. Requires `claude` CLI with that model available. |
+| `"claude-cli"` | Default. Spawns the `claude` CLI subprocess. Model passed as `--model`. |
+| `"anthropic-api"` | HTTP POST to `https://api.anthropic.com/v1/messages`. API key from env. |
+| `"openai-compatible"` | HTTP POST to `${runner_url}/chat/completions`. Covers OpenAI, Azure, Ollama, etc. |
+| `"clagentic-router"` | HTTP POST to `${runner_url}/v1/assess`. Router handles multi-provider routing. |
 
-**For non-Claude models (GPT, Codex, Gemini, etc.):** set `model: "clagentic:router"` and
-configure the router to route to the desired provider. The router is the multi-provider
-abstraction layer — `src/llm.js` only speaks to the `claude` CLI directly.
-
-The `clagentic:router` is optional. Without it, set `model` to any valid Claude model ID
-and the tool works standalone. The router adds: multi-provider support, cost routing,
-fallback chains, and load balancing across models.
+**Deprecation:** `model: "clagentic:router"` is deprecated. On config load it is
+automatically migrated to `runner: "clagentic-router"` + `model: "auto"` with a warning.
+`router_url` is deprecated in favor of `runner_url` with the same migration shim.
 
 ---
 

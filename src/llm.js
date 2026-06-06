@@ -1,8 +1,11 @@
 /**
- * LLM subprocess wrapper for clagentic:triage.
+ * LLM runner dispatch for clagentic:triage.
  *
- * All LLM calls go through callLlm(). No other module invokes the claude CLI
- * directly (DD-003).
+ * All LLM calls go through callLlm(). No other module invokes any LLM backend
+ * directly (DD-003). The runner backend is selected via opts.runner or
+ * config.runner (default: 'claude-cli').
+ *
+ * Supported runners: claude-cli, anthropic-api, openai-compatible, clagentic-router.
  *
  * The claude binary is resolved via process.env.CLAUDE_PATH, then falls back
  * to 'claude' (relies on PATH). No absolute path is hardcoded.
@@ -37,12 +40,29 @@ const VALID_ACTION_CLASSES = [
  */
 const STDIN_THRESHOLD = 4_000;
 
+/**
+ * Valid runner backend identifiers.
+ */
+export const VALID_RUNNERS = [
+  'claude-cli',
+  'anthropic-api',
+  'openai-compatible',
+  'clagentic-router',
+];
+
+// Module-level API endpoint constants. These are defaults only — config drives
+// runner_url for openai-compatible and clagentic-router, so nothing is truly
+// hardcoded into business logic.
+const ANTHROPIC_API_ENDPOINT = 'https://api.anthropic.com/v1/messages';
+const ANTHROPIC_API_VERSION = '2023-06-01';
+const CLAGENTIC_ROUTER_DEFAULT_URL = 'http://localhost:4200';
+
 // ---------------------------------------------------------------------------
 // Spawn override (test injection)
 // ---------------------------------------------------------------------------
 
 /**
- * The spawn function used by _spawnClaude. Tests may override this via
+ * The spawn function used by _runClaudeCli. Tests may override this via
  * _setSpawnFn() to inject a mock without touching the process environment.
  *
  * @type {Function}
@@ -76,7 +96,7 @@ export class LlmError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Runner: claude-cli
 // ---------------------------------------------------------------------------
 
 /**
@@ -91,7 +111,7 @@ function _claudeBin() {
 
 /**
  * Spawn the claude CLI and collect stdout/stderr.
- * Resolves with { stdout, stderr, code } regardless of exit status.
+ * Resolves with { stdout, stderr, code, timedOut } regardless of exit status.
  *
  * When useStdin is true the prompt is written to the process's stdin and
  * --print is omitted from the arguments.
@@ -100,7 +120,7 @@ function _claudeBin() {
  * @param {string}   model
  * @param {boolean}  useStdin
  * @param {number}   timeoutMs
- * @returns {Promise<{ stdout: string, stderr: string, code: number|null }>}
+ * @returns {Promise<{ stdout: string, stderr: string, code: number|null, timedOut: boolean }>}
  */
 function _spawnClaude(prompt, model, useStdin, timeoutMs) {
   return new Promise((resolve, reject) => {
@@ -157,23 +177,16 @@ function _spawnClaude(prompt, model, useStdin, timeoutMs) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
 /**
- * Call the claude CLI and return parsed JSON from its stdout.
+ * Run the claude CLI and return a parsed JSON payload.
  *
- * @param {string} prompt          - The full prompt text
- * @param {object} [opts]
- * @param {string} [opts.model]    - Model identifier to pass via --model
- * @param {number} [opts.timeout_ms] - Timeout in milliseconds (default: 120000)
- * @returns {Promise<object>}      - Parsed JSON response from the LLM
- * @throws {LlmError}              - On timeout, non-zero exit, parse failure, or missing fields
+ * @param {string} prompt
+ * @param {string|null} model
+ * @param {number} timeoutMs
+ * @returns {Promise<object>}
+ * @throws {LlmError}
  */
-export async function callLlm(prompt, opts = {}) {
-  const model = opts.model ?? null;
-  const timeoutMs = typeof opts.timeout_ms === 'number' ? opts.timeout_ms : DEFAULT_TIMEOUT_MS;
+async function _runClaudeCli(prompt, model, timeoutMs) {
   const useStdin = prompt.length > STDIN_THRESHOLD;
 
   let result;
@@ -204,16 +217,260 @@ export async function callLlm(prompt, opts = {}) {
   // The claude CLI --output-format json wraps the response. If the result
   // contains a 'result' field that is a string, attempt to parse that as the
   // actual LLM JSON payload. This handles the CLI's envelope format.
-  let payload = parsed;
   if (typeof parsed === 'object' && parsed !== null && typeof parsed.result === 'string') {
     try {
-      payload = JSON.parse(parsed.result);
+      return JSON.parse(parsed.result);
     } catch {
       const snippet = parsed.result.slice(0, 500);
       throw new LlmError(`LLM result field is not valid JSON: ${snippet}`, 'parse_error');
     }
   }
 
+  return parsed;
+}
+
+// ---------------------------------------------------------------------------
+// Runner: anthropic-api
+// ---------------------------------------------------------------------------
+
+/**
+ * Call the Anthropic Messages API directly via fetch and return a parsed JSON payload.
+ *
+ * @param {string} prompt
+ * @param {string|null} model
+ * @param {number} timeoutMs
+ * @param {object|null} config
+ * @returns {Promise<object>}
+ * @throws {LlmError}
+ */
+async function _runAnthropicApi(prompt, model, timeoutMs, config) {
+  const apiKeyEnv = config?.runner_api_key_env ?? 'ANTHROPIC_API_KEY';
+  const apiKey = process.env[apiKeyEnv];
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response;
+  try {
+    response = await globalThis.fetch(ANTHROPIC_API_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'x-api-key': apiKey || '',
+        'anthropic-version': ANTHROPIC_API_VERSION,
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: model || 'claude-sonnet-4-5',
+        max_tokens: 4096,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: controller.signal,
+    });
+  } catch (fetchErr) {
+    clearTimeout(timer);
+    if (fetchErr.name === 'AbortError') {
+      throw new LlmError('LLM call timed out', 'timeout');
+    }
+    throw new LlmError(`anthropic-api fetch failed: ${fetchErr.message}`, 'exit_nonzero');
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    throw new LlmError(
+      `anthropic-api returned HTTP ${response.status}`,
+      'exit_nonzero',
+    );
+  }
+
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    throw new LlmError('anthropic-api response is not valid JSON', 'parse_error');
+  }
+
+  const text = body?.content?.[0]?.text;
+  if (typeof text !== 'string') {
+    throw new LlmError('anthropic-api response missing content[0].text', 'parse_error');
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    const snippet = text.slice(0, 500);
+    throw new LlmError(`anthropic-api content is not valid JSON: ${snippet}`, 'parse_error');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Runner: openai-compatible
+// ---------------------------------------------------------------------------
+
+/**
+ * Call an OpenAI-compatible /chat/completions endpoint and return a parsed JSON payload.
+ *
+ * @param {string} prompt
+ * @param {string|null} model
+ * @param {number} timeoutMs
+ * @param {object|null} config
+ * @returns {Promise<object>}
+ * @throws {LlmError}
+ */
+async function _runOpenAiCompatible(prompt, model, timeoutMs, config) {
+  const runnerUrl = config?.runner_url;
+  if (!runnerUrl) {
+    throw new LlmError(
+      'openai-compatible runner requires runner_url to be set in config',
+      'exit_nonzero',
+    );
+  }
+
+  const endpoint = `${runnerUrl.replace(/\/$/, '')}/chat/completions`;
+  const apiKeyEnv = config?.runner_api_key_env ?? 'OPENAI_API_KEY';
+  const apiKey = apiKeyEnv ? process.env[apiKeyEnv] : '';
+
+  const headers = { 'content-type': 'application/json' };
+  // Only add Authorization if the key env var is set and non-empty (covers Ollama local).
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response;
+  try {
+    response = await globalThis.fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: model || 'gpt-4o',
+        max_tokens: 4096,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: controller.signal,
+    });
+  } catch (fetchErr) {
+    clearTimeout(timer);
+    if (fetchErr.name === 'AbortError') {
+      throw new LlmError('LLM call timed out', 'timeout');
+    }
+    throw new LlmError(`openai-compatible fetch failed: ${fetchErr.message}`, 'exit_nonzero');
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    let bodySnippet = '';
+    try {
+      const rawBody = await response.text();
+      bodySnippet = rawBody.slice(0, 200);
+    } catch {
+      // ignore body read failure
+    }
+    throw new LlmError(
+      `openai-compatible returned HTTP ${response.status}: ${bodySnippet}`,
+      'exit_nonzero',
+    );
+  }
+
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    throw new LlmError('openai-compatible response is not valid JSON', 'parse_error');
+  }
+
+  const text = body?.choices?.[0]?.message?.content;
+  if (typeof text !== 'string') {
+    throw new LlmError('openai-compatible response missing choices[0].message.content', 'parse_error');
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch {
+    const snippet = text.slice(0, 500);
+    throw new LlmError(`openai-compatible content is not valid JSON: ${snippet}`, 'parse_error');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Runner: clagentic-router
+// ---------------------------------------------------------------------------
+
+/**
+ * Call the clagentic:router /v1/assess endpoint and return the assessment JSON.
+ * The router validates output and returns the assessment directly — no unwrapping needed.
+ *
+ * @param {string} prompt
+ * @param {string|null} model
+ * @param {number} timeoutMs
+ * @param {object|null} config
+ * @returns {Promise<object>}
+ * @throws {LlmError}
+ */
+async function _runClagenticRouter(prompt, model, timeoutMs, config) {
+  const runnerUrl = config?.runner_url ?? CLAGENTIC_ROUTER_DEFAULT_URL;
+  const endpoint = `${runnerUrl.replace(/\/$/, '')}/v1/assess`;
+
+  const apiKeyEnv = config?.runner_api_key_env ?? 'CLAGENTIC_ROUTER_TOKEN';
+  const apiKey = apiKeyEnv ? process.env[apiKeyEnv] : '';
+
+  const headers = { 'content-type': 'application/json' };
+  if (apiKey) {
+    headers['Authorization'] = `Bearer ${apiKey}`;
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response;
+  try {
+    response = await globalThis.fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ model: model || 'auto', prompt }),
+      signal: controller.signal,
+    });
+  } catch (fetchErr) {
+    clearTimeout(timer);
+    if (fetchErr.name === 'AbortError') {
+      throw new LlmError('LLM call timed out', 'timeout');
+    }
+    throw new LlmError(`clagentic-router fetch failed: ${fetchErr.message}`, 'exit_nonzero');
+  }
+  clearTimeout(timer);
+
+  if (!response.ok) {
+    throw new LlmError(
+      `clagentic-router returned HTTP ${response.status}`,
+      'exit_nonzero',
+    );
+  }
+
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    throw new LlmError('clagentic-router response is not valid JSON', 'parse_error');
+  }
+
+  // The router returns the assessment JSON directly — no envelope to unwrap.
+  return body;
+}
+
+// ---------------------------------------------------------------------------
+// Schema validation (shared across all runners)
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate a raw payload object against the assessment schema.
+ * Throws LlmError with code 'missing_fields' or 'bad_response' on any failure.
+ *
+ * @param {object} payload
+ * @returns {object} The validated payload (same reference)
+ * @throws {LlmError}
+ */
+function _validatePayload(payload) {
   for (const field of REQUIRED_FIELDS) {
     if (!(field in payload) || payload[field] === undefined || payload[field] === null) {
       throw new LlmError(
@@ -223,9 +480,7 @@ export async function callLlm(prompt, opts = {}) {
     }
   }
 
-  // RT-007: Strict type and enum validation. Presence checks above are not
-  // sufficient — a type-coerced confidence ("1.0" as string) bypasses the
-  // threshold gate in the assessor. Validate everything before returning.
+  // RT-007: Strict type and enum validation.
   if (!VALID_VERDICTS.includes(payload.verdict)) {
     throw new LlmError(
       `LLM response verdict "${payload.verdict}" is not a valid value. Expected one of: ${VALID_VERDICTS.join(', ')}`,
@@ -262,4 +517,60 @@ export async function callLlm(prompt, opts = {}) {
   }
 
   return payload;
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/**
+ * Call an LLM backend and return a validated assessment JSON payload.
+ *
+ * The runner is selected in priority order:
+ *   1. opts.runner (explicit per-call override)
+ *   2. opts.config?.runner (from loaded config)
+ *   3. 'claude-cli' (built-in default)
+ *
+ * @param {string} prompt            - The full prompt text
+ * @param {object} [opts]
+ * @param {string} [opts.runner]     - Runner override ('claude-cli' | 'anthropic-api' | 'openai-compatible' | 'clagentic-router')
+ * @param {string} [opts.model]      - Model identifier (semantics depend on runner)
+ * @param {number} [opts.timeout_ms] - Timeout in milliseconds (default: 120000)
+ * @param {object} [opts.config]     - Full config object for runner-specific settings
+ * @returns {Promise<object>}        - Validated assessment JSON
+ * @throws {LlmError}                - On timeout, non-zero exit, parse failure, or schema violation
+ */
+export async function callLlm(prompt, opts = {}) {
+  const runner = opts.runner ?? opts.config?.runner ?? 'claude-cli';
+  const model = opts.model ?? opts.config?.model ?? null;
+  const timeoutMs = typeof opts.timeout_ms === 'number' ? opts.timeout_ms : DEFAULT_TIMEOUT_MS;
+  const config = opts.config ?? null;
+
+  let rawPayload;
+
+  switch (runner) {
+    case 'claude-cli':
+      rawPayload = await _runClaudeCli(prompt, model, timeoutMs);
+      break;
+
+    case 'anthropic-api':
+      rawPayload = await _runAnthropicApi(prompt, model, timeoutMs, config);
+      break;
+
+    case 'openai-compatible':
+      rawPayload = await _runOpenAiCompatible(prompt, model, timeoutMs, config);
+      break;
+
+    case 'clagentic-router':
+      rawPayload = await _runClagenticRouter(prompt, model, timeoutMs, config);
+      break;
+
+    default:
+      throw new LlmError(
+        `Unknown runner: "${runner}". Valid runners: ${VALID_RUNNERS.join(', ')}`,
+        'exit_nonzero',
+      );
+  }
+
+  return _validatePayload(rawPayload);
 }
