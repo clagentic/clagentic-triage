@@ -16,11 +16,10 @@ Dispatchers push triage verdicts and actions into external task/ticket systems. 
 ## Writing a dispatcher
 
 ```js
-module.exports = {
-  name: 'mydispatcher',
-  create_task(config, event, assessment) { },  // returns Promise<{id, url}>
-  update_task(config, task_id, patch) { }       // returns Promise<void>
-}
+// src/dispatchers/mydispatcher.js — ESM
+export const name = 'mydispatcher'
+export async function create_task(config, event, assessment) { }  // returns { id, url }
+export async function update_task(config, task_id, patch) { }     // returns void
 ```
 
 `assessment` is the full assessor output object. The dispatcher can use whatever fields it needs.
