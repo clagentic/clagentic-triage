@@ -2,3 +2,6 @@
 node_modules/
 .triage/
 *.log
+
+# Agent worktrees (clagentic harness)
+.claude/
