@@ -148,13 +148,20 @@ the LLM prompt without the `<UNTRUSTED_USER_CONTENT>` boundary applied to issue/
 **Residual risk and mitigations:**
 - A compromised maintainer account or a supply-chain compromise of the repo could weaponize
   the intent file. Mitigations applied:
-  1. **Size cap (RT-003):** Intent files are capped at 64 KB and truncated with a visible
-     marker. A legitimate triage-intent.yml is typically < 2 KB; an abnormally large file
-     is a signal. The cap limits the blast radius of prompt-stuffing.
+  1. **Size cap (RT-003):** Intent files are capped at 64 KB (`MAX_INTENT_FILE_BYTES`) and
+     truncated with a visible marker. A legitimate triage-intent.yml is typically < 2 KB; an
+     abnormally large file is a signal. The cap limits the blast radius of prompt-stuffing.
   2. **`repo_context_files` path safety (RT-005):** Referenced context files are validated
      by extension allowlist and blocked-path patterns before fetching. The intent file cannot
      be used to read arbitrary repo content.
-  3. **Operator awareness:** Operators deploying this tool should treat the intent file as
+  3. **Composite byte bound:** The 64 KB intent cap is a *per-source* cap, not the total
+     bytes reaching the LLM. A truncated intent file that retains a `repo_context_files`
+     block still triggers up to `MAX_CONTEXT_FILES` (5) fetches of up to
+     `MAX_CONTEXT_FILE_BYTES` (32 KB) each. The composite worst-case repo-controlled
+     context is therefore ~64 KB + 5×32 KB ≈ 224 KB. All three caps compose; none defeats
+     another. Operators tuning these limits should reason about the aggregate, not just the
+     intent cap.
+  4. **Operator awareness:** Operators deploying this tool should treat the intent file as
      configuration with the same review discipline as CI workflow files.
 
 **What this does NOT protect against:**
