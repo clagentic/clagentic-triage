@@ -8,7 +8,8 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { enrich, parseYaml } from '../src/enricher.js';
+import { enrich } from '../src/enricher.js';
+import { parseYaml } from '../src/yaml.js';
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
