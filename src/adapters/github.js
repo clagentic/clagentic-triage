@@ -46,9 +46,14 @@ export const name = 'github';
 // ---------------------------------------------------------------------------
 
 export class AdapterError extends Error {
-  constructor(message) {
+  /**
+   * @param {string} message
+   * @param {string} [code] - Machine-readable error code (e.g. 'auth_failure', 'rate_limited')
+   */
+  constructor(message, code) {
     super(message);
     this.name = 'AdapterError';
+    this.code = code ?? null;
   }
 }
 
@@ -131,13 +136,15 @@ async function _fetchPaginated(url, token, cacheKey) {
     const res = await globalThis.fetch(nextUrl, { headers: _headers(token, etag) });
 
     if (firstPage && res.status === 304) {
+      // Still honour rate-limit headers on 304 responses — they count against the budget.
+      await _handleRateLimit(res.headers);
       return { items: [], status: 304 };
     }
 
     await _handleRateLimit(res.headers);
 
     if (res.status === 401) {
-      throw new AdapterError('GitHub token invalid or missing');
+      throw new AdapterError('GitHub token invalid or missing', 'auth_failure');
     }
 
     if (res.status === 403) {
@@ -145,9 +152,10 @@ async function _fetchPaginated(url, token, cacheKey) {
       if (retryAfter) {
         throw new AdapterError(
           `GitHub API forbidden; rate limit exceeded. Retry-After: ${retryAfter}s`,
+          'rate_limited',
         );
       }
-      throw new AdapterError('GitHub API forbidden (403)');
+      throw new AdapterError('GitHub API forbidden (403)', 'forbidden');
     }
 
     if (!res.ok) {
@@ -321,7 +329,7 @@ export async function list_events(config, since) {
 
       events.push(...normalized);
     } catch (err) {
-      if (err instanceof AdapterError && err.message.includes('token invalid')) {
+      if (err instanceof AdapterError && err.code === 'auth_failure') {
         console.warn(`[github adapter] auth failure for repo ${repo}: ${err.message}`);
         return [];
       }
@@ -347,7 +355,7 @@ async function _listOrgRepos(org, token) {
   try {
     result = await _fetchPaginated(url, token, null);
   } catch (err) {
-    if (err instanceof AdapterError && err.message.includes('token invalid')) {
+    if (err instanceof AdapterError && err.code === 'auth_failure') {
       console.warn(`[github adapter] auth failure listing org repos for ${org}: ${err.message}`);
       return null;
     }
