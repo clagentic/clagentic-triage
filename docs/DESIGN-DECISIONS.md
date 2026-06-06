@@ -279,3 +279,66 @@ adapter via `actor_allowed(config, event)`, keeping the actor policy co-located
 with the adapter that produced the association signal. The pure decision function
 `should_process_actor(config, { author, author_association })` is exported for
 reuse and testing.
+
+---
+
+## DD-009: ETag cache has a TTL, is invalidated after writes, and re-applies filters on 304 replay
+
+**Decision:** The GitHub adapter's ETag cache (module-level Map keyed by repo + since) enforces
+a 5-minute TTL, is invalidated after any write operation, and re-applies bot and actor filters
+to cached items before returning them on a 304 replay.
+
+**Rationale:**
+- Without a TTL, a long-running watch process accumulates cache entries that are never evicted.
+  Stale entries can mask real changes if GitHub's ETag happens to be reused for a different
+  response body.
+- After a write (comment, close, label, approve), the repo's state has changed. The ETag for
+  that repo's issue list is now stale. Invalidating on write ensures the next poll fetches fresh
+  data rather than replaying a pre-write snapshot.
+- `config.source.allow_bot_logins` and `config.source.ignore_logins` can change between poll
+  cycles (config reload). If a 304 replay returns pre-filter items and config has changed, the
+  pipeline processes events it should have dropped (or vice versa). Re-applying filters on replay
+  is a defense-in-depth measure that keeps behavior consistent across hot config changes.
+
+**Implementation:**
+- `ETAG_CACHE_TTL_MS = 300_000` (5 minutes). On cache lookup, if `Date.now() - entry.cached_at > TTL`,
+  the entry is evicted and the fetch proceeds without `If-None-Match`.
+- `_invalidate_cache(repo)` removes all entries whose key contains `:${repo}:`. Called in each write method.
+- Cache entry is written **after** normalization succeeds (not before), so a partially-processed
+  fetch never leaves a stale empty entry in the cache.
+- On 304, the cached normalized events are re-run through `_isBot` and `should_process_actor` before
+  being appended to the results.
+
+---
+
+## DD-010: Operator-supplied dispatcher module paths are validated before dynamic import
+
+**Decision:** When a `dispatchers` config entry has a `module` field (operator-supplied path),
+the path is validated against a confinement policy before `import()` is called. Invalid paths
+are skipped with a warning; they never cause a crash.
+
+**Rationale (RT-009):** Dynamic `import()` of an arbitrary operator-supplied path is a path
+traversal risk. Without validation, a misconfigured or malicious config entry could load
+system files (e.g. `/etc/passwd` as a module), execute code outside the project, or read
+sensitive content. The confinement policy limits filesystem-path specifiers to within the
+operator's `process.cwd()` — effectively the project directory.
+
+**Implementation:**
+- `_validate_module_path(modulePath, cwd)` (exported for testing) validates the specifier:
+  - Rejects paths containing null bytes (C-level path truncation).
+  - Bare npm specifiers (`package-name`, `@scope/pkg`) are not filesystem paths — they pass
+    without confinement checks and are loaded via node_modules as normal.
+  - Relative (`./`, `../`) and absolute paths are resolved to an absolute path via
+    `resolve(cwd, modulePath)`. The resolved path must start with `cwd + sep` (sep-appended to
+    prevent prefix-collision attacks like `/tmp` matching `/tmp-evil`).
+  - Returns `{ valid: true, resolvedPath }` on pass or `{ valid: false, reason }` on reject.
+- `resolveDispatcher` converts `resolvedPath` to a `file://` URL and passes that to `import()`.
+  This is the key safety property: the path that is **validated** and the path that is **loaded**
+  are identical. Using the raw `entry.module` string would let ESM resolve it relative to
+  `src/dispatchers/`, not `cwd`, defeating the confinement check for relative specifiers.
+- Validation failures log a warning and return `null`; the loader skips the entry and continues.
+  The pipeline is never blocked by a bad dispatcher config entry.
+
+**Scope note:** The hook module loader (`config.hooks`) is not yet implemented. When it is,
+the same guard (`_validate_module_path` + import-from-resolvedPath) must be applied there.
+This is noted in `src/cli.js` where hook loading will be wired.

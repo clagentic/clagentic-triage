@@ -50,10 +50,14 @@ The pipeline runs cleanly with an empty `dispatchers` list (no dispatch).
 The loader (`src/dispatchers/index.js`) walks the `dispatchers` list and
 resolves each entry to a module:
 
-- **`module` set** — the value is dynamic-imported as given. This is the path
-  for third-party and private backends. Resolution is whatever Node's module
-  resolver does for that specifier (package name, absolute path, file URL). The
-  operator is trusting that module; the core does not sandbox it.
+- **`module` set** — the path is validated before import (RT-009). Relative
+  (`./...`, `../...`) and absolute (`/...`) paths must resolve to a location
+  inside `process.cwd()` — traversal outside the project root is rejected and
+  the entry is skipped with a warning. The resolved absolute path is what
+  gets imported, so the validated path and the loaded path are always identical.
+  Bare npm package names and scoped packages (`@scope/pkg`) are not filesystem
+  paths and pass without confinement checks. The operator is trusting any loaded
+  module; the core does not sandbox it.
 - **`name` only** — resolves a bundled reference dispatcher at
   `./<name>.js` inside the dispatchers directory. The name is validated against
   `^[a-z][a-z0-9-]*$` first: a name containing slashes, dots, a leading hyphen,
@@ -81,8 +85,32 @@ first-class once you point config at its module.
 
 | Dispatcher | Status  | Notes                                   |
 |---|---|---|
-| `webhook`  | planned | Generic outbound HTTP POST              |
+| `webhook`  | shipped | Generic outbound HTTP POST with optional HMAC-SHA256 signing |
 | `noop`     | shipped | Logs only — dry-run; copy as a template |
+
+### webhook dispatcher
+
+POSTs a structured JSON payload to a configured URL on each dispatch event.
+
+```json
+{
+  "dispatchers": [
+    {
+      "name": "webhook",
+      "url": "https://example.com/triage-hook",
+      "secret": "optional-hmac-secret",
+      "timeout_ms": 5000
+    }
+  ]
+}
+```
+
+- `url` — required. POST target.
+- `secret` — optional. If set, adds `X-Clagentic-Signature: sha256=<HMAC-SHA256 hex>` to the request so the receiver can verify authenticity.
+- `timeout_ms` — optional, default `5000`. Request is aborted after this many milliseconds.
+
+The payload includes structured verdict fields only — raw issue/PR body and
+context blocks are never sent.
 
 Common ticketing backends (Jira, Linear, GitHub Issues, etc.) are implemented
 as dispatchers using the same interface; see each integration's own
