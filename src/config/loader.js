@@ -51,6 +51,7 @@ function defaults() {
     model_fallback: 'claude-sonnet-4-5',
     confidence_threshold: 0.7,
     auto_approve: [],
+    allow_auto_pr_approval: false,  // RT-002: explicit opt-in required before approve class works
     pending_queue: '.triage/pending.jsonl',
     dispatchers: [],
     hooks: [],
@@ -191,6 +192,17 @@ function validate(cfg) {
         `auto_approve contains invalid action class "${action}". Valid classes: ${VALID_AUTO_APPROVE_CLASSES.join(', ')}`,
       );
     }
+  }
+
+  // RT-002: auto-approving the 'approve' action class means the LLM can
+  // autonomously approve PRs on live repos. This requires an explicit opt-in
+  // acknowledgment key to prevent accidental enablement.
+  if (cfg.auto_approve.includes('approve') && !cfg.allow_auto_pr_approval) {
+    throw new ConfigError(
+      'auto_approve includes "approve" (autonomous PR approval) but allow_auto_pr_approval is not set to true. ' +
+      'Set allow_auto_pr_approval: true in your config to confirm this is intentional. ' +
+      'See docs/DESIGN-DECISIONS.md DD-002 for the security implications.',
+    );
   }
 
   const port = cfg.webhooks.port;

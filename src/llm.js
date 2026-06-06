@@ -22,6 +22,16 @@ const DEFAULT_TIMEOUT_MS = 120_000;
 const REQUIRED_FIELDS = ['verdict', 'confidence', 'reasoning', 'suggested_action'];
 
 /**
+ * Strict schema constraints on the LLM response payload (RT-007).
+ * Type coercion bypasses the confidence threshold gate — all fields are
+ * validated to exact types and enum values before the payload is returned.
+ */
+const VALID_VERDICTS = ['accept', 'needs_changes', 'reject', 'escalate', 'defer'];
+const VALID_ACTION_CLASSES = [
+  'approve', 'respond', 'request_changes', 'close', 'dispatch', 'escalate',
+];
+
+/**
  * Threshold above which a prompt is written to stdin rather than passed as
  * a --print argument. Keeps argv within safe limits on all platforms.
  */
@@ -211,6 +221,44 @@ export async function callLlm(prompt, opts = {}) {
         'missing_fields',
       );
     }
+  }
+
+  // RT-007: Strict type and enum validation. Presence checks above are not
+  // sufficient — a type-coerced confidence ("1.0" as string) bypasses the
+  // threshold gate in the assessor. Validate everything before returning.
+  if (!VALID_VERDICTS.includes(payload.verdict)) {
+    throw new LlmError(
+      `LLM response verdict "${payload.verdict}" is not a valid value. Expected one of: ${VALID_VERDICTS.join(', ')}`,
+      'bad_response',
+    );
+  }
+
+  if (typeof payload.confidence !== 'number' || payload.confidence < 0 || payload.confidence > 1) {
+    throw new LlmError(
+      `LLM response confidence must be a number between 0 and 1, got: ${JSON.stringify(payload.confidence)}`,
+      'bad_response',
+    );
+  }
+
+  if (typeof payload.reasoning !== 'string' || payload.reasoning.trim().length === 0) {
+    throw new LlmError(
+      'LLM response reasoning must be a non-empty string',
+      'bad_response',
+    );
+  }
+
+  if (typeof payload.suggested_action !== 'object' || payload.suggested_action === null) {
+    throw new LlmError(
+      'LLM response suggested_action must be an object',
+      'bad_response',
+    );
+  }
+
+  if (!VALID_ACTION_CLASSES.includes(payload.suggested_action.class)) {
+    throw new LlmError(
+      `LLM response suggested_action.class "${payload.suggested_action.class}" is not valid. Expected one of: ${VALID_ACTION_CLASSES.join(', ')}`,
+      'bad_response',
+    );
   }
 
   return payload;

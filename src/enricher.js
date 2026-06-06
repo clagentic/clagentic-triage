@@ -39,6 +39,35 @@ const ACCEPT_HEADER = 'application/vnd.github+json';
 const API_VERSION_HEADER = 'X-GitHub-Api-Version';
 const API_VERSION = '2022-11-28';
 
+// RT-005: repo_context_files path safety constraints.
+// Only documentation-style file extensions are permitted as context file
+// fetches. Binary, credential, and config files are blocked by extension.
+const ALLOWED_CONTEXT_EXTENSIONS = new Set(['.md', '.txt', '.yml', '.yaml', '.json', '.rst']);
+
+// Path segments that are always blocked regardless of extension.
+const BLOCKED_PATH_PATTERNS = [
+  /\.env(\.|$)/i,
+  /secret/i,
+  /credential/i,
+  /private/i,
+  /\.pem$/i,
+  /\.key$/i,
+  /\.p12$/i,
+  /\.pfx$/i,
+  /\.cer$/i,
+  /\.crt$/i,
+  /token/i,
+  /password/i,
+  /\.git\//,
+  /^\.git$/,
+];
+
+// Maximum number of context files to fetch per intent file.
+const MAX_CONTEXT_FILES = 5;
+
+// Maximum byte size of a single fetched context file (32 KB).
+const MAX_CONTEXT_FILE_BYTES = 32 * 1024;
+
 /**
  * Generic fallback intent used when neither the YAML file nor the Markdown
  * fallback is found in the target repo.
@@ -474,16 +503,33 @@ async function _loadIntent(config, repo, token) {
     const contextFiles = parsed.repo_context_files;
     if (Array.isArray(contextFiles) && contextFiles.length > 0) {
       const resolved = {};
+      // RT-005: cap the number of files, validate each path before fetching.
+      const safeCandidates = contextFiles.slice(0, MAX_CONTEXT_FILES);
       await Promise.all(
-        contextFiles.map(async (entry) => {
+        safeCandidates.map(async (entry) => {
           // Each entry is expected to be an object with a `path` key.
           const filePath = typeof entry === 'object' && entry !== null ? entry.path : null;
           if (!filePath || typeof filePath !== 'string') {
             return;
           }
+          // RT-005: reject blocked path patterns (credentials, keys, etc.)
+          if (BLOCKED_PATH_PATTERNS.some((re) => re.test(filePath))) {
+            console.warn(`[enricher] repo_context_files: blocked path "${filePath}" (matches credential/secret pattern)`);
+            return;
+          }
+          // RT-005: enforce extension allowlist
+          const ext = filePath.slice(filePath.lastIndexOf('.')).toLowerCase();
+          if (!ALLOWED_CONTEXT_EXTENSIONS.has(ext)) {
+            console.warn(`[enricher] repo_context_files: blocked path "${filePath}" (extension "${ext}" not in allowlist)`);
+            return;
+          }
           const content = await _fetchRepoFile(repo, filePath, token);
           if (content !== null) {
-            resolved[filePath] = content;
+            // RT-005: enforce per-file size cap
+            const truncated = content.length > MAX_CONTEXT_FILE_BYTES
+              ? content.slice(0, MAX_CONTEXT_FILE_BYTES) + '\n[...truncated]'
+              : content;
+            resolved[filePath] = truncated;
           }
         }),
       );
