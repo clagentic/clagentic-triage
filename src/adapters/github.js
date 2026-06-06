@@ -35,6 +35,7 @@ const ACCEPT_HEADER = 'application/vnd.github+json';
 const API_VERSION_HEADER = 'X-GitHub-Api-Version';
 const API_VERSION = '2022-11-28';
 const PER_REPO_SAFETY_CAP = 500;
+const ETAG_CACHE_TTL_MS = 300_000;
 
 // ---------------------------------------------------------------------------
 // Public name
@@ -62,8 +63,22 @@ export class AdapterError extends Error {
 // ETag cache — module-level, keyed by repo+url string
 // ---------------------------------------------------------------------------
 
-/** @type {Map<string, { etag: string, result: object[] }>} */
+/** @type {Map<string, { etag: string, result: object[], cached_at: number }>} */
 const _etagCache = new Map();
+
+/**
+ * Remove all cache entries whose key begins with the given repo path prefix.
+ * Called after any write operation so subsequent polls re-fetch fresh data.
+ *
+ * @param {string} repo - "owner/repo" string
+ */
+function _invalidate_cache(repo) {
+  for (const key of _etagCache.keys()) {
+    if (key.includes(`:${repo}:`)) {
+      _etagCache.delete(key);
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Internal HTTP helpers
@@ -132,8 +147,19 @@ async function _fetchPaginated(url, token, cacheKey) {
   let firstPage = true;
 
   while (nextUrl && items.length < PER_REPO_SAFETY_CAP) {
-    // Only send ETag on first page of a paginated series
-    const etag = firstPage && cacheKey ? _etagCache.get(cacheKey)?.etag : undefined;
+    // Only send ETag on first page of a paginated series, and only if not expired.
+    let etag;
+    if (firstPage && cacheKey) {
+      const entry = _etagCache.get(cacheKey);
+      if (entry) {
+        if (Date.now() - entry.cached_at > ETAG_CACHE_TTL_MS) {
+          // TTL expired — evict and do a full re-fetch.
+          _etagCache.delete(cacheKey);
+        } else {
+          etag = entry.etag;
+        }
+      }
+    }
     const res = await globalThis.fetch(nextUrl, { headers: _headers(token, etag) });
 
     if (firstPage && res.status === 304) {
@@ -168,8 +194,9 @@ async function _fetchPaginated(url, token, cacheKey) {
     if (firstPage && cacheKey) {
       const newEtag = res.headers.get('ETag');
       if (newEtag) {
-        // Placeholder — updated after we collect all pages
-        _etagCache.set(cacheKey, { etag: newEtag, result: [] });
+        // Placeholder result — updated after we collect all pages.
+        // cached_at records when the entry was written for TTL enforcement.
+        _etagCache.set(cacheKey, { etag: newEtag, result: [], cached_at: Date.now() });
       }
     }
 
@@ -370,9 +397,25 @@ export async function list_events(config, since) {
     try {
       const result = await _fetchPaginated(url, token, cacheKey);
       if (result.status === 304) {
-        // Cache stores already-normalized events; push them directly.
+        // Cache stores already-normalized events. Re-apply bot and actor filters
+        // in case config.source.allow_bot_logins or config.source.ignore_logins
+        // changed since the entry was written.
         const cached = _etagCache.get(cacheKey);
-        events.push(...(cached?.result ?? []));
+        const cachedItems = cached?.result ?? [];
+        for (const event of cachedItems) {
+          if (_isBot({ user: { login: event.author, type: '' } }, allowBotLogins)) {
+            continue;
+          }
+          if (
+            !should_process_actor(config, {
+              author: event.author,
+              author_association: event.metadata?.author_association ?? null,
+            })
+          ) {
+            continue;
+          }
+          events.push(event);
+        }
         continue;
       }
 
@@ -477,6 +520,7 @@ export async function post_comment(config, event, body) {
   }
 
   const data = await res.json();
+  _invalidate_cache(event.repo);
   return data.html_url;
 }
 
@@ -517,6 +561,8 @@ export async function close_item(config, event) {
   if (!res.ok) {
     throw new AdapterError(`close_item failed: ${res.status} ${res.statusText}`);
   }
+
+  _invalidate_cache(event.repo);
 }
 
 // ---------------------------------------------------------------------------
@@ -549,6 +595,8 @@ export async function request_changes(config, event, body) {
   if (!res.ok) {
     throw new AdapterError(`request_changes failed: ${res.status} ${res.statusText}`);
   }
+
+  _invalidate_cache(event.repo);
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +628,8 @@ export async function approve_pr(config, event) {
   if (!res.ok) {
     throw new AdapterError(`approve_pr failed: ${res.status} ${res.statusText}`);
   }
+
+  _invalidate_cache(event.repo);
 }
 
 // ---------------------------------------------------------------------------
@@ -607,6 +657,8 @@ export async function label_item(config, event, labels) {
   if (!res.ok) {
     throw new AdapterError(`label_item failed: ${res.status} ${res.statusText}`);
   }
+
+  _invalidate_cache(event.repo);
 }
 
 // ---------------------------------------------------------------------------
