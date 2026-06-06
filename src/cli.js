@@ -72,11 +72,6 @@ async function getConfig(flags) {
     }
     return await loadConfig();
   } catch (err) {
-    if (err instanceof ConfigError && typeof configPath !== 'string') {
-      // No explicit config file and no project config — use bare defaults.
-      // loadConfig always returns defaults when no files exist, so a
-      // ConfigError here means something else (e.g. bad env var). Re-throw.
-    }
     throw err;
   }
 }
@@ -116,7 +111,9 @@ function formatItem(item) {
 
 async function cmdWatch(flags) {
   const config = await getConfig(flags);
-  const intervalSec = parseInt(flags.get('interval') ?? '60', 10);
+  const intervalSec = flags.has('interval')
+    ? parseInt(flags.get('interval'), 10)
+    : (config.source?.poll_interval_seconds ?? 60);
   const { list_events } = await import(`./adapters/${config.source.adapter}.js`);
   const adapter = { list_events };
 
