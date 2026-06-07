@@ -54,6 +54,8 @@ function makeAssessment(overrides = {}) {
 }
 
 const FAKE_MODULE_PATH = fileURLToPath(new URL('./fixtures/fake-dispatcher.js', import.meta.url));
+const BROKEN_MODULE_PATH = fileURLToPath(new URL('./fixtures/broken-dispatcher.js', import.meta.url));
+const THROWING_MODULE_PATH = fileURLToPath(new URL('./fixtures/throwing-dispatcher.js', import.meta.url));
 
 // ---------------------------------------------------------------------------
 // noop reference dispatcher
@@ -120,12 +122,9 @@ describe('loadDispatchers', () => {
   }
 
   it('skips a dispatcher missing create_task with a warning; others still load', async () => {
-    // Build a data: URL module that exports a name but no create_task.
-    const badModule =
-      'data:text/javascript,export const name = "broken";';
     const loaded = await loadDispatchers({
       dispatchers: [
-        { name: 'broken', module: badModule },
+        { name: 'broken', module: BROKEN_MODULE_PATH },
         { name: 'noop' },
       ],
     });
@@ -166,16 +165,11 @@ describe('dispatch', () => {
   });
 
   it('runs all dispatchers and isolates a failing one', async () => {
-    const throwingModule =
-      'data:text/javascript,' +
-      'export const name = "boom";' +
-      'export async function create_task(){ throw new Error("kaboom"); }';
-
     const out = await dispatch(
       {
         dispatchers: [
           { name: 'noop' },
-          { name: 'boom', module: throwingModule },
+          { name: 'boom', module: THROWING_MODULE_PATH },
           { name: 'fake-tracker', module: FAKE_MODULE_PATH },
         ],
       },

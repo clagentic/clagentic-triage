@@ -47,7 +47,9 @@ Configuration is loaded from (in priority order):
   "webhooks": {
     "enabled": false,
     "port": 8742,
-    "secret": ""
+    "secret": "",
+    "rate_limit_window_seconds": 60,
+    "max_events_per_minute": 300
   },
   "notifications": {
     "webhooks": []
@@ -70,6 +72,7 @@ Configuration is loaded from (in priority order):
 | `ignore_logins` | `[]` | Logins always skipped, regardless of association (deny). E.g. the operator's own username, or an automation account like `naomi`. Wins over everything. |
 | `watch_logins` | `[]` | Logins always processed, even if their association is not in `watch_associations` (allow). Lets you watch a specific internal person. |
 | `max_events_per_author_per_poll` | `20` | Maximum events passed downstream per author per poll window. Applied after the bot and actor-association filters; filtered events do not count. `0` or `null` disables the cap. Stateless — counts reset each poll call. Protects against a single noisy actor flooding the assessment queue. |
+| `max_events_per_repo_per_poll` | `200` | Maximum post-filter events accumulated per repo per poll. Pagination stops once this many events have passed all filters for a repo. This cap operates on the post-filter event count, so a high-volume author whose events are dropped by the per-author cap cannot consume the budget and starve legitimate contributors. `0` or `null` disables the cap. |
 | `github_app_id` | `null` | GitHub App numeric ID. When set, the adapter mints installation tokens instead of using `CLAGENTIC_TRIAGE_GITHUB_TOKEN`. Use App auth or PAT — not both. |
 | `github_app_private_key_env` | `"CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY"` | Name of the env var that holds the RS256 private key PEM. The PEM is never stored on the config object — only the env var name is. Override if you store the key under a different env var name. |
 | `github_app_installation_id` | `null` | Installation numeric ID. Found in the installation URL on GitHub. Required when `github_app_id` is set. |
@@ -145,6 +148,23 @@ Default: `false`. Must be explicitly set to `true` before `"approve"` can be
 added to `auto_approve`. This is a deliberate friction point — autonomous PR
 approval carries real consequences on live repos. See DD-001 and DD-002 in
 `docs/DESIGN-DECISIONS.md`.
+
+### `allow_overprivileged_token`
+
+Default: `false`. When a classic PAT with broad OAuth scopes (e.g. `repo`,
+`admin:org`) is used alongside write action classes in `auto_approve`
+(`respond`, `close`, `request_changes`, `approve`, `dispatch`), clagentic-triage
+emits a startup warning because a compromised token can take write actions across
+every repo in scope.
+
+Set `allow_overprivileged_token: true` to silence the warning when you have
+intentionally accepted this risk — for example, in a development environment or
+when the token is scoped to a dedicated test org.
+
+The preferred alternative is to use a fine-grained PAT scoped to the specific
+repos you want to triage, or to configure a GitHub App (see
+`docs/GITHUB_APP.md`). GitHub App installation tokens are already narrowly
+scoped and are not subject to this check.
 
 ### `auto_label`
 
@@ -303,6 +323,20 @@ Real-time event delivery via GitHub webhooks. Disabled by default.
 **`webhooks.secret` must be a non-empty string when `enabled` is `true`.** An
 empty secret is rejected at config load time. Expose the webhook endpoint behind
 a reverse proxy — the default bind address is `127.0.0.1`, not `0.0.0.0`.
+
+### Webhook rate limiting
+
+Two independent caps protect the inbound event stream from noisy or abusive senders:
+
+| Key | Default | Description |
+|---|---|---|
+| `webhooks.rate_limit_window_seconds` | `60` | Sliding window length (seconds) for the per-author event cap. Each author's counter resets independently when this many seconds have elapsed since their window started. |
+| `webhooks.max_events_per_minute` | `300` | Global cap: maximum events processed across all authors in any 60-second bucket. When exceeded, the server returns `429 Too Many Requests` and logs a warning. Use this to guard against distributed floods from many unique actors. |
+
+The per-author cap reuses the `source.max_events_per_author_per_poll` threshold
+(default `20`) — no additional config key is needed. An author who sends more
+than that many events within `rate_limit_window_seconds` receives `429` until
+the window expires. Both caps are in-memory and reset on process restart.
 
 ## Environment variable overrides
 

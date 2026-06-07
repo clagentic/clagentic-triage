@@ -7,9 +7,14 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
 
 import { loadHooks, runHooks } from '../src/hooks/index.js';
 import { run as consoleRun, buildPrompt } from '../src/hooks/console.js';
+
+const NORUNE_HOOK_PATH = fileURLToPath(new URL('./fixtures/norune-hook.js', import.meta.url));
+const THROWING_HOOK_PATH = fileURLToPath(new URL('./fixtures/throwing-hook.js', import.meta.url));
+const CRASHING_HOOK_PATH = fileURLToPath(new URL('./fixtures/crashing-hook.js', import.meta.url));
 
 // ---------------------------------------------------------------------------
 // Console capture helper
@@ -137,8 +142,7 @@ describe('loadHooks', () => {
   });
 
   it('skips a module missing run() and emits a warning', async () => {
-    const noRun = 'data:text/javascript,export const name = "norune";';
-    const loaded = await loadHooks({ hooks: [{ name: 'norune', module: noRun }] });
+    const loaded = await loadHooks({ hooks: [{ name: 'norune', module: NORUNE_HOOK_PATH }] });
     assert.equal(loaded.length, 0);
     assert.ok(warnLines.some((l) => /missing run/.test(l)));
   });
@@ -166,13 +170,8 @@ describe('runHooks', () => {
   });
 
   it('catches a hook that throws and returns { name, error } without throwing', async () => {
-    // Build a data: URL hook module that always throws.
-    const throwingHook =
-      'data:text/javascript,' +
-      'export async function run(){ throw new Error("boom"); }';
-
     const results = await runHooks(
-      { hooks: [{ name: 'bomb', module: throwingHook }] },
+      { hooks: [{ name: 'bomb', module: THROWING_HOOK_PATH }] },
       makeEvent(),
       makeAssessment(),
     );
@@ -184,15 +183,11 @@ describe('runHooks', () => {
   });
 
   it('runs all hooks and isolates a failing one', async () => {
-    const throwingHook =
-      'data:text/javascript,' +
-      'export async function run(){ throw new Error("crash"); }';
-
     const results = await runHooks(
       {
         hooks: [
           { name: 'console', config: { command: 'true' } },
-          { name: 'crash', module: throwingHook },
+          { name: 'crash', module: CRASHING_HOOK_PATH },
         ],
       },
       makeEvent(),

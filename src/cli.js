@@ -21,6 +21,46 @@ import { check_token_scopes } from './adapters/github.js';
 // from src/dispatchers/index.js before any import() of operator-supplied hook
 // module paths — same confinement rules as dispatcher modules.
 
+// Action classes that modify repository state. An over-privileged PAT
+// combined with any of these in auto_approve creates a significant blast radius.
+const WRITE_ACTION_CLASSES = new Set(['respond', 'close', 'request_changes', 'approve', 'dispatch']);
+
+/**
+ * After a scope check, warn prominently when a broad-scope PAT is paired with
+ * write auto_approve classes and the operator has not explicitly acknowledged
+ * the risk via allow_overprivileged_token.
+ *
+ * Does NOT block startup — the right response is a loud, unmissable warning
+ * so operators notice without breaking existing deployments that use broad
+ * PATs intentionally.
+ *
+ * @param {object} scopeResult - Return value of check_token_scopes()
+ * @param {object} config
+ */
+function _warnIfOverprivilegedWithWriteActions(scopeResult, config) {
+  if (!scopeResult.ok || !scopeResult.warned) {
+    return;
+  }
+  // App tokens are already scoped by installation — only warn for PAT deployments.
+  if (config.source?.github_app_id) {
+    return;
+  }
+  const hasWriteAutoAction = (config.auto_approve ?? []).some((c) => WRITE_ACTION_CLASSES.has(c));
+  if (!hasWriteAutoAction) {
+    return;
+  }
+  if (config.allow_overprivileged_token) {
+    return;
+  }
+  process.stderr.write(
+    '[clagentic:triage] WARNING: over-privileged GitHub token is paired with write auto_approve ' +
+    `classes (${(config.auto_approve ?? []).filter((c) => WRITE_ACTION_CLASSES.has(c)).join(', ')}). ` +
+    'A compromised or stolen token can take write actions across every repo in scope. ' +
+    'Switch to a fine-grained token scoped to specific repos (see docs/GITHUB_APP.md), or set ' +
+    '"allow_overprivileged_token": true in your config to silence this warning if this is intentional.\n',
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Argument parsing
 // ---------------------------------------------------------------------------
@@ -149,6 +189,7 @@ async function cmdWatch(flags) {
   if (!scopeResult.ok) {
     err(`[clagentic:triage] WARNING: Could not verify GitHub token scopes: ${scopeResult.error}`);
   }
+  _warnIfOverprivilegedWithWriteActions(scopeResult, config);
 
   const intervalSec = flags.has('interval')
     ? parseInt(flags.get('interval'), 10)
@@ -213,6 +254,7 @@ async function cmdRun(flags) {
   if (!scopeResult.ok) {
     err(`[clagentic:triage] WARNING: Could not verify GitHub token scopes: ${scopeResult.error}`);
   }
+  _warnIfOverprivilegedWithWriteActions(scopeResult, config);
 
   const adapter = await loadAdapter(config);
 

@@ -79,6 +79,10 @@ function defaults() {
       // Safety valve: max events passed downstream per author per poll call.
       // 0 or null disables the cap. This is stateless — counts reset each call.
       max_events_per_author_per_poll: 20,
+      // Post-filter cap: max events accumulated per repo per poll after all
+      // filters are applied. Bounds total pages fetched without starving
+      // legitimate contributors behind a high-volume author. 0 or null disables.
+      max_events_per_repo_per_poll: 200,
       // GitHub App credentials (alternative to PAT). When github_app_id is set,
       // the adapter mints an installation token instead of using the PAT.
       github_app_id: null,
@@ -97,6 +101,7 @@ function defaults() {
     confidence_threshold: 0.7,
     auto_approve: [],
     allow_auto_pr_approval: false,  // RT-002: explicit opt-in required before approve class works
+    allow_overprivileged_token: false,  // explicit acknowledgement that a broad-scope PAT is intentional
     pending_queue: '.triage/pending.jsonl',
     dispatchers: [],
     hooks: [],
@@ -106,6 +111,11 @@ function defaults() {
       secret: '',
       bind: '127.0.0.1',
       path: '/webhook',
+      // Sliding window duration for the per-author event cap (seconds).
+      rate_limit_window_seconds: 60,
+      // Global cap: maximum events processed across all authors per minute.
+      // A per-minute bucket reset is used (not a full sliding window).
+      max_events_per_minute: 300,
     },
     notifications: {
       webhooks: [],

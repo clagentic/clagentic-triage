@@ -7,9 +7,14 @@
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { generateKeyPairSync } from 'node:crypto';
 
 import { enrich } from '../src/enricher.js';
 import { parseYaml } from '../src/yaml.js';
+
+// Generate a throwaway RSA key pair once for GitHub App token tests.
+const { privateKey: _APP_PRIVATE_KEY } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+const APP_PRIVATE_KEY_PEM = _APP_PRIVATE_KEY.export({ type: 'pkcs8', format: 'pem' });
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -475,5 +480,76 @@ describe('enrich', () => {
 
     assert.equal(enriched.context.intent._source, 'generic');
     assert.deepEqual(enriched.context.contributor, { login: 'testuser' });
+  });
+
+  // -------------------------------------------------------------------------
+  // GitHub App auth: enrich() uses _resolve_token (installation token) rather
+  // than config.github_token() when App credentials are configured.
+  //
+  // Validates that the enricher does not bypass App auth by falling through to
+  // config.github_token(). We configure github_token() to return null so that
+  // any code path that calls it directly would produce degraded context — then
+  // verify that the enricher still returns real (non-generic) context because
+  // _resolve_token minted an installation token instead.
+  // -------------------------------------------------------------------------
+
+  it('uses GitHub App installation token when App credentials are configured', async () => {
+    const INSTALL_TOKEN = 'ghs_test_enricher_install_token';
+    const APP_ENV_VAR = 'CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY';
+
+    // Inject the throwaway PEM into the process environment so _resolve_token
+    // can read it at the key_env name.
+    process.env[APP_ENV_VAR] = APP_PRIVATE_KEY_PEM;
+
+    try {
+      // Config has App credentials; github_token() deliberately returns null.
+      // If enrich() called github_token() directly it would get degraded context.
+      const config = {
+        intent_file: '.github/triage-intent.yml',
+        intent_file_fallback: '.github/TRIAGE_INTENT.md',
+        github_token: () => null,
+        source: {
+          github_app_id: '123',
+          github_app_private_key_env: APP_ENV_VAR,
+          github_app_installation_id: '456',
+        },
+      };
+
+      const yamlContent = 'description: App auth intent';
+
+      // Register fetch handlers: installation token mint, intent file, user profile.
+      // Use a handler array to avoid replacing the module-level mock infrastructure.
+      _fetchHandlers.push({
+        match: (url) => url.includes('/app/installations/'),
+        respond: () =>
+          new Response(JSON.stringify({ token: INSTALL_TOKEN }), {
+            status: 201,
+            headers: { 'Content-Type': 'application/json' },
+          }),
+      });
+      mockUrl('/repos/owner/repo/contents/.github/triage-intent.yml', contentsResponse(yamlContent));
+      mockUrl('/users/testuser', {
+        login: 'testuser',
+        name: 'App User',
+        public_repos: 1,
+        followers: 0,
+        created_at: '2023-01-01T00:00:00Z',
+        company: null,
+        bio: null,
+      });
+
+      const enriched = await enrich(config, makeEvent(), null);
+
+      // Enrichment must have succeeded using the installation token — not degraded.
+      assert.notEqual(
+        enriched.context.intent._source,
+        'generic',
+        'intent source must not be generic; enricher must have used the App installation token',
+      );
+      assert.equal(enriched.context.intent._source, 'yaml');
+      assert.equal(enriched.context.contributor.login, 'testuser');
+    } finally {
+      delete process.env[APP_ENV_VAR];
+    }
   });
 });

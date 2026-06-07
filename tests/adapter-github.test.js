@@ -319,6 +319,116 @@ describe('list_events', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Post-filter repo cap: single author with many issues hits repo cap, not author cap
+  // -------------------------------------------------------------------------
+
+  it('single-author flood hits max_events_per_repo_per_poll before author cap', async () => {
+    // 150 issues from one author, repo cap=50, author cap=200 (higher than repo cap).
+    // Expect exactly 50 events — capped by the repo limit, not the author limit.
+    // Issues are spread across two pages to verify pagination is working.
+    const page1Issues = Array.from({ length: 100 }, (_, i) =>
+      makeRawIssue({
+        number: 1000 + i,
+        user: { login: 'attacker', type: 'User' },
+        author_association: 'NONE',
+      }),
+    );
+    const page2Issues = Array.from({ length: 50 }, (_, i) =>
+      makeRawIssue({
+        number: 1100 + i,
+        user: { login: 'attacker', type: 'User' },
+        author_association: 'NONE',
+      }),
+    );
+
+    const page2Url = 'https://api.github.com/repos/example/repo/issues?state=open&page=2';
+
+    globalThis.fetch = async (url) => {
+      if (url.includes('page=2') || url === page2Url) {
+        return mockResponse(200, page2Issues);
+      }
+      // Page 1: return 100 items and a Link: rel="next" header
+      return mockResponse(200, page1Issues, {
+        Link: `<${page2Url}>; rel="next"`,
+      });
+    };
+
+    const config = makeConfig({
+      source: {
+        adapter: 'github',
+        org: null,
+        repos: ['example/repo'],
+        allow_bot_logins: [],
+        watch_associations: ['NONE'],
+        ignore_logins: [],
+        watch_logins: [],
+        max_events_per_author_per_poll: 200,
+        max_events_per_repo_per_poll: 50,
+      },
+    });
+
+    const events = await list_events(config, '2024-01-01T00:00:00Z');
+    assert.equal(
+      events.length,
+      50,
+      'repo cap (50) should stop pagination before author cap (200) is reached',
+    );
+    assert.ok(
+      events.every((e) => e.author === 'attacker'),
+      'all events should be from the flood author',
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // Post-filter repo cap: two authors, both hit author cap, repo cap not reached
+  // -------------------------------------------------------------------------
+
+  it('two authors each hit author cap independently; repo cap is not the limiting factor', async () => {
+    // Two authors each with 30 issues, author cap=20, repo cap=200.
+    // Expected: 20 from alice + 20 from bob = 40 total.
+    // The repo cap (200) is not hit; the author cap (20) is the binding constraint.
+    const aliceIssues = Array.from({ length: 30 }, (_, i) =>
+      makeRawIssue({
+        number: 2000 + i,
+        user: { login: 'alice', type: 'User' },
+        author_association: 'NONE',
+      }),
+    );
+    const bobIssues = Array.from({ length: 30 }, (_, i) =>
+      makeRawIssue({
+        number: 2100 + i,
+        user: { login: 'bob', type: 'User' },
+        author_association: 'NONE',
+      }),
+    );
+
+    // All 60 items fit on one page (< 100), so no pagination is needed.
+    globalThis.fetch = async () => mockResponse(200, [...aliceIssues, ...bobIssues]);
+
+    const config = makeConfig({
+      source: {
+        adapter: 'github',
+        org: null,
+        repos: ['example/repo'],
+        allow_bot_logins: [],
+        watch_associations: ['NONE'],
+        ignore_logins: [],
+        watch_logins: [],
+        max_events_per_author_per_poll: 20,
+        max_events_per_repo_per_poll: 200,
+      },
+    });
+
+    const events = await list_events(config, '2024-01-01T00:00:00Z');
+    const aliceEvents = events.filter((e) => e.author === 'alice');
+    const bobEvents = events.filter((e) => e.author === 'bob');
+
+    assert.equal(aliceEvents.length, 20, 'alice capped at 20 by author cap');
+    assert.equal(bobEvents.length, 20, 'bob capped at 20 by author cap');
+    assert.equal(events.length, 40, 'total should be 40 (20+20), not 50 or 60');
+  });
+
+  // -------------------------------------------------------------------------
   // Test 5b: repos=['*'] without org throws AdapterError
   // -------------------------------------------------------------------------
 

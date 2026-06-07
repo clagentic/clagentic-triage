@@ -1,4 +1,17 @@
-# clagentic:triage
+<p align="center">
+  <img src="media/logo/triage-lockup-256.png" alt="clagentic:triage" width="260" />
+</p>
+
+<h4 align="center">LLM-powered issue triage. Built for builders.</h4>
+
+<p align="center">
+  <a href="https://clagentic.ai"><img src="https://img.shields.io/badge/-clagentic.ai-00CFFF?style=flat&logoColor=white" alt="clagentic.ai" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-FSL--1.1--MIT-blue?style=flat" alt="License: FSL-1.1-MIT" /></a>
+  <img src="https://img.shields.io/badge/Node.js-20+-339933?style=flat&logo=node.js&logoColor=white" alt="Node.js 20+" />
+  <a href="https://www.npmjs.com/package/@clagentic/triage"><img src="https://img.shields.io/npm/v/@clagentic/triage?style=flat&label=npm" alt="npm version" /></a>
+  <a href="https://www.npmjs.com/package/@clagentic/triage"><img src="https://img.shields.io/npm/dw/@clagentic/triage?style=flat&label=downloads" alt="npm downloads" /></a>
+  <a href="https://ko-fi.com/clagentic"><img src="https://img.shields.io/badge/Ko--fi-FF5E5B?style=flat&logo=ko-fi&logoColor=white&label=support" alt="Support on Ko-fi" /></a>
+</p>
 
 LLM-powered triage agent for GitHub issues and PRs. Part of the [clagentic](https://clagentic.ai) suite.
 
@@ -164,7 +177,20 @@ behind each security decision (DD-001 through DD-007).
 | [docs/SECURITY.md](docs/SECURITY.md) | Token security, input validation, PII and data residency |
 | [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) | DD-001..DD-011 rationale and security decisions |
 
+## Support
+
+If clagentic:triage is useful to you: [ko-fi.com/clagentic](https://ko-fi.com/clagentic)
+
+## Disclaimer
+
+Not affiliated with Anthropic or OpenAI. Claude is a trademark of Anthropic. Codex is a
+trademark of OpenAI. Provided "as is" without warranty. Users are responsible for
+complying with their AI provider's terms of service.
+
 ## License
 
-[FSL-1.1-MIT](LICENSE) — Functional Source License, version 1.1, with MIT as the
-Change License.
+[FSL-1.1-MIT](LICENSE) — Functional Source License 1.1, with MIT as the Change License.
+
+Free for personal, internal-business, evaluation, research, and non-commercial use.
+Not free for offering this tool (or a substantial fork) as a competing commercial product.
+Each release auto-converts to MIT on its second anniversary.

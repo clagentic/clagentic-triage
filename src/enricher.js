@@ -18,6 +18,7 @@ import { join } from 'path';
 import { fileURLToPath } from 'url';
 
 import { parseYaml } from './yaml.js';
+import { _resolve_token } from './adapters/github.js';
 
 // ---------------------------------------------------------------------------
 // Package version — read once at module load time, used in User-Agent
@@ -331,7 +332,7 @@ async function _fetchContributor(login, token) {
  * @returns {Promise<object>} EnrichedEvent
  */
 export async function enrich(config, event, _adapter) {
-  const token = config.github_token ? config.github_token() : null;
+  const token = await _resolve_token(config);
 
   // Degraded-context sentinel: used if auth is completely absent or fails.
   const genericFallbackIntent = {

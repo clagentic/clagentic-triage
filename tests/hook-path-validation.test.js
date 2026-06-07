@@ -96,6 +96,55 @@ describe('_validate_module_path', () => {
     assert.doesNotThrow(() => _validate_module_path('../../escape', TEST_CWD));
     assert.doesNotThrow(() => _validate_module_path('foo\0bar', TEST_CWD));
   });
+
+  // --- blocked URL scheme tests ---
+
+  it('rejects data: URL (inline module execution bypass)', () => {
+    const result = _validate_module_path('data:text/javascript,export default {}', TEST_CWD);
+    assert.equal(result.valid, false);
+    assert.match(result.reason, /blocked URL scheme/);
+  });
+
+  it('rejects data: URL with base64 encoding', () => {
+    const result = _validate_module_path('data:application/javascript;base64,abc', TEST_CWD);
+    assert.equal(result.valid, false);
+    assert.match(result.reason, /blocked URL scheme/);
+  });
+
+  it('rejects file: URL (explicit filesystem URL bypass)', () => {
+    const result = _validate_module_path('file:///etc/passwd', TEST_CWD);
+    assert.equal(result.valid, false);
+    assert.match(result.reason, /blocked URL scheme/);
+  });
+
+  it('rejects javascript: URL', () => {
+    const result = _validate_module_path('javascript:alert(1)', TEST_CWD);
+    assert.equal(result.valid, false);
+    assert.match(result.reason, /blocked URL scheme/);
+  });
+
+  it('rejects blocked schemes case-insensitively (DATA:, FILE:)', () => {
+    assert.equal(_validate_module_path('DATA:text/javascript,x', TEST_CWD).valid, false);
+    assert.equal(_validate_module_path('FILE:///etc/passwd', TEST_CWD).valid, false);
+  });
+
+  it('still accepts a scoped npm package name (@clagentic/some-package)', () => {
+    const result = _validate_module_path('@clagentic/some-package', TEST_CWD);
+    assert.equal(result.valid, true);
+    assert.equal(result.resolvedPath, null);
+  });
+
+  it('still accepts a bare npm package name (some-package)', () => {
+    const result = _validate_module_path('some-package', TEST_CWD);
+    assert.equal(result.valid, true);
+    assert.equal(result.resolvedPath, null);
+  });
+
+  it('still accepts a relative path within cwd (./local-module.js)', () => {
+    const result = _validate_module_path('./tests/fixtures/fake-dispatcher.js', TEST_CWD);
+    assert.equal(result.valid, true);
+    assert.ok(result.resolvedPath.endsWith('fake-dispatcher.js'));
+  });
 });
 
 // ---------------------------------------------------------------------------

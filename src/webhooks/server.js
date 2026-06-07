@@ -84,6 +84,108 @@ class DeliveryIdSet {
 }
 
 // ---------------------------------------------------------------------------
+// Per-author sliding-window rate limiter
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-author event counter using a sliding window.
+ *
+ * Each author entry tracks the count of events processed within the current
+ * window. The window is reset per author when `rate_limit_window_seconds` has
+ * elapsed since the window started — not on a global clock tick. This keeps
+ * the data structure O(1) per check without a background timer.
+ *
+ * The `_now` hook is injected for deterministic testing.
+ */
+class AuthorRateLimiter {
+  /**
+   * @param {number} maxPerWindow  Maximum events allowed per author per window.
+   * @param {number} windowSeconds Window length in seconds.
+   * @param {function(): number} [_now]  Returns current time in ms (default: Date.now).
+   */
+  constructor(maxPerWindow, windowSeconds, _now = Date.now) {
+    this._max = maxPerWindow;
+    this._windowMs = windowSeconds * 1000;
+    this._now = _now;
+    // Map<login, { count: number, window_start_ms: number }>
+    this._authors = new Map();
+  }
+
+  /**
+   * Check and record an event for the given author login.
+   *
+   * Returns true if the event is allowed (count after increment <= max),
+   * false if the author has exceeded the cap for this window.
+   *
+   * @param {string} login
+   * @returns {boolean}
+   */
+  checkAndRecord(login) {
+    if (!this._max || this._max <= 0) {
+      // Cap disabled.
+      return true;
+    }
+    const now = this._now();
+    let entry = this._authors.get(login);
+    if (!entry || now - entry.window_start_ms >= this._windowMs) {
+      // First event from this author, or the previous window has expired.
+      entry = { count: 0, window_start_ms: now };
+      this._authors.set(login, entry);
+    }
+    entry.count += 1;
+    return entry.count <= this._max;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Global per-minute bucket rate limiter
+// ---------------------------------------------------------------------------
+
+/**
+ * Global event counter using a 1-minute bucket.
+ *
+ * A new bucket starts when the current minute boundary is crossed. This is
+ * simpler than a full sliding window and sufficient for a global noise gate.
+ *
+ * The `_now` hook is injected for deterministic testing.
+ */
+class GlobalRateLimiter {
+  /**
+   * @param {number} maxPerMinute  Maximum events allowed per minute (all authors combined).
+   * @param {function(): number} [_now]  Returns current time in ms (default: Date.now).
+   */
+  constructor(maxPerMinute, _now = Date.now) {
+    this._max = maxPerMinute;
+    this._now = _now;
+    this._count = 0;
+    this._bucket_start_ms = this._now();
+  }
+
+  /**
+   * Check and record an event globally.
+   *
+   * Returns true if the event is allowed, false if the global cap has been hit
+   * for this minute bucket.
+   *
+   * @returns {boolean}
+   */
+  checkAndRecord() {
+    if (!this._max || this._max <= 0) {
+      // Cap disabled.
+      return true;
+    }
+    const now = this._now();
+    if (now - this._bucket_start_ms >= 60_000) {
+      // New minute bucket.
+      this._count = 0;
+      this._bucket_start_ms = now;
+    }
+    this._count += 1;
+    return this._count <= this._max;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
 
@@ -150,9 +252,10 @@ function sendJson(res, status, body) {
  * @param {object} adapter  - Source adapter implementing the webhook interface
  * @param {object} [opts]
  * @param {function} [opts.onEvent]  - Called with each normalized, verified Event
+ * @param {function} [opts._now]     - Clock override for testing (default: Date.now)
  * @returns {import('node:http').Server}
  */
-export function createServer(config, adapter, { onEvent } = {}) {
+export function createServer(config, adapter, { onEvent, _now } = {}) {
   const secret = config.webhooks?.secret ?? '';
   const webhookPath = config.webhooks?.path ?? '/webhook';
   const allowBotLogins = config.source?.allow_bot_logins ?? [];
@@ -167,6 +270,17 @@ export function createServer(config, adapter, { onEvent } = {}) {
   }
 
   const seenDeliveries = new DeliveryIdSet();
+
+  const authorRateLimiter = new AuthorRateLimiter(
+    config.source?.max_events_per_author_per_poll ?? 20,
+    config.webhooks?.rate_limit_window_seconds ?? 60,
+    _now,
+  );
+
+  const globalRateLimiter = new GlobalRateLimiter(
+    config.webhooks?.max_events_per_minute ?? 300,
+    _now,
+  );
 
   const server = _httpCreateServer((req, res) => {
     const { method, url } = req;
@@ -185,8 +299,11 @@ export function createServer(config, adapter, { onEvent } = {}) {
 
     // Async handler — errors are caught and returned as 500 to avoid
     // uncaught promise rejections hanging the server.
-    handleWebhookRequest(req, res, config, secret, adapter, seenDeliveries, allowBotLogins, onEvent)
-      .catch((err) => {
+    handleWebhookRequest(
+      req, res, config, secret, adapter,
+      seenDeliveries, allowBotLogins, onEvent,
+      authorRateLimiter, globalRateLimiter,
+    ).catch((err) => {
         console.error('[webhook] unhandled error:', err.message);
         if (!res.headersSent) {
           sendJson(res, 500, { error: 'internal error' });
@@ -241,8 +358,14 @@ export function startWebhookServer(config, adapter, { onEvent } = {}) {
  * @param {DeliveryIdSet} seenDeliveries
  * @param {string[]} allowBotLogins
  * @param {function|undefined} onEvent
+ * @param {AuthorRateLimiter} authorRateLimiter
+ * @param {GlobalRateLimiter} globalRateLimiter
  */
-async function handleWebhookRequest(req, res, config, secret, adapter, seenDeliveries, allowBotLogins, onEvent) {
+async function handleWebhookRequest(
+  req, res, config, secret, adapter,
+  seenDeliveries, allowBotLogins, onEvent,
+  authorRateLimiter, globalRateLimiter,
+) {
   // Fast path: reject on a declared Content-Length over the cap before reading
   // any body bytes. A well-behaved client gets a clean 413 it can read. The
   // streaming guard in readBody is the backstop for chunked / lying clients.
@@ -320,6 +443,24 @@ async function handleWebhookRequest(req, res, config, secret, adapter, seenDeliv
   if (typeof adapter.actor_allowed === 'function' && !adapter.actor_allowed(config, event)) {
     console.log(`[webhook] actor filtered: ${event.author}`);
     sendJson(res, 200, { status: 'ignored', reason: 'actor' });
+    return;
+  }
+
+  // Global rate limit: cap total events per minute across all authors.
+  // Checked before the per-author cap so a distributed flood (many actors)
+  // is stopped before per-author accounting runs.
+  if (!globalRateLimiter.checkAndRecord()) {
+    console.warn('[webhook] global rate limit exceeded — dropping event');
+    sendJson(res, 429, { error: 'too many requests' });
+    return;
+  }
+
+  // Per-author rate limit: mirrors max_events_per_author_per_poll used by the
+  // poll adapter, but applied over a sliding window instead of per-poll-call.
+  const author = event.author ?? '';
+  if (!authorRateLimiter.checkAndRecord(author)) {
+    console.log(`[webhook] per-author rate limit exceeded for: ${author}`);
+    sendJson(res, 429, { error: 'too many requests' });
     return;
   }
 

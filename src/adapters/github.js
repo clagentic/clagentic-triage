@@ -100,7 +100,7 @@ function _invalidate_cache(repo) {
  * @param {object} config - Loaded triage config
  * @returns {Promise<string|null>} Token string, or null if no credentials are configured
  */
-async function _resolve_token(config) {
+export async function _resolve_token(config) {
   const src = config.source ?? {};
   if (src.github_app_id) {
     const key_env = src.github_app_private_key_env ?? 'CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY';
@@ -392,7 +392,67 @@ function _normalize(raw, repo, forceType = null) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Apply the bot filter, actor-association filter, and per-author cap to a single
+ * raw GitHub issue/PR object. Returns the normalized Event if it passes all
+ * filters, or null if it should be dropped.
+ *
+ * Mutates authorCounts in place so the cap state accumulates across pages.
+ *
+ * @param {object} raw
+ * @param {string} repo
+ * @param {object} config
+ * @param {string[]} allowBotLogins
+ * @param {boolean} capEnabled
+ * @param {number} authorCap
+ * @param {Map<string, number>} authorCounts
+ * @returns {object|null} Normalized Event or null
+ */
+function _filterAndNormalize(raw, repo, config, allowBotLogins, capEnabled, authorCap, authorCounts) {
+  // DD-005 bot filter and DD-008 actor-association filter are orthogonal;
+  // an item must pass both to be processed.
+  if (_isBot(raw, allowBotLogins)) {
+    return null;
+  }
+  if (!should_process_actor(config, _actorOf(raw))) {
+    return null;
+  }
+  // Per-author cap: applied after the above filters so filtered events
+  // do not count toward the cap for a given author.
+  if (capEnabled) {
+    const author = raw.user?.login ?? '';
+    const count = authorCounts.get(author) ?? 0;
+    if (count >= authorCap) {
+      if (count === authorCap) {
+        // Warn exactly once per author when the cap is first hit.
+        console.warn(
+          `[github adapter] per-author cap reached for "${author}" (${authorCap} events); skipping further events from this author this poll`,
+        );
+        // Increment so the warning fires only once.
+        authorCounts.set(author, count + 1);
+      }
+      return null;
+    }
+    authorCounts.set(author, count + 1);
+  }
+  return _normalize(raw, repo);
+}
+
+/**
  * List open issues and PRs updated since `since`.
+ *
+ * Pagination strategy: fetches one page at a time and applies the bot filter,
+ * actor-association filter, and per-author cap after each page. This prevents a
+ * single high-volume author from consuming the entire fetch budget before
+ * legitimate events from other contributors are seen.
+ *
+ * Stops fetching for a repo when:
+ * - No more pages (Link rel="next" exhausted), OR
+ * - The post-filter accumulated count reaches max_events_per_repo_per_poll
+ *
+ * ETag caching still applies for the single-page (first page 304) case. When
+ * paginating past page 1, the ETag path is bypassed — ETags are per-repo, not
+ * per-page, so a 304 on page 1 means the entire result set is unchanged; we
+ * replay from cache rather than paginating.
  *
  * Behavior on errors:
  * - 401: returns [] with a warning (adapter must not throw on auth failure per spec)
@@ -432,6 +492,12 @@ export async function list_events(config, since) {
   /** @type {Map<string, number>} */
   const authorCounts = new Map();
 
+  // Per-repo post-filter cap: the maximum number of events that pass all filters
+  // per repo per poll. Prevents any single repo from monopolizing the event
+  // stream even when no single author dominates.
+  const repoPostFilterCap = config.source?.max_events_per_repo_per_poll ?? 200;
+  const repoCapEnabled = repoPostFilterCap !== 0 && repoPostFilterCap !== null;
+
   // Resolve the list of repos to query
   let repos;
   if (config.source?.org) {
@@ -454,12 +520,29 @@ export async function list_events(config, since) {
 
   for (const repo of repos) {
     const sinceParam = since ? `&since=${encodeURIComponent(since)}` : '';
-    const url = `${GITHUB_API}/repos/${repo}/issues?state=open&sort=updated&direction=desc${sinceParam}&per_page=100`;
+    const page1Url = `${GITHUB_API}/repos/${repo}/issues?state=open&sort=updated&direction=desc${sinceParam}&per_page=100`;
     const cacheKey = `list_events:${repo}:${since ?? ''}`;
 
     try {
-      const result = await _fetchPaginated(url, token, cacheKey);
-      if (result.status === 304) {
+      // --- Page 1: single-page ETag-conditional fetch ---
+      // The ETag cache operates per-repo (keyed to page 1's URL). A 304 means
+      // the entire result set is unchanged — replay from cache rather than
+      // paginating. Pages 2+ do not participate in ETag caching.
+
+      let page1Etag;
+      const entry = _etagCache.get(cacheKey);
+      if (entry) {
+        if (Date.now() - entry.cached_at > ETAG_CACHE_TTL_MS) {
+          _etagCache.delete(cacheKey);
+        } else {
+          page1Etag = entry.etag;
+        }
+      }
+
+      const page1Res = await globalThis.fetch(page1Url, { headers: _headers(token, page1Etag) });
+      await _handleRateLimit(page1Res.headers);
+
+      if (page1Res.status === 304) {
         // Cache stores already-normalized events. Re-apply bot and actor filters
         // in case config.source.allow_bot_logins or config.source.ignore_logins
         // changed since the entry was written.
@@ -497,52 +580,108 @@ export async function list_events(config, since) {
         continue;
       }
 
-      if (result.status !== 200) {
+      if (page1Res.status === 401) {
+        throw new AdapterError('GitHub token invalid or missing', 'auth_failure');
+      }
+      if (page1Res.status === 403) {
+        const retryAfter = page1Res.headers.get('Retry-After');
+        if (retryAfter) {
+          throw new AdapterError(
+            `GitHub API forbidden; rate limit exceeded. Retry-After: ${retryAfter}s`,
+            'rate_limited',
+          );
+        }
+        throw new AdapterError('GitHub API forbidden (403)', 'forbidden');
+      }
+      if (!page1Res.ok) {
         console.warn(
-          `[github adapter] non-2xx response (${result.status}) for repo ${repo}; skipping`,
+          `[github adapter] non-2xx response (${page1Res.status}) for repo ${repo}; skipping`,
         );
         continue;
       }
 
-      // Normalize and filter the raw items for this repo.
+      // Capture the ETag from page 1 for cache write-back after normalization.
+      const pendingEtag = page1Res.headers.get('ETag') ?? null;
+
+      // Parse page 1 body and extract the Link: rel="next" URL.
+      const page1Body = await page1Res.json();
+      const page1Items = Array.isArray(page1Body) ? page1Body : [page1Body];
+      const page1Link = page1Res.headers.get('Link') ?? '';
+      const page1NextMatch = page1Link.match(/<([^>]+)>;\s*rel="next"/);
+      let nextPageUrl = page1NextMatch ? page1NextMatch[1] : null;
+
+      // --- Post-filter pagination loop ---
+      // normalized accumulates passing events for ETag cache write-back.
       const normalized = [];
-      for (const raw of result.items) {
-        // DD-005 bot filter and DD-008 actor-association filter are orthogonal;
-        // an item must pass both to be processed.
-        if (_isBot(raw, allowBotLogins)) {
-          continue;
-        }
-        if (!should_process_actor(config, _actorOf(raw))) {
-          continue;
-        }
-        // Per-author cap: applied after the above filters so filtered events
-        // do not count toward the cap for a given author.
-        if (capEnabled) {
-          const author = raw.user?.login ?? '';
-          const count = authorCounts.get(author) ?? 0;
-          if (count >= authorCap) {
-            if (count === authorCap) {
-              // Warn exactly once per author when the cap is first hit.
-              console.warn(
-                `[github adapter] per-author cap reached for "${author}" (${authorCap} events); skipping further events from this author this poll`,
-              );
-              // Increment so the warning fires only once.
-              authorCounts.set(author, count + 1);
-            }
-            continue;
+
+      /**
+       * Process a page of raw items through all filters, accumulating passing
+       * events into normalized[]. Returns false when the repo post-filter cap
+       * is reached so the caller can stop fetching further pages.
+       *
+       * @param {object[]} rawItems
+       * @returns {boolean} true to continue fetching, false if repo cap hit
+       */
+      const processPage = (rawItems) => {
+        for (const raw of rawItems) {
+          if (repoCapEnabled && normalized.length >= repoPostFilterCap) {
+            return false;
           }
-          authorCounts.set(author, count + 1);
+          const event = _filterAndNormalize(
+            raw, repo, config, allowBotLogins, capEnabled, authorCap, authorCounts,
+          );
+          if (event !== null) {
+            normalized.push(event);
+          }
         }
-        normalized.push(_normalize(raw, repo));
+        return !(repoCapEnabled && normalized.length >= repoPostFilterCap);
+      };
+
+      let shouldContinue = processPage(page1Items);
+
+      // Follow Link rel="next" pages, one at a time, until the post-filter cap
+      // is reached or there are no more pages.
+      while (nextPageUrl && shouldContinue) {
+        // Pages 2+ are fetched without ETag headers — ETags are per-URL and
+        // page 1's ETag covers the canonical resource, not individual pages.
+        const res = await globalThis.fetch(nextPageUrl, { headers: _headers(token) });
+        await _handleRateLimit(res.headers);
+
+        if (res.status === 401) {
+          throw new AdapterError('GitHub token invalid or missing', 'auth_failure');
+        }
+        if (res.status === 403) {
+          const retryAfter = res.headers.get('Retry-After');
+          if (retryAfter) {
+            throw new AdapterError(
+              `GitHub API forbidden; rate limit exceeded. Retry-After: ${retryAfter}s`,
+              'rate_limited',
+            );
+          }
+          throw new AdapterError('GitHub API forbidden (403)', 'forbidden');
+        }
+        if (!res.ok) {
+          // Non-2xx on a continuation page — stop paginating for this repo.
+          break;
+        }
+
+        const pageBody = await res.json();
+        const rawItems = Array.isArray(pageBody) ? pageBody : [pageBody];
+        shouldContinue = processPage(rawItems);
+
+        // Follow Link rel="next"
+        const link = res.headers.get('Link') ?? '';
+        const nextMatch = link.match(/<([^>]+)>;\s*rel="next"/);
+        nextPageUrl = nextMatch ? nextMatch[1] : null;
       }
 
       // Persist normalized events into the ETag cache so a subsequent 304 can
       // replay them without re-normalizing. The entry is written here — after
       // normalization succeeds — not inside _fetchPaginated, so the cache never
       // contains a stale empty result from a partially-processed fetch.
-      if (result.pendingEtag) {
+      if (pendingEtag) {
         _etagCache.set(cacheKey, {
-          etag: result.pendingEtag,
+          etag: pendingEtag,
           result: normalized,
           cached_at: Date.now(),
         });

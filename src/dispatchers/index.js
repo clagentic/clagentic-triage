@@ -23,10 +23,12 @@ const BUNDLED_NAME_RE = /^[a-z][a-z0-9-]*$/;
  * Validate an operator-supplied module path before dynamic import (RT-009).
  *
  * Three forms are accepted:
- *   - Bare specifiers (npm package names, scoped packages, data: URLs, etc.) —
- *     anything that does not start with `/`, `./`, or `../`. These resolve via
- *     node_modules or are handled by the runtime, not the filesystem path
- *     traversal machinery.
+ *   - Bare specifiers (npm package names, scoped packages) — anything that
+ *     does not start with `/`, `./`, or `../`, and does not use a blocked URL
+ *     scheme. These resolve via node_modules.
+ *
+ * Dangerous URL schemes (data:, file:, javascript:, vbscript:, blob:) are
+ * rejected unconditionally before the relative/absolute check.
  *   - Relative paths (`./...`, `../...`) — only if the resolved absolute path
  *     remains within `cwd`. Paths that escape via `../` traversal are rejected.
  *   - Absolute paths — only if they start with `cwd`. Absolute paths that point
@@ -40,6 +42,13 @@ const BUNDLED_NAME_RE = /^[a-z][a-z0-9-]*$/;
  *   Callers MUST import resolvedPath (as a file:// URL) rather than the raw
  *   modulePath so the validated path and the loaded path are identical.
  */
+// URL schemes that Node's ESM loader can execute directly. A config-supplied
+// module path that matches one of these is rejected regardless of whether it
+// looks like a filesystem path, because it bypasses the cwd-confinement check
+// entirely (data: is run by the VM, file: is an explicit FS URL, javascript:
+// and vbscript: execute script, blob: is a runtime object URL).
+const BLOCKED_URL_SCHEME_RE = /^(data:|file:|javascript:|vbscript:|blob:)/i;
+
 export function _validate_module_path(modulePath, cwd = process.cwd()) {
   if (typeof modulePath !== 'string') {
     return { valid: false, reason: 'module path must be a string' };
@@ -50,12 +59,24 @@ export function _validate_module_path(modulePath, cwd = process.cwd()) {
     return { valid: false, reason: 'module path contains a null byte' };
   }
 
+  // Reject dangerous URL schemes before any other check. These bypass the
+  // filesystem path confinement logic: data: is executed directly by the VM,
+  // file: is an explicit filesystem URL, javascript:/vbscript:/blob: execute
+  // script or reference runtime objects. Belt-and-suspenders against cwd check.
+  if (BLOCKED_URL_SCHEME_RE.test(modulePath)) {
+    return {
+      valid: false,
+      reason: 'module path uses a blocked URL scheme (data:, file:, javascript:, blob:)',
+    };
+  }
+
   const isRelative = modulePath.startsWith('./') || modulePath.startsWith('../');
   const isAbsolute = modulePath.startsWith('/');
 
   if (!isRelative && !isAbsolute) {
-    // Bare specifier (npm package, scoped package, data: URL, etc.) — not a
-    // filesystem path, so path-traversal confinement does not apply.
+    // Bare specifier (npm package, scoped package) — not a filesystem path, so
+    // path-traversal confinement does not apply. Blocked URL schemes are already
+    // rejected above before this branch is reached.
     return { valid: true, resolvedPath: null };
   }
 

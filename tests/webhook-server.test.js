@@ -893,3 +893,180 @@ describe('adapter wiring contract', () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Webhook rate limiting tests
+// ---------------------------------------------------------------------------
+
+describe('webhook server — rate limiting', () => {
+  const SECRET = 'shared-token-value';
+
+  // Minimal fake adapter that does not filter any events and uses a simple
+  // token verification scheme.  Identical to the one defined above but
+  // self-contained here so the rate-limit suite can be read independently.
+  const rlAdapter = {
+    name: 'fake-rl',
+    verify_webhook(_rawBody, headers, secret) {
+      return headers['x-fake-token'] === secret;
+    },
+    get_delivery_id(headers) {
+      return headers['x-fake-delivery'] ?? null;
+    },
+    normalize_webhook(headers, payload) {
+      if ((headers['x-fake-event'] ?? '') !== 'item') return null;
+      return {
+        id: `fake#${payload.id}`,
+        type: 'issue',
+        title: payload.title ?? '',
+        body: payload.body ?? '',
+        author: payload.author ?? 'user',
+        created_at: '',
+        url: '',
+        source: 'fake',
+        repo: 'org/test',
+        number: payload.id,
+        metadata: { labels: [], state: 'open', draft: false, merged: false, head_ref: '', base_ref: '' },
+      };
+    },
+    is_bot_sender() { return false; },
+  };
+
+  /**
+   * Send N signed webhook deliveries from the given author.
+   * Each delivery gets a unique x-fake-delivery ID to avoid replay rejection.
+   *
+   * @param {number} port
+   * @param {string} author
+   * @param {number} count
+   * @param {number} startSeq  Delivery ID sequence start (avoids cross-test collisions).
+   * @returns {Promise<Array<{status: number, body: object}>>}
+   */
+  async function sendN(port, author, count, startSeq = 0) {
+    const results = [];
+    for (let i = 0; i < count; i++) {
+      const payload = JSON.stringify({ id: startSeq + i, author, title: 't', body: 'b' });
+      const buf = Buffer.from(payload, 'utf8');
+      const r = await sendWebhook(port, buf, {
+        'x-fake-token': SECRET,
+        'x-fake-event': 'item',
+        'x-fake-delivery': `rl-${author}-${startSeq + i}`,
+      });
+      results.push(r);
+    }
+    return results;
+  }
+
+  it('per-author cap: events 1-20 pass, event 21+ returns 429 (cap=20, window=60s)', async () => {
+    const config = makeConfig({
+      webhooks: {
+        secret: SECRET,
+        path: '/webhook',
+        rate_limit_window_seconds: 60,
+        max_events_per_minute: 1000,
+      },
+      source: {
+        max_events_per_author_per_poll: 20,
+      },
+    });
+
+    // Use a frozen clock so the window never expires during the test.
+    const frozenNow = Date.now();
+    const { server, port } = await startServer(config, rlAdapter, { _now: () => frozenNow });
+
+    try {
+      const results = await sendN(port, 'alice', 25, 0);
+      // First 20 should be 200 ok
+      for (let i = 0; i < 20; i++) {
+        assert.equal(results[i].status, 200, `event ${i + 1} should pass`);
+      }
+      // Events 21-25 should be 429
+      for (let i = 20; i < 25; i++) {
+        assert.equal(results[i].status, 429, `event ${i + 1} should be rate-limited`);
+      }
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('global cap: events 1-3 pass, event 4+ returns 429 (global cap=3)', async () => {
+    const config = makeConfig({
+      webhooks: {
+        secret: SECRET,
+        path: '/webhook',
+        rate_limit_window_seconds: 60,
+        max_events_per_minute: 3,
+      },
+      source: {
+        // Per-author cap is generous — only the global cap should trigger here.
+        max_events_per_author_per_poll: 1000,
+      },
+    });
+
+    const frozenNow = Date.now();
+    // Use unique authors so no single author hits their per-author cap.
+    const { server, port } = await startServer(config, rlAdapter, { _now: () => frozenNow });
+
+    try {
+      const allResults = [];
+      // Five unique authors, one event each.
+      for (let i = 0; i < 5; i++) {
+        const author = `actor${i}`;
+        const payload = JSON.stringify({ id: 2000 + i, author, title: 't', body: 'b' });
+        const buf = Buffer.from(payload, 'utf8');
+        const r = await sendWebhook(port, buf, {
+          'x-fake-token': SECRET,
+          'x-fake-event': 'item',
+          'x-fake-delivery': `global-${i}`,
+        });
+        allResults.push(r);
+      }
+
+      assert.equal(allResults[0].status, 200, 'event 1 should pass');
+      assert.equal(allResults[1].status, 200, 'event 2 should pass');
+      assert.equal(allResults[2].status, 200, 'event 3 should pass');
+      assert.equal(allResults[3].status, 429, 'event 4 should be globally rate-limited');
+      assert.equal(allResults[4].status, 429, 'event 5 should be globally rate-limited');
+    } finally {
+      await closeServer(server);
+    }
+  });
+
+  it('window reset: 20 events pass, clock advances past window, next event passes (not 429)', async () => {
+    const config = makeConfig({
+      webhooks: {
+        secret: SECRET,
+        path: '/webhook',
+        rate_limit_window_seconds: 60,
+        max_events_per_minute: 1000,
+      },
+      source: {
+        max_events_per_author_per_poll: 20,
+      },
+    });
+
+    // Start at t=0; will advance to t=61s after filling the window.
+    let mockMs = 0;
+    const { server, port } = await startServer(config, rlAdapter, { _now: () => mockMs });
+
+    try {
+      // Fill the window for author 'bob'.
+      const firstBatch = await sendN(port, 'bob', 20, 3000);
+      for (let i = 0; i < 20; i++) {
+        assert.equal(firstBatch[i].status, 200, `event ${i + 1} in first batch should pass`);
+      }
+
+      // Confirm the cap is active before the clock advances.
+      const overCap = await sendN(port, 'bob', 1, 3020);
+      assert.equal(overCap[0].status, 429, 'event 21 should be rate-limited before window resets');
+
+      // Advance the mock clock past the window (60 s + 1 ms).
+      mockMs = 61_000;
+
+      // The window has expired — the next event from 'bob' should pass.
+      const afterReset = await sendN(port, 'bob', 1, 3021);
+      assert.equal(afterReset[0].status, 200, 'first event after window reset should pass');
+    } finally {
+      await closeServer(server);
+    }
+  });
+});
