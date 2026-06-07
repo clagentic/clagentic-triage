@@ -8,8 +8,6 @@
   <a href="https://clagentic.ai"><img src="https://img.shields.io/badge/-clagentic.ai-00CFFF?style=flat&logoColor=white" alt="clagentic.ai" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-FSL--1.1--MIT-blue?style=flat" alt="License: FSL-1.1-MIT" /></a>
   <img src="https://img.shields.io/badge/Node.js-20+-339933?style=flat&logo=node.js&logoColor=white" alt="Node.js 20+" />
-  <a href="https://www.npmjs.com/package/@clagentic/triage"><img src="https://img.shields.io/npm/v/@clagentic/triage?style=flat&label=npm" alt="npm version" /></a>
-  <a href="https://www.npmjs.com/package/@clagentic/triage"><img src="https://img.shields.io/npm/dw/@clagentic/triage?style=flat&label=downloads" alt="npm downloads" /></a>
   <a href="https://ko-fi.com/clagentic"><img src="https://img.shields.io/badge/Ko--fi-FF5E5B?style=flat&logo=ko-fi&logoColor=white&label=support" alt="Support on Ko-fi" /></a>
 </p>
 
