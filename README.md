@@ -61,15 +61,11 @@ GitHub Issues, a webhook endpoint, or any custom dispatcher).
 
 Requires Node 20 or later.
 
-```
-npm install -g @clagentic/triage
-```
-
-Or run from a clone:
+Run from a clone:
 
 ```
 git clone https://github.com/clagentic/clagentic-triage
-cd triage
+cd clagentic-triage
 node src/cli.js run
 ```
 
