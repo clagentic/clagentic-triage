@@ -163,7 +163,7 @@ and DD-011 in [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md).
   are never written to the config file or the pending queue.
 
 See [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) for the full rationale
-behind each security decision (DD-001 through DD-007).
+behind each security decision (DD-001 through DD-011).
 
 ## Documentation
 
