@@ -69,6 +69,10 @@ Configuration is loaded from (in priority order):
 | `watch_associations` | `["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE", "MANNEQUIN"]` | Actor-association filter (DD-008). Only events whose GitHub `author_association` is in this list are triaged. Default = external contributors only. Valid values: `OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`, `MANNEQUIN`. Unknown values are rejected at load. |
 | `ignore_logins` | `[]` | Logins always skipped, regardless of association (deny). E.g. the operator's own username, or an automation account like `naomi`. Wins over everything. |
 | `watch_logins` | `[]` | Logins always processed, even if their association is not in `watch_associations` (allow). Lets you watch a specific internal person. |
+| `max_events_per_author_per_poll` | `20` | Maximum events passed downstream per author per poll window. Applied after the bot and actor-association filters; filtered events do not count. `0` or `null` disables the cap. Stateless — counts reset each poll call. Protects against a single noisy actor flooding the assessment queue. |
+| `github_app_id` | `null` | GitHub App numeric ID. When set, the adapter mints installation tokens instead of using `CLAGENTIC_TRIAGE_GITHUB_TOKEN`. Use App auth or PAT — not both. |
+| `github_app_private_key_env` | `"CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY"` | Name of the env var that holds the RS256 private key PEM. The PEM is never stored on the config object — only the env var name is. Override if you store the key under a different env var name. |
+| `github_app_installation_id` | `null` | Installation numeric ID. Found in the installation URL on GitHub. Required when `github_app_id` is set. |
 
 The actor-association filter is orthogonal to the bot filter — both apply, and an
 event must pass both to be triaged. Precedence: `ignore_logins` (deny) → `watch_logins`
@@ -176,6 +180,84 @@ and `docs/SPAM_PROTECTION.md` for when and how to enable it.
 Pre-filter failures (LLM error, parse error, timeout) always degrade to pass-through.
 A failing pre-filter never blocks the pipeline.
 
+## Dispatchers
+
+Dispatchers receive events after assessment and create tasks in external systems
+(Jira, Linear, webhooks, etc.). They fire on the `dispatch` action class.
+
+```json
+{
+  "dispatchers": [
+    { "name": "webhook", "url": "https://example.com/triage-hook" },
+    { "name": "my-backend", "module": "./backends/my-backend.js", "config": {} }
+  ]
+}
+```
+
+Each entry must have either `name` (bundled dispatcher) or `module` (operator-supplied
+module path or npm specifier). `config` is optional and passed to the dispatcher.
+
+Bundled dispatchers: `noop` (logs only), `webhook` (HTTP POST). See `docs/DISPATCHERS.md`
+for the dispatcher interface contract.
+
+## Hooks
+
+Hooks are lightweight callbacks that fire after every assessment, regardless of the
+verdict. They run before the pending queue is written. Hook failures are logged as
+warnings — they never affect the pipeline outcome.
+
+```json
+{
+  "hooks": [
+    {
+      "name": "console",
+      "config": {
+        "command": "clagentic-console",
+        "args": [],
+        "prompt_via": "flag"
+      }
+    }
+  ]
+}
+```
+
+Each entry must have either `name` (bundled hook) or `module` (operator-supplied
+module path or npm specifier). `config` is optional and passed to the hook's `run`
+function.
+
+| Field | Required | Description |
+|---|---|---|
+| `name` | one of `name`/`module` | Bundled hook name. Must match `/^[a-z][a-z0-9-]*$/`. |
+| `module` | one of `name`/`module` | Operator-supplied module path (relative/absolute within cwd, or npm specifier). |
+| `config` | no | Hook-specific config object passed to `run()`. |
+
+### Bundled hook: `console`
+
+Launches `clagentic-console` when the triage verdict is `escalate`. The hook is
+fire-and-forget — the CLI session starts in a detached process; the pipeline does not
+wait for it to finish. Non-escalate verdicts are silently skipped.
+
+```json
+{
+  "name": "console",
+  "config": {
+    "command": "clagentic-console",
+    "args": [],
+    "prompt_via": "flag"
+  }
+}
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `command` | `"clagentic-console"` | CLI binary to invoke. Must be on PATH or an absolute path. |
+| `args` | `[]` | Extra arguments prepended before the prompt. Use for flags like `--profile myprofile`. |
+| `prompt_via` | `"flag"` | How to pass the prompt: `"flag"` passes `--message <prompt>` as a CLI argument; `"stdin"` writes the prompt to the process stdin. |
+
+The prompt contains: repo, issue/PR number, title, verdict, confidence score, and
+suggested action. It is a single concise paragraph — enough context for a console
+session to start immediately.
+
 ## Intent file
 
 The primary intent file is a YAML file committed to each watched repo at
@@ -237,6 +319,9 @@ a reverse proxy — the default bind address is `127.0.0.1`, not `0.0.0.0`.
 | `CLAGENTIC_TRIAGE_RUNNER_URL` | `runner_url` | Base URL for openai-compatible / clagentic-router |
 | `CLAGENTIC_TRIAGE_RUNNER_API_KEY_ENV` | `runner_api_key_env` | Name of the env var holding the API key (never the key itself) |
 | `CLAGENTIC_TRIAGE_GITHUB_TOKEN` | *(token getter)* | Never stored in config object |
+| `CLAGENTIC_TRIAGE_GITHUB_APP_ID` | `source.github_app_id` | |
+| `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY` | *(PEM read at mint time)* | Never stored in config object; env var name stored via `github_app_private_key_env` |
+| `CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID` | `source.github_app_installation_id` | |
 | `CLAGENTIC_TRIAGE_AUTO_APPROVE` | `auto_approve` | comma-separated |
 | `CLAGENTIC_TRIAGE_WEBHOOK_SECRET` | `webhooks.secret` | |
 | `CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD` | `confidence_threshold` | float 0–1 |

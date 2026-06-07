@@ -17,6 +17,7 @@ import { preFilter, noiseAssessment } from './assessors/pre_filter.js';
 import { route } from './router.js';
 import { enqueue } from './queue.js';
 import { dispatch } from './dispatchers/index.js';
+import { runHooks } from './hooks/index.js';
 
 // ---------------------------------------------------------------------------
 // Dispatch execution
@@ -148,6 +149,19 @@ export async function processEvent(config, event, adapter) {
       assessment = await assess(config, enrichedEvent);
     }
 
+    // Stage 2.5: Run hooks (fire-and-forget; failures are warnings, never fatal)
+    try {
+      const hookResults = await runHooks(config, enrichedEvent, assessment);
+      for (const r of hookResults) {
+        if (r.error) {
+          console.warn(`[pipeline] hook "${r.name}" failed: ${r.error}`);
+        }
+      }
+    } catch (hookErr) {
+      // runHooks itself should never throw, but guard defensively.
+      console.warn(`[pipeline] runHooks threw unexpectedly: ${hookErr.message}`);
+    }
+
     // Stage 3: Route — apply HITL gate (DD-001)
     const { should_dispatch, queue_reason } = route(config, assessment);
 
@@ -182,7 +196,7 @@ export async function processEvent(config, event, adapter) {
     }
 
     // Stage 4: Dispatch — execute the adapter action.
-    // Pass enrichedEvent so dispatchers receive the full context block (Peaches nit).
+    // Pass enrichedEvent so dispatchers receive the full context block.
     const { action_taken, queue_reason: deferredQueueReason, dispatch_results } = await _executeAction(
       config,
       enrichedEvent,

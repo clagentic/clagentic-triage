@@ -242,6 +242,83 @@ describe('list_events', () => {
   });
 
   // -------------------------------------------------------------------------
+  // Per-author cap: author is dropped after hitting the configured limit
+  // -------------------------------------------------------------------------
+
+  it('caps events per author at max_events_per_author_per_poll', async () => {
+    // Build 5 issues from 'spammer' and 1 from 'normal'
+    const spamIssues = Array.from({ length: 5 }, (_, i) =>
+      makeRawIssue({
+        number: 100 + i,
+        user: { login: 'spammer', type: 'User' },
+        author_association: 'NONE',
+      }),
+    );
+    const normalIssue = makeRawIssue({
+      number: 200,
+      user: { login: 'normal', type: 'User' },
+      author_association: 'NONE',
+    });
+
+    globalThis.fetch = async () => mockResponse(200, [...spamIssues, normalIssue]);
+
+    // Cap at 3 for 'spammer'; 'normal' is well under the cap.
+    const config = makeConfig({
+      source: {
+        adapter: 'github',
+        org: null,
+        repos: ['example/repo'],
+        allow_bot_logins: [],
+        watch_associations: ['NONE'],
+        ignore_logins: [],
+        watch_logins: [],
+        max_events_per_author_per_poll: 3,
+      },
+    });
+
+    const events = await list_events(config, '2024-01-01T00:00:00Z');
+    const spammerEvents = events.filter((e) => e.author === 'spammer');
+    const normalEvents = events.filter((e) => e.author === 'normal');
+
+    assert.equal(spammerEvents.length, 3, 'only 3 spammer events should pass through');
+    assert.equal(normalEvents.length, 1, 'normal event should always pass through');
+    assert.equal(events.length, 4);
+  });
+
+  // -------------------------------------------------------------------------
+  // Per-author cap: disabled when set to 0
+  // -------------------------------------------------------------------------
+
+  it('does not cap events when max_events_per_author_per_poll is 0', async () => {
+    // Build 10 issues all from the same author
+    const manyIssues = Array.from({ length: 10 }, (_, i) =>
+      makeRawIssue({
+        number: 300 + i,
+        user: { login: 'prolific', type: 'User' },
+        author_association: 'NONE',
+      }),
+    );
+
+    globalThis.fetch = async () => mockResponse(200, manyIssues);
+
+    const config = makeConfig({
+      source: {
+        adapter: 'github',
+        org: null,
+        repos: ['example/repo'],
+        allow_bot_logins: [],
+        watch_associations: ['NONE'],
+        ignore_logins: [],
+        watch_logins: [],
+        max_events_per_author_per_poll: 0,
+      },
+    });
+
+    const events = await list_events(config, '2024-01-01T00:00:00Z');
+    assert.equal(events.length, 10, 'all events pass through when cap is 0');
+  });
+
+  // -------------------------------------------------------------------------
   // Test 5b: repos=['*'] without org throws AdapterError
   // -------------------------------------------------------------------------
 
@@ -256,6 +333,36 @@ describe('list_events', () => {
         return true;
       },
     );
+  });
+
+  // -------------------------------------------------------------------------
+  // since validation: malformed string is rejected
+  // -------------------------------------------------------------------------
+
+  it('throws AdapterError with code invalid_since for a malformed since value', async () => {
+    const config = makeConfig();
+
+    await assert.rejects(
+      () => list_events(config, 'yesterday'),
+      (err) => {
+        assert.ok(err instanceof AdapterError, 'should be AdapterError');
+        assert.equal(err.code, 'invalid_since');
+        return true;
+      },
+    );
+  });
+
+  // -------------------------------------------------------------------------
+  // since validation: a valid ISO 8601 timestamp passes without throwing
+  // -------------------------------------------------------------------------
+
+  it('does not throw for a well-formed ISO 8601 since value', async () => {
+    globalThis.fetch = async () => mockResponse(200, []);
+
+    const config = makeConfig();
+    // Should resolve without error; the adapter returns an empty array.
+    const events = await list_events(config, '2024-06-01T12:00:00Z');
+    assert.deepEqual(events, []);
   });
 });
 

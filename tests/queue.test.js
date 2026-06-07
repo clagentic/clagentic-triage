@@ -6,9 +6,9 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, rm, mkdir } from 'fs/promises';
+import { readFile, writeFile, rm, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
-import { join } from 'path';
+import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { randomBytes } from 'crypto';
 
@@ -32,7 +32,7 @@ function makeConfig(queuePath) {
 }
 
 function makeEvent(id = 'evt-1') {
-  return { id, title: `Test event ${id}`, type: 'issue' };
+  return { id, title: `Test event ${id}`, type: 'issue', repo: 'example/repo' };
 }
 
 function makeAssessment(verdict = 'off_topic', confidence = 0.9) {
@@ -238,5 +238,63 @@ describe('QueueError', () => {
     assert.equal(e.code, 'test_code');
     assert.equal(e.message, 'test message');
     assert.ok(e instanceof Error);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Record re-validation on load
+// ---------------------------------------------------------------------------
+
+describe('readAll record validation', () => {
+  test('silently skips a malformed record (missing id)', async () => {
+    const config = makeConfig(tmpQueuePath());
+
+    // Write one malformed record directly (missing id) and confirm it is skipped.
+    const bad = {
+      // id intentionally omitted
+      queued_at: new Date().toISOString(),
+      queue_reason: 'awaiting_approval',
+      event: { id: 'e-bad', title: 'Bad', type: 'issue', repo: 'example/repo' },
+      assessment: { verdict: 'off_topic', confidence: 0.9 },
+      status: 'pending',
+      resolved_at: null,
+      resolved_action: null,
+      dispatch_results: null,
+    };
+
+    await mkdir(dirname(config.pending_queue), { recursive: true });
+    await writeFile(config.pending_queue, JSON.stringify(bad) + '\n', 'utf8');
+
+    const items = await readAll(config);
+    assert.deepEqual(items, [], 'malformed record should be skipped, returning empty array');
+  });
+
+  test('returns only valid records when the queue contains a mix of good and bad', async () => {
+    const config = makeConfig(tmpQueuePath());
+
+    // Write two records: one valid (via enqueue), one malformed (via direct write).
+    const good = await enqueue(config, {
+      event: { ...makeEvent('good-1'), repo: 'example/repo' },
+      assessment: makeAssessment(),
+      queue_reason: 'awaiting_approval',
+    });
+
+    // Append a bad record: assessment.confidence is out of range.
+    const bad = {
+      id: 'bad-record-1',
+      queued_at: new Date().toISOString(),
+      queue_reason: 'low_confidence',
+      event: { id: 'e-bad', title: 'Bad', type: 'issue', repo: 'example/repo' },
+      assessment: { verdict: 'spam', confidence: 2.5 },
+      status: 'pending',
+      resolved_at: null,
+      resolved_action: null,
+      dispatch_results: null,
+    };
+    await writeFile(config.pending_queue, JSON.stringify(bad) + '\n', { flag: 'a', encoding: 'utf8' });
+
+    const items = await readAll(config);
+    assert.equal(items.length, 1, 'only the valid record should be returned');
+    assert.equal(items[0].id, good.id);
   });
 });

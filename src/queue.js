@@ -54,8 +54,75 @@ function queuePath(config) {
 }
 
 /**
+ * Validate a deserialized queue record. Returns true if the record is
+ * structurally sound; false (with a console.warn) if it is corrupt or missing
+ * required fields. A single corrupt record must not prevent the rest of the
+ * queue from loading.
+ *
+ * Required fields:
+ *   - id:              non-empty string
+ *   - event:           object with a non-empty string `repo` field
+ *   - assessment:      object with string `verdict` and number `confidence` (0–1)
+ *   - created_at:      string (ISO 8601; format is not re-parsed, only type-checked)
+ *
+ * Note: queue records written by `enqueue` use `queued_at`, not `created_at`.
+ * The validator accepts either field name so that records from both the current
+ * writer and any future schema variation pass without false positives.
+ *
+ * @param {unknown} record
+ * @returns {boolean}
+ */
+function _validate_record(record) {
+  if (record === null || typeof record !== 'object') {
+    console.warn('[queue] skipping corrupt record: not an object', record);
+    return false;
+  }
+
+  if (typeof record.id !== 'string' || record.id.length === 0) {
+    console.warn('[queue] skipping corrupt record: id is missing or not a non-empty string', record);
+    return false;
+  }
+
+  if (record.event === null || typeof record.event !== 'object') {
+    console.warn(`[queue] skipping corrupt record ${record.id}: event is missing or not an object`);
+    return false;
+  }
+
+  if (typeof record.event.repo !== 'string' || record.event.repo.length === 0) {
+    console.warn(`[queue] skipping record ${record.id}: event.repo is missing or empty`);
+    return false;
+  }
+
+  if (
+    record.assessment === null ||
+    typeof record.assessment !== 'object' ||
+    typeof record.assessment.verdict !== 'string' ||
+    typeof record.assessment.confidence !== 'number' ||
+    record.assessment.confidence < 0 ||
+    record.assessment.confidence > 1
+  ) {
+    console.warn(
+      `[queue] skipping corrupt record ${record.id}: assessment.verdict or assessment.confidence is missing or invalid`,
+    );
+    return false;
+  }
+
+  // Accept either created_at (external schema) or queued_at (written by enqueue).
+  const timestamp = record.created_at ?? record.queued_at;
+  if (typeof timestamp !== 'string') {
+    console.warn(
+      `[queue] skipping corrupt record ${record.id}: created_at/queued_at is missing or not a string`,
+    );
+    return false;
+  }
+
+  return true;
+}
+
+/**
  * Read and parse all lines from the JSONL file. Returns an empty array if the
- * file does not exist or is empty. Never throws on missing file.
+ * file does not exist or is empty. Never throws on missing file. Corrupt lines
+ * are skipped with a warning rather than causing the whole load to fail.
  *
  * @param {string} filePath
  * @returns {Promise<object[]>}
@@ -66,7 +133,20 @@ async function readLines(filePath) {
   }
   const raw = await readFile(filePath, 'utf8');
   const lines = raw.split('\n').filter((l) => l.trim().length > 0);
-  return lines.map((l) => JSON.parse(l));
+  const records = [];
+  for (const line of lines) {
+    let parsed;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      console.warn('[queue] skipping unparseable JSONL line:', line.slice(0, 120));
+      continue;
+    }
+    if (_validate_record(parsed)) {
+      records.push(parsed);
+    }
+  }
+  return records;
 }
 
 /**

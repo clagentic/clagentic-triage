@@ -1,6 +1,6 @@
 # clagentic:triage
 
-LLM-powered triage agent for GitHub issues and PRs.
+LLM-powered triage agent for GitHub issues and PRs. Part of the [clagentic](https://clagentic.ai) suite.
 
 ## What it does
 
@@ -39,6 +39,9 @@ GitHub Issues, a webhook endpoint, or any custom dispatcher).
   Any backend — including private or internal tools — plugs in by module path. The
   core ships generic reference dispatchers (`webhook`, `noop`); concrete backends are
   external packages.
+- **Post-verdict hooks.** Hooks fire after assessment, before the queue. The bundled
+  `clagentic-console` hook opens a clagentic:console conversation on `escalate`
+  verdicts. Additional hooks load by module path.
 - **Zero runtime npm dependencies.** ESM, Node 20+, no bundler required.
 
 ## Install
@@ -52,7 +55,7 @@ npm install -g @clagentic/triage
 Or run from a clone:
 
 ```
-git clone https://github.com/clagentic/triage
+git clone https://github.com/clagentic/clagentic-triage
 cd triage
 node src/cli.js run
 ```
@@ -119,6 +122,13 @@ then `triage.config.json` in the working directory, then
 See [docs/CONFIG.md](docs/CONFIG.md) for the full schema and all environment
 variable overrides.
 
+The two-tier pre-filter is optional and off by default. When enabled, a fast
+cheap LLM pass classifies each inbound event as noise or real before the main
+assessor runs, reducing cost on high-volume repos. Enable it by setting
+`pre_filter.enabled: true` in the config file once you have a representative
+event sample to tune against. See [docs/CONFIG.md#pre_filter](docs/CONFIG.md#pre_filter)
+and DD-011 in [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md).
+
 ## Security model
 
 - **Webhook verification.** Inbound webhook deliveries are verified by the source
@@ -151,7 +161,8 @@ behind each security decision (DD-001 through DD-007).
 | [docs/GITHUB_APP.md](docs/GITHUB_APP.md) | GitHub integration: PAT vs GitHub App, setup, webhook ingress, reverse proxy |
 | [docs/ADAPTERS.md](docs/ADAPTERS.md) | Source adapter interface (poll + webhook), how to write one |
 | [docs/DISPATCHERS.md](docs/DISPATCHERS.md) | Dispatch backend interface, reference dispatchers, third-party plugins |
-| [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) | DD-001..DD-010 rationale and security decisions |
+| [docs/SECURITY.md](docs/SECURITY.md) | Token security, input validation, PII and data residency |
+| [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) | DD-001..DD-011 rationale and security decisions |
 
 ## License
 

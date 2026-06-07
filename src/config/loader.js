@@ -76,6 +76,16 @@ function defaults() {
       watch_associations: DEFAULT_WATCH_ASSOCIATIONS.slice(),
       ignore_logins: [],   // always skipped, regardless of association (deny)
       watch_logins: [],    // always processed, regardless of association (allow)
+      // Safety valve: max events passed downstream per author per poll call.
+      // 0 or null disables the cap. This is stateless — counts reset each call.
+      max_events_per_author_per_poll: 20,
+      // GitHub App credentials (alternative to PAT). When github_app_id is set,
+      // the adapter mints an installation token instead of using the PAT.
+      github_app_id: null,
+      // Name of the env var that holds the PEM (not the PEM itself). Default:
+      // CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY. The PEM is read at mint time.
+      github_app_private_key_env: 'CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY',
+      github_app_installation_id: null,
     },
     intent_file: '.github/triage-intent.yml',
     intent_file_fallback: '.github/TRIAGE_INTENT.md',
@@ -204,6 +214,22 @@ function configFromEnv(env) {
   if (env.CLAGENTIC_TRIAGE_WATCH_LOGINS !== undefined) {
     out.source = out.source || {};
     out.source.watch_logins = splitCsv(env.CLAGENTIC_TRIAGE_WATCH_LOGINS);
+  }
+
+  if (env.CLAGENTIC_TRIAGE_GITHUB_APP_ID !== undefined) {
+    out.source = out.source || {};
+    out.source.github_app_id = env.CLAGENTIC_TRIAGE_GITHUB_APP_ID;
+  }
+
+  // CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY is intentionally NOT mapped here.
+  // The key name convention stores only the env var name on config; the PEM is
+  // read from process.env at mint time and never stored on the config object.
+  // Operators who want to use a non-default env var name set
+  // github_app_private_key_env in the config file.
+
+  if (env.CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID !== undefined) {
+    out.source = out.source || {};
+    out.source.github_app_installation_id = env.CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID;
   }
 
   if (env.CLAGENTIC_TRIAGE_MODEL !== undefined) {

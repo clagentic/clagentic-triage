@@ -1,5 +1,5 @@
 /**
- * Tests for ETag cache hardening (lr-1dc5):
+ * Tests for ETag cache hardening:
  *   - TTL eviction: expired entries trigger a full re-fetch (no If-None-Match)
  *   - TTL within window: fresh entry uses the 304 path
  *   - Post-write invalidation: write methods clear the cache for the affected repo

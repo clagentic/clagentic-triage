@@ -64,7 +64,7 @@ function makeQueueConfig(queuePath, dispatchers = []) {
 }
 
 function makeEvent(id = 'owner/repo#1') {
-  return { id, type: 'issue', title: 'Test issue' };
+  return { id, type: 'issue', title: 'Test issue', repo: 'owner/repo' };
 }
 
 function makeAssessment(actionClass = 'dispatch') {

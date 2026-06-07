@@ -130,52 +130,43 @@ Note the **Installation ID** from the URL after installing:
 
 ### Step 4: Configure clagentic:triage for GitHub App auth
 
-clagentic:triage does not yet ship a built-in GitHub App token exchanger — this is
-planned for a future release (see **Planned: App auth integration** below). In the
-interim, the recommended approach is to use a sidecar or init container that exchanges
-the App credential for an installation token and writes it to the env var before
-clagentic:triage starts.
+clagentic:triage has built-in GitHub App token exchange. Set three config fields (or
+the corresponding env vars) and the adapter will mint a fresh installation token on
+every poll cycle — no sidecar required.
 
-**Option A: generate-github-app-token script (simple)**
+**Config file (`triage.config.json`):**
 
-A minimal script:
-```bash
-#!/usr/bin/env bash
-# generate-token.sh — exchange GitHub App credentials for an installation token
-# Requires: openssl, curl, jq
-APP_ID="${GITHUB_APP_ID:?}"
-KEY_FILE="${GITHUB_APP_KEY_FILE:?}"
-INSTALLATION_ID="${GITHUB_APP_INSTALLATION_ID:?}"
-
-# Build a JWT (expires in 9 minutes)
-NOW=$(date +%s)
-EXP=$((NOW + 540))
-HEADER=$(echo -n '{"alg":"RS256","typ":"JWT"}' | base64 -w0 | tr '+/' '-_' | tr -d '=')
-PAYLOAD=$(echo -n "{\"iat\":$NOW,\"exp\":$EXP,\"iss\":\"$APP_ID\"}" | base64 -w0 | tr '+/' '-_' | tr -d '=')
-SIG=$(echo -n "$HEADER.$PAYLOAD" | openssl dgst -sha256 -sign "$KEY_FILE" | base64 -w0 | tr '+/' '-_' | tr -d '=')
-JWT="$HEADER.$PAYLOAD.$SIG"
-
-# Exchange JWT for installation token
-TOKEN=$(curl -s -X POST \
-  -H "Authorization: Bearer $JWT" \
-  -H "Accept: application/vnd.github+json" \
-  "https://api.github.com/app/installations/$INSTALLATION_ID/access_tokens" \
-  | jq -r '.token')
-
-export CLAGENTIC_TRIAGE_GITHUB_TOKEN="$TOKEN"
-exec clagentic-triage watch
+```json
+{
+  "source": {
+    "github_app_id": "123456",
+    "github_app_installation_id": "78901234"
+  }
+}
 ```
 
-Installation tokens expire after 1 hour. Wrap clagentic-triage in a supervisor
-(systemd, Docker restart policy, etc.) that re-runs this script on exit so the token
-stays fresh.
+**Corresponding env vars:**
 
-**Option B: gh-app-token third-party tool**
+```
+CLAGENTIC_TRIAGE_GITHUB_APP_ID=123456
+CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n...
+CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID=78901234
+```
 
-Tools like [`github-app-token`](https://github.com/marketplace/actions/create-github-app-token)
-(GitHub Actions) or [`generate-github-app-token`](https://cli.github.com/manual/gh_auth_token)
-wrap this exchange. For non-Actions deployments, any OIDC-capable secret manager
-(Vault, AWS Secrets Manager) can store the private key and vend short-lived tokens.
+| Config key | Env var | Description |
+|---|---|---|
+| `source.github_app_id` | `CLAGENTIC_TRIAGE_GITHUB_APP_ID` | Numeric App ID shown at the top of your App's settings page |
+| `source.github_app_private_key_env` | *(not mapped — see note)* | Name of the env var that holds the PEM. Default: `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY`. Change this if you store the key under a different name. |
+| `source.github_app_installation_id` | `CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID` | Numeric installation ID from the installation URL |
+
+> **Note on the private key:** the PEM is never stored on the config object. Only the
+> *name* of the env var is stored (`github_app_private_key_env`). The adapter reads the
+> PEM from `process.env[github_app_private_key_env]` at mint time. Set the env var
+> whose name is in `github_app_private_key_env` to the full PEM contents (newlines as
+> `\n` or literal, depending on your deployment method).
+
+When `github_app_id` is set, the PAT (`CLAGENTIC_TRIAGE_GITHUB_TOKEN`) is ignored.
+Use one or the other — not both.
 
 ### Step 5: Configure webhooks
 
@@ -209,19 +200,6 @@ Open an issue in a watched repo from an external account. You should see:
 1. A webhook delivery arrive (check GitHub → App settings → Advanced → Recent deliveries)
 2. `[triage]` log output showing the event processed
 3. A new entry in `.triage/pending.jsonl`
-
----
-
-## Planned: App auth integration
-
-A future release will add native GitHub App auth to `src/adapters/github.js`:
-- Accept `github_app_id`, `github_app_key_file`, and `github_app_installation_id`
-  in config
-- Auto-exchange for installation tokens at startup and before each poll cycle
-- Cache the token and refresh it before expiry (tokens are valid for 1 hour)
-- Expose as `config.github_token()` so no other code changes are needed
-
-Until that ships, the sidecar script in Step 4 is the supported path.
 
 ---
 

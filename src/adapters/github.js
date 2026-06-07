@@ -4,14 +4,16 @@
  * Implements the standard adapter interface against the GitHub REST API.
  * Uses Node's built-in fetch (Node 20+). No external dependencies.
  *
- * Token is always sourced from config.github_token() — never hardcoded or
- * read from any other env var. The token is never logged or stored.
+ * Token resolution goes through _resolve_token(): GitHub App installation tokens
+ * are minted when App credentials are configured; otherwise falls back to the PAT
+ * from config.github_token(). Tokens are never logged or stored.
  */
 
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { readFile } from 'fs/promises';
 import { join } from 'path';
 import { fileURLToPath } from 'url';
+import { mint_installation_token } from './github_app.js';
 
 // ---------------------------------------------------------------------------
 // Package version — read once at module load time
@@ -78,6 +80,44 @@ function _invalidate_cache(repo) {
       _etagCache.delete(key);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Token resolution
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve the GitHub API token for a given config.
+ *
+ * If GitHub App credentials are present (`source.github_app_id`), a fresh
+ * installation token is minted via the App's private key. Otherwise falls back
+ * to the PAT from `config.github_token()`.
+ *
+ * The PEM is read from the env var named by `source.github_app_private_key_env`
+ * (default: `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY`) so it is never stored on
+ * the config object.
+ *
+ * @param {object} config - Loaded triage config
+ * @returns {Promise<string|null>} Token string, or null if no credentials are configured
+ */
+async function _resolve_token(config) {
+  const src = config.source ?? {};
+  if (src.github_app_id) {
+    const key_env = src.github_app_private_key_env ?? 'CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY';
+    const private_key_pem = process.env[key_env];
+    if (!private_key_pem) {
+      throw new AdapterError(
+        `GitHub App auth configured but env var "${key_env}" is not set or empty`,
+        'auth_failure',
+      );
+    }
+    return mint_installation_token({
+      app_id: src.github_app_id,
+      private_key_pem,
+      installation_id: src.github_app_installation_id,
+    });
+  }
+  return config.github_token();
 }
 
 // ---------------------------------------------------------------------------
@@ -360,17 +400,37 @@ function _normalize(raw, repo, forceType = null) {
  * - repos=['*'] without an org: throws AdapterError
  *
  * @param {object} config
- * @param {string} since  - ISO 8601 timestamp
+ * @param {string} [since]  - ISO 8601 timestamp (optional; omit to fetch all open items)
  * @returns {Promise<object[]>} Normalized Event[]
  */
 export async function list_events(config, since) {
-  const token = config.github_token();
+  // Validate `since` when provided. Null/undefined/empty string are allowed
+  // (callers may omit it). Non-string values or strings that do not start with a
+  // recognizable ISO 8601 timestamp (YYYY-MM-DDTHH:MM:SS…) are rejected.
+  if (since !== null && since !== undefined && since !== '') {
+    if (typeof since !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(since)) {
+      throw new AdapterError(
+        `invalid since value: expected an ISO 8601 timestamp string (e.g. "2024-01-01T00:00:00Z"), got: ${JSON.stringify(since)}`,
+        'invalid_since',
+      );
+    }
+  }
+
+  const token = await _resolve_token(config);
   if (!token) {
-    console.warn('[github adapter] CLAGENTIC_TRIAGE_GITHUB_TOKEN is not set; returning empty list');
+    console.warn('[github adapter] no GitHub token configured; returning empty list');
     return [];
   }
 
   const allowBotLogins = config.source?.allow_bot_logins ?? [];
+
+  // Per-author event cap for this poll window. Stateless: counts live only for
+  // the duration of this list_events() call and are never persisted. 0 or null
+  // means disabled.
+  const authorCap = config.source?.max_events_per_author_per_poll ?? 20;
+  const capEnabled = authorCap !== 0 && authorCap !== null;
+  /** @type {Map<string, number>} */
+  const authorCounts = new Map();
 
   // Resolve the list of repos to query
   let repos;
@@ -393,8 +453,9 @@ export async function list_events(config, since) {
   const events = [];
 
   for (const repo of repos) {
-    const url = `${GITHUB_API}/repos/${repo}/issues?state=open&sort=updated&direction=desc&since=${encodeURIComponent(since)}&per_page=100`;
-    const cacheKey = `list_events:${repo}:${since}`;
+    const sinceParam = since ? `&since=${encodeURIComponent(since)}` : '';
+    const url = `${GITHUB_API}/repos/${repo}/issues?state=open&sort=updated&direction=desc${sinceParam}&per_page=100`;
+    const cacheKey = `list_events:${repo}:${since ?? ''}`;
 
     try {
       const result = await _fetchPaginated(url, token, cacheKey);
@@ -415,6 +476,21 @@ export async function list_events(config, since) {
             })
           ) {
             continue;
+          }
+          if (capEnabled) {
+            const count = authorCounts.get(event.author) ?? 0;
+            if (count >= authorCap) {
+              if (count === authorCap) {
+                // Warn exactly once per author when the cap is first hit.
+                console.warn(
+                  `[github adapter] per-author cap reached for "${event.author}" (${authorCap} events); skipping further events from this author this poll`,
+                );
+                // Increment so the warning fires only once.
+                authorCounts.set(event.author, count + 1);
+              }
+              continue;
+            }
+            authorCounts.set(event.author, count + 1);
           }
           events.push(event);
         }
@@ -438,6 +514,24 @@ export async function list_events(config, since) {
         }
         if (!should_process_actor(config, _actorOf(raw))) {
           continue;
+        }
+        // Per-author cap: applied after the above filters so filtered events
+        // do not count toward the cap for a given author.
+        if (capEnabled) {
+          const author = raw.user?.login ?? '';
+          const count = authorCounts.get(author) ?? 0;
+          if (count >= authorCap) {
+            if (count === authorCap) {
+              // Warn exactly once per author when the cap is first hit.
+              console.warn(
+                `[github adapter] per-author cap reached for "${author}" (${authorCap} events); skipping further events from this author this poll`,
+              );
+              // Increment so the warning fires only once.
+              authorCounts.set(author, count + 1);
+            }
+            continue;
+          }
+          authorCounts.set(author, count + 1);
         }
         normalized.push(_normalize(raw, repo));
       }
@@ -513,7 +607,7 @@ async function _listOrgRepos(org, token) {
  * @returns {Promise<string>} URL of the created comment
  */
 export async function post_comment(config, event, body) {
-  const token = config.github_token();
+  const token = await _resolve_token(config);
   const url = `${GITHUB_API}/repos/${event.repo}/issues/${event.number}/comments`;
 
   const res = await globalThis.fetch(url, {
@@ -546,7 +640,7 @@ export async function post_comment(config, event, body) {
  * @returns {Promise<void>}
  */
 export async function close_item(config, event) {
-  const token = config.github_token();
+  const token = await _resolve_token(config);
 
   let url;
   let patchBody;
@@ -590,7 +684,7 @@ export async function request_changes(config, event, body) {
     throw new AdapterError(`request_changes is only valid for PRs; got type='${event.type}'`);
   }
 
-  const token = config.github_token();
+  const token = await _resolve_token(config);
   const url = `${GITHUB_API}/repos/${event.repo}/pulls/${event.number}/reviews`;
 
   const res = await globalThis.fetch(url, {
@@ -623,7 +717,7 @@ export async function approve_pr(config, event) {
     throw new AdapterError(`approve_pr is only valid for PRs; got type='${event.type}'`);
   }
 
-  const token = config.github_token();
+  const token = await _resolve_token(config);
   const url = `${GITHUB_API}/repos/${event.repo}/pulls/${event.number}/reviews`;
 
   const res = await globalThis.fetch(url, {
@@ -652,7 +746,7 @@ export async function approve_pr(config, event) {
  * @returns {Promise<void>}
  */
 export async function label_item(config, event, labels) {
-  const token = config.github_token();
+  const token = await _resolve_token(config);
   const url = `${GITHUB_API}/repos/${event.repo}/issues/${event.number}/labels`;
 
   const res = await globalThis.fetch(url, {
@@ -864,7 +958,7 @@ const BROAD_SCOPES = new Set([
  * >}
  */
 export async function check_token_scopes(config) {
-  const token = config.github_token();
+  const token = await _resolve_token(config);
   if (!token) {
     return { ok: false, error: 'no token configured' };
   }
