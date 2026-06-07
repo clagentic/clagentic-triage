@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 112 112" width="112" height="112">
+  <defs>
+    <linearGradient id="grad" gradientUnits="userSpaceOnUse" x1="8" y1="8" x2="104" y2="104">
+      <stop offset="0%"   stop-color="#00CFFF"/>
+      <stop offset="45%"  stop-color="#4A7FE8"/>
+      <stop offset="100%" stop-color="#7B3FE4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Standard terminal frame -->
+  <rect x="8" y="8" width="96" height="96" rx="8" ry="8"
+        fill="none" stroke="url(#grad)" stroke-width="4.5"/>
+
+  <!-- Inbox tray: a document dropping into a triage queue -->
+  <!-- Three horizontal "signal" lines entering from top-left (inbound issues/PRs) -->
+  <line x1="26" y1="30" x2="52" y2="30"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round"/>
+  <line x1="26" y1="38" x2="46" y2="38"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round" opacity="0.55"/>
+  <line x1="26" y1="46" x2="40" y2="46"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round" opacity="0.3"/>
+
+  <!-- Central assessment node: diamond (decision point) -->
+  <path d="M 56 42 L 68 56 L 56 70 L 44 56 Z"
+        fill="none" stroke="url(#grad)" stroke-width="2.5"
+        stroke-linejoin="round" stroke-linecap="round"/>
+
+  <!-- Connector: signals flow into the diamond -->
+  <line x1="52" y1="30" x2="56" y2="42"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Three output branches from diamond: approve (top-right), respond (mid-right), reject (bottom-right) -->
+  <!-- Top branch: approve / merge — solid weight -->
+  <line x1="68" y1="56" x2="82" y2="40"
+        stroke="url(#grad)" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="82" y1="40" x2="92" y2="40"
+        stroke="url(#grad)" stroke-width="2.5" stroke-linecap="round"/>
+
+  <!-- Mid branch: respond / request changes — medium -->
+  <line x1="68" y1="56" x2="92" y2="56"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round"/>
+
+  <!-- Bottom branch: reject / close — dimmed -->
+  <line x1="68" y1="56" x2="82" y2="72"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+  <line x1="82" y1="72" x2="92" y2="72"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+
+  <!-- Approve endpoint dot -->
+  <circle cx="92" cy="40" r="3" fill="url(#grad)"/>
+
+  <!-- Respond endpoint: small speech reply mark -->
+  <circle cx="92" cy="56" r="3" fill="none" stroke="url(#grad)" stroke-width="2"/>
+
+  <!-- Reject endpoint: small X -->
+  <line x1="89" y1="69" x2="95" y2="75"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+  <line x1="95" y1="69" x2="89" y2="75"
+        stroke="url(#grad)" stroke-width="2" stroke-linecap="round" opacity="0.45"/>
+
+  <!-- LLM indicator: small filled dot at base of diamond (agent is inside the loop) -->
+  <circle cx="56" cy="56" r="2.5" fill="url(#grad)"/>
+
+</svg>
