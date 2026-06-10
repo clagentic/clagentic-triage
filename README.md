@@ -170,6 +170,7 @@ behind each security decision (DD-001 through DD-011).
 | [docs/DISPATCHERS.md](docs/DISPATCHERS.md) | Dispatch backend interface, reference dispatchers, third-party plugins |
 | [docs/SECURITY.md](docs/SECURITY.md) | Token security, input validation, PII and data residency |
 | [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) | DD-001..DD-011 rationale and security decisions |
+| [docs/INTENT_AUTHORING.md](docs/INTENT_AUTHORING.md) | How to write a `.github/triage-intent.yml` file for your repo |
 
 ## Support
 

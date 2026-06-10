@@ -306,6 +306,10 @@ keys, and `.env` files are blocked regardless of the intent file's contents.
 If no YAML file is found, the assessor falls back to `.github/TRIAGE_INTENT.md`
 (Markdown), then to a built-in generic intent.
 
+See [INTENT_AUTHORING.md](INTENT_AUTHORING.md) for guidance on writing effective
+intent files — what to put in `llm_context`, how to tune for confidence, and how
+to iterate safely before enabling `auto_approve`.
+
 ## Webhook server
 
 Real-time event delivery via GitHub webhooks. Disabled by default.
