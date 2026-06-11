@@ -498,22 +498,27 @@ export async function list_events(config, since) {
   const repoPostFilterCap = config.source?.max_events_per_repo_per_poll ?? 200;
   const repoCapEnabled = repoPostFilterCap !== 0 && repoPostFilterCap !== null;
 
-  // Resolve the list of repos to query
+  // Resolve the list of repos to query.
+  // When source.repos is explicit (not ['*']), use it directly — org is used
+  // only to resolve the wildcard. This prevents enumerating all org repos when
+  // the operator has scoped the watch to a specific list.
   let repos;
-  if (config.source?.org) {
+  const cfgRepos = config.source?.repos ?? ['*'];
+  if (cfgRepos.includes('*')) {
+    if (!config.source?.org) {
+      throw new AdapterError(
+        "source.repos=['*'] requires source.org to be set — cannot list all repos without an org",
+      );
+    }
     repos = await _listOrgRepos(config.source.org, token);
     if (repos === null) {
       // Auth failure from org listing
       return [];
     }
   } else {
-    const cfgRepos = config.source?.repos ?? ['*'];
-    if (cfgRepos.includes('*')) {
-      throw new AdapterError(
-        "source.repos=['*'] requires source.org to be set — cannot list all repos without an org",
-      );
-    }
-    repos = cfgRepos;
+    // Explicit repo list: qualify unqualified names with org if present.
+    const org = config.source?.org;
+    repos = cfgRepos.map((r) => (org && !r.includes('/') ? `${org}/${r}` : r));
   }
 
   const events = [];

@@ -301,15 +301,42 @@ async function cmdApprove(args, flags) {
   const all = await readAll(config);
   const item = all.find((i) => i.id === id);
 
-  // Fire dispatchers when the assessment's suggested action class is 'dispatch'.
-  // dispatch() handles per-dispatcher errors internally — it never throws.
+  if (!item) {
+    err(`No item found with id: ${id}`);
+    process.exit(1);
+  }
+
+  const adapter = await loadAdapter(config);
+  const actionClass = item.assessment?.suggested_action?.class;
+  const body = item.assessment?.suggested_action?.body ?? '';
   let dispatchResults = null;
-  if (item?.assessment?.suggested_action?.class === 'dispatch') {
-    dispatchResults = await dispatch(config, item.event, item.assessment);
+
+  // Execute the adapter action that was held for human approval.
+  switch (actionClass) {
+    case 'respond':
+      await adapter.post_comment(config, item.event, body);
+      break;
+    case 'request_changes':
+      await adapter.request_changes(config, item.event, body);
+      break;
+    case 'approve':
+      await adapter.approve_pr(config, item.event);
+      break;
+    case 'close':
+      await adapter.close_item(config, item.event);
+      break;
+    case 'dispatch':
+      // Fire all configured dispatchers.
+      dispatchResults = await dispatch(config, item.event, item.assessment);
+      break;
+    case 'escalate':
+    default:
+      // Nothing to execute — approval just records the human decision.
+      break;
   }
 
   const updated = await resolveItem(config, id, { action: 'approved', dispatch_results: dispatchResults });
-  out(`Approved: ${updated.id}`);
+  out(`Approved and dispatched: ${updated.id} (action=${actionClass})`);
 }
 
 async function cmdOverride(args, flags) {
