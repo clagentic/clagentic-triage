@@ -15,7 +15,7 @@ import { enrich } from './enricher.js';
 import { assess } from './assessor.js';
 import { preFilter, noiseAssessment } from './assessors/pre_filter.js';
 import { route } from './router.js';
-import { enqueue } from './queue.js';
+import { enqueue, readAll } from './queue.js';
 import { dispatch } from './dispatchers/index.js';
 import { runHooks } from './hooks/index.js';
 
@@ -286,7 +286,27 @@ export async function runPipeline(config, events, adapter) {
   const queued = [];
   const errors = [];
 
+  // Build a set of event IDs that already have a pending queue entry so we
+  // don't re-assess the same issue/PR on every poll cycle while it awaits
+  // human review. Resolved items (approved/rejected) are not excluded — a
+  // re-opened issue could legitimately be re-assessed.
+  const pendingEventIds = new Set();
+  try {
+    const existing = await readAll(config);
+    for (const item of existing) {
+      if (item.status === 'pending' && item.event?.id) {
+        pendingEventIds.add(item.event.id);
+      }
+    }
+  } catch {
+    // readAll never throws, but guard defensively — dedup is best-effort.
+  }
+
   for (const event of events) {
+    if (pendingEventIds.has(event.id)) {
+      continue; // already awaiting human review; skip re-assessment
+    }
+
     // processEvent never throws — safe to await in a loop.
     const result = await processEvent(config, event, adapter);
 

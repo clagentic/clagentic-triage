@@ -83,6 +83,20 @@ export function _setSpawnFn(fn) {
 // Error class
 // ---------------------------------------------------------------------------
 
+/**
+ * Strip markdown code fences from LLM output before JSON parsing.
+ * Some models wrap JSON responses in ```json ... ``` or ``` ... ``` fences
+ * even when instructed not to. Stripping them allows robust parsing.
+ * If no fences are found the string is returned unchanged.
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function stripMarkdownFences(text) {
+  const stripped = text.trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```\s*$/i, '').trim();
+  return stripped;
+}
+
 export class LlmError extends Error {
   /**
    * @param {string} message
@@ -219,7 +233,7 @@ async function _runClaudeCli(prompt, model, timeoutMs) {
   // actual LLM JSON payload. This handles the CLI's envelope format.
   if (typeof parsed === 'object' && parsed !== null && typeof parsed.result === 'string') {
     try {
-      return JSON.parse(parsed.result);
+      return JSON.parse(stripMarkdownFences(parsed.result));
     } catch {
       const snippet = parsed.result.slice(0, 500);
       throw new LlmError(`LLM result field is not valid JSON: ${snippet}`, 'parse_error');
@@ -302,7 +316,7 @@ async function _runAnthropicApi(prompt, model, timeoutMs, config) {
   }
 
   try {
-    return JSON.parse(text);
+    return JSON.parse(stripMarkdownFences(text));
   } catch {
     const snippet = text.slice(0, 500);
     throw new LlmError(`anthropic-api content is not valid JSON: ${snippet}`, 'parse_error');
@@ -393,7 +407,7 @@ async function _runOpenAiCompatible(prompt, model, timeoutMs, config) {
   }
 
   try {
-    return JSON.parse(text);
+    return JSON.parse(stripMarkdownFences(text));
   } catch {
     const snippet = text.slice(0, 500);
     throw new LlmError(`openai-compatible content is not valid JSON: ${snippet}`, 'parse_error');
