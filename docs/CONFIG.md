@@ -88,38 +88,48 @@ is treated as external and processed (fail-open). See DD-008 for the full ration
 
 | `runner` | Description |
 |---|---|
-| `"claude-cli"` | Default. Spawns the `claude` CLI as a subprocess. `model` is passed as `--model`. Requires `claude` on PATH or `CLAUDE_PATH`. |
-| `"anthropic-api"` | HTTP POST to `https://api.anthropic.com/v1/messages`. API key read from the env var named in `runner_api_key_env` (default: `ANTHROPIC_API_KEY`). |
-| `"openai-compatible"` | HTTP POST to `${runner_url}/chat/completions`. Covers OpenAI, Azure OpenAI, Ollama, and any OpenAI-compatible server. If the key env var is empty (e.g. Ollama local), the Authorization header is omitted. |
-| `"clagentic-router"` | HTTP POST to `${runner_url}/v1/assess` (default URL: `http://localhost:4200`). The router handles multi-provider routing — Claude, GPT-4o, Gemini, or any configured backend. |
+| `"claude-cli"` | Default. Spawns the `claude` CLI as a subprocess. `model` is passed as `--model`. Requires `claude` on PATH or `CLAUDE_PATH`. The CLI must be authenticated on the machine running clagentic:triage — this runner does not work in containers or on hosts without an active OAuth session. |
+| `"anthropic-api"` | HTTP POST to `https://api.anthropic.com/v1/messages`. API key read from the env var named in `runner_api_key_env` (default: `ANTHROPIC_API_KEY`). No CLI required. |
+| `"openai-compatible"` | HTTP POST to `${runner_url}/chat/completions`. Covers OpenAI, Azure OpenAI, Ollama, clagentic:router, and any OpenAI-compatible server. If the key env var is empty (e.g. Ollama local), the Authorization header is omitted. This is the recommended runner for hosted or containerized deployments. |
+| `"clagentic-router"` | HTTP POST to `${runner_url}/v1/assess`. Legacy runner for a private router protocol not implemented in the public clagentic:router release. **Prefer `openai-compatible` pointing at a clagentic:router instance** — it speaks the standard `/v1/chat/completions` path that router exposes. |
 
-**`runner_url`** — base URL for `openai-compatible` and `clagentic-router`. Required for `openai-compatible`; optional for `clagentic-router` (defaults to `http://localhost:4200`).
+**`runner_url`** — base URL for `openai-compatible` and `clagentic-router`. Required for `openai-compatible`; ignored for `claude-cli` and `anthropic-api`.
 
 **`runner_api_key_env`** — the **name** of the environment variable that holds the API key (never the key itself). Leave unset to use the runner's default (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `CLAGENTIC_ROUTER_TOKEN`).
 
-**Minimal standalone setup (claude CLI):**
+**Minimal standalone setup (claude CLI, on the same host as OAuth session):**
 ```json
-{ "runner": "claude-cli", "model": "claude-sonnet-4-5" }
+{ "runner": "claude-cli", "model": "claude-haiku-4-5" }
 ```
 
-**Anthropic API directly:**
+**Anthropic API directly (no CLI, no router — just an API key):**
 ```json
-{ "runner": "anthropic-api", "model": "claude-opus-4", "runner_api_key_env": "ANTHROPIC_API_KEY" }
+{ "runner": "anthropic-api", "model": "claude-haiku-4-5", "runner_api_key_env": "ANTHROPIC_API_KEY" }
 ```
+
+**clagentic:router (recommended for self-hosted multi-backend setups):**
+
+clagentic:router is a self-hosted LLM routing daemon that exposes an OpenAI-compatible API and walks a configurable fallback chain across backends (Claude CLI, Anthropic API, OpenAI, Ollama, etc.). Run it on a host where OAuth sessions are active; point clagentic:triage at it from anywhere on the same network.
+
+```json
+{
+  "runner": "openai-compatible",
+  "runner_url": "http://your-router-host:8765/v1",
+  "runner_api_key_env": "CLAGENTIC_ROUTER_TOKEN",
+  "model": "role:triage"
+}
+```
+
+The `model` field is passed to router as the chain selector. Use `role:<chain-name>` to select a named chain from router's config (e.g. `role:triage` for a cheap-model-first chain), `backend:<id>` to target a specific backend, or `chain:alias1,alias2` for an explicit fallback sequence. See clagentic:router documentation for chain configuration.
 
 **Ollama local (no auth):**
 ```json
-{ "runner": "openai-compatible", "model": "llama3", "runner_url": "http://localhost:11434" }
-```
-
-**clagentic:router:**
-```json
-{ "runner": "clagentic-router", "model": "auto", "runner_url": "http://localhost:4200" }
+{ "runner": "openai-compatible", "model": "llama3", "runner_url": "http://localhost:11434/v1" }
 ```
 
 **Deprecation note:** `model: "clagentic:router"` is deprecated. On load, it is automatically
 migrated to `runner: "clagentic-router"` and `model: "auto"` with a warning. Update your config
-to use the explicit `runner` field.
+to use `runner: "openai-compatible"` pointing at your clagentic:router instance.
 
 ### `confidence_threshold`
 
@@ -192,7 +202,7 @@ and `docs/SPAM_PROTECTION.md` for when and how to enable it.
 | Key | Default | Description |
 |---|---|---|
 | `enabled` | `false` | Enable the pre-filter. Off by default — enable once you have confidence in the threshold for your event stream. |
-| `runner` | main `runner` | Runner to use for tier-1 calls. Route to a cheap model here. `clagentic-router` is not compatible — use a direct runner. |
+| `runner` | main `runner` | Runner to use for tier-1 calls. Route to a cheap/fast model here. `openai-compatible` pointing at a clagentic:router instance or a local Ollama server works well. |
 | `model` | main `model` | Model for tier-1 calls. |
 | `timeout_ms` | main `llm_timeout_ms` | Timeout for pre-filter calls. |
 | `confidence_threshold` | `0.8` | Minimum confidence to drop an event as noise. Below this threshold the event passes through to the main assessor. Intentionally high — uncertain classifications pass. |

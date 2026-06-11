@@ -40,10 +40,12 @@ GitHub Issues, a webhook endpoint, or any custom dispatcher).
   explicitly opt an action class into auto-approve. Confidence below the configured
   threshold always routes to HITL regardless of auto-approve settings.
 - **Multi-runner LLM.** Four backends: `claude-cli` (default — spawns the `claude`
-  CLI, no API key required in the environment), `anthropic-api` (direct HTTP, no SDK),
-  `openai-compatible` (covers OpenAI, Azure OpenAI, Ollama, and any compatible server),
-  `clagentic-router` (delegates to the clagentic:router service for multi-provider
-  routing). Model selection is config-driven, never hardcoded.
+  CLI, requires OAuth session on the same host), `anthropic-api` (direct HTTP, no SDK,
+  just an API key), `openai-compatible` (covers OpenAI, Azure OpenAI, Ollama,
+  clagentic:router, and any OpenAI-compatible server — recommended for containerized or
+  multi-host deployments), `clagentic-router` (legacy private protocol; prefer
+  `openai-compatible` against a router instance). Model selection is config-driven,
+  never hardcoded.
 - **Pluggable source adapters.** Adapters normalize events from a platform (GitHub,
   GitLab, Forgejo, ...) into a common Event schema. The pipeline is adapter-agnostic.
 - **Pluggable dispatch backends.** Dispatchers push verdicts into backend systems.
