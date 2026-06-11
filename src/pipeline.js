@@ -286,16 +286,17 @@ export async function runPipeline(config, events, adapter) {
   const queued = [];
   const errors = [];
 
-  // Build a set of event IDs that already have a pending queue entry so we
-  // don't re-assess the same issue/PR on every poll cycle while it awaits
-  // human review. Resolved items (approved/rejected) are not excluded — a
-  // re-opened issue could legitimately be re-assessed.
-  const pendingEventIds = new Set();
+  // Build a set of event IDs to skip on this poll cycle:
+  //   - 'pending': awaiting human review; don't re-assess.
+  //   - 'approved': action already executed (or queued for execution); don't re-queue.
+  // Rejected and overridden items ARE re-assessed — the human explicitly declined,
+  // so a re-opened or updated issue should be triaged fresh.
+  const skipEventIds = new Set();
   try {
     const existing = await readAll(config);
     for (const item of existing) {
-      if (item.status === 'pending' && item.event?.id) {
-        pendingEventIds.add(item.event.id);
+      if ((item.status === 'pending' || item.status === 'approved') && item.event?.id) {
+        skipEventIds.add(item.event.id);
       }
     }
   } catch {
@@ -303,8 +304,8 @@ export async function runPipeline(config, events, adapter) {
   }
 
   for (const event of events) {
-    if (pendingEventIds.has(event.id)) {
-      continue; // already awaiting human review; skip re-assessment
+    if (skipEventIds.has(event.id)) {
+      continue; // already pending or approved; skip re-assessment
     }
 
     // processEvent never throws — safe to await in a loop.
