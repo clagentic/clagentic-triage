@@ -749,3 +749,76 @@ describe('callLlm() — clagentic-router runner', () => {
     );
   });
 });
+
+// ---------------------------------------------------------------------------
+// _buildPrompt — approve-class constraint rule (lr-4717)
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a spawn function that captures the full prompt passed to the claude
+ * CLI — whether delivered via --print argv or via stdin. The prompt is stored
+ * in capturedPrompt[0] after assess() resolves.
+ *
+ * The claude-cli runner uses stdin when prompt.length > STDIN_THRESHOLD (4000);
+ * otherwise it passes the prompt as a --print argument. Both paths are covered.
+ *
+ * @param {string[]} capturedPrompt  - Single-element array populated with the prompt
+ * @param {object}   childOpts       - Forwarded to makeChild
+ * @returns {Function}
+ */
+function makePromptCapturingSpawn(capturedPrompt, childOpts) {
+  return function fakeSpawn(_bin, args, _opts) {
+    // Short prompts arrive via --print <value> in args.
+    const printIdx = args.indexOf('--print');
+    if (printIdx !== -1 && args[printIdx + 1] !== undefined) {
+      capturedPrompt[0] = args[printIdx + 1];
+    }
+
+    const child = makeChild(childOpts);
+
+    // Long prompts arrive via stdin.write(); capture those too.
+    const origWrite = child.stdin.write.bind(child.stdin);
+    child.stdin.write = (chunk, ...rest) => {
+      capturedPrompt[0] = typeof chunk === 'string' ? chunk : chunk.toString();
+      return origWrite(chunk, ...rest);
+    };
+
+    return child;
+  };
+}
+
+describe('_buildPrompt() — approve-class PR-only rule (lr-4717)', () => {
+  it('prompt for an issue event contains the approve-is-PR-only rule', async () => {
+    const capturedPrompt = [];
+    const payload = validLlmPayload({ suggested_action: { class: 'dispatch', body: null, dispatch_target: 'backend', labels: [] } });
+    _setSpawnFn(makePromptCapturingSpawn(capturedPrompt, { stdout: cliEnvelope(payload), code: 0 }));
+
+    const event = makeEvent({ type: 'issue' });
+    await assess(makeConfig(), event);
+
+    const prompt = capturedPrompt[0] ?? '';
+    assert.ok(
+      prompt.includes("'approve' is valid ONLY for PRs"),
+      `prompt must contain approve-is-PR-only constraint; got: ${prompt.slice(0, 500)}`,
+    );
+    assert.ok(
+      prompt.includes("use 'dispatch'"),
+      "prompt must mention 'dispatch' as the alternative for accepted issues",
+    );
+  });
+
+  it('prompt for a PR event also contains the approve-is-PR-only rule', async () => {
+    const capturedPrompt = [];
+    const payload = validLlmPayload();
+    _setSpawnFn(makePromptCapturingSpawn(capturedPrompt, { stdout: cliEnvelope(payload), code: 0 }));
+
+    const event = makeEvent({ type: 'pr' });
+    await assess(makeConfig(), event);
+
+    const prompt = capturedPrompt[0] ?? '';
+    assert.ok(
+      prompt.includes("'approve' is valid ONLY for PRs"),
+      `PR prompt must also carry the constraint rule; got: ${prompt.slice(0, 500)}`,
+    );
+  });
+});
