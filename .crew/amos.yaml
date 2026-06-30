@@ -118,6 +118,17 @@ scope:
 #     on_failure: warn   # 'warn' (default): log and continue; 'fail': exit
 
 # -----------------------------------------------------------------------
+# builder_identity  — commit re-authoring for GitHub push (lr-66c2)
+# -----------------------------------------------------------------------
+# crew_push.py rewrites branch commits to this identity before push so
+# that AMoS-authored commits are attributed to the builder App, not the
+# operator. Required for --platform github pushes to clagentic/* repos.
+#
+builder_identity:
+  name: "clagentic-builder[bot]"
+  email: "290147524+clagentic-builder[bot]@users.noreply.github.com"
+
+# -----------------------------------------------------------------------
 # permissions.bash  (optional — Bash command policy)
 # -----------------------------------------------------------------------
 # Bash safety policy. Default 'blocklist' mode: anything not matching
