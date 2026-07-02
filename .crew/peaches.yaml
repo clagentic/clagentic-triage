@@ -1,0 +1,23 @@
+# .crew/peaches.yaml — PEACHES per-project configuration
+#
+# Generated from: examples/starter-peaches.yaml (crew-manifest lr-e247)
+# Schema: schemas/crew-config.schema.json (reviewer block, lr-840a)
+#
+# What this file does:
+#   - Adds project-specific review rules ON TOP of the AMoS code-craft
+#     defaults (amos.code-craft.1-13) and path-choice defaults
+#   - PEACHES will cite your rules as <project>.<rule> in findings
+#
+# What this file does NOT do:
+#   - Replace the baseline rulebook (code-craft + path-choice always apply)
+#   - Grant PEACHES write access (it remains read-only on code)
+#   - Configure which PRs get reviewed (that is the dispatch layer)
+#
+# MINIMAL STARTER: no project-specific rules yet — PEACHES applies only
+# the baseline defaults. Add rules here as clagentic-triage conventions
+# emerge (namespace: clagentic-triage.<rule-name>).
+
+schema_version: 1
+
+reviewer:
+  rules: []
