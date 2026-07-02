@@ -127,6 +127,31 @@ function defaults() {
       timeout_ms: null,
       confidence_threshold: null,
     },
+    // DD-012: namespaced label vocabulary. status_namespace/status_values form
+    // the single lifecycle-state axis; not_planned_values are terminal closure
+    // labels orthogonal to status; axes are independent, non-state label
+    // namespaces (kind/priority/area by default, extensible). All fields are
+    // config-driven — see src/labels.js, which treats an absent `labels` block
+    // as "use these same built-in defaults".
+    labels: {
+      status_namespace: 'status',
+      status_values: [
+        'needs-triage',
+        'accepted',
+        'needs-info',
+        'blocked',
+        'in-progress',
+        'in-review',
+        'awaiting-release',
+        'released',
+      ],
+      not_planned_values: ['wontfix', 'duplicate', 'invalid'],
+      axes: {
+        kind: ['bug', 'feature', 'chore', 'docs', 'question'],
+        priority: ['p0', 'p1', 'p2', 'p3'],
+        area: [],
+      },
+    },
   };
 }
 
@@ -276,6 +301,21 @@ function configFromEnv(env) {
     }
     out.webhooks = out.webhooks || {};
     out.webhooks.port = parsed;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_LABELS_STATUS_NAMESPACE !== undefined) {
+    out.labels = out.labels || {};
+    out.labels.status_namespace = env.CLAGENTIC_TRIAGE_LABELS_STATUS_NAMESPACE;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_LABELS_STATUS_VALUES !== undefined) {
+    out.labels = out.labels || {};
+    out.labels.status_values = splitCsv(env.CLAGENTIC_TRIAGE_LABELS_STATUS_VALUES);
+  }
+
+  if (env.CLAGENTIC_TRIAGE_LABELS_NOT_PLANNED_VALUES !== undefined) {
+    out.labels = out.labels || {};
+    out.labels.not_planned_values = splitCsv(env.CLAGENTIC_TRIAGE_LABELS_NOT_PLANNED_VALUES);
   }
 
   if (env.CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD !== undefined) {
@@ -439,6 +479,58 @@ function validate(cfg) {
           `pre_filter.confidence_threshold must be a number between 0 and 1. Got: ${JSON.stringify(pf.confidence_threshold)}`,
         );
       }
+    }
+  }
+
+  // DD-012: validate the label vocabulary block. status/* is the single state
+  // axis and must stay disjoint from the not-planned closure labels and from
+  // every other (orthogonal) axis, or "exactly one status/* at a time" would
+  // be ambiguous with a value that also means something else.
+  const lbl = cfg.labels;
+  if (lbl !== undefined && lbl !== null) {
+    if (typeof lbl.status_namespace !== 'string' || lbl.status_namespace.length === 0) {
+      throw new ConfigError(
+        `labels.status_namespace must be a non-empty string. Got: ${JSON.stringify(lbl.status_namespace)}`,
+      );
+    }
+    if (lbl.status_namespace.includes('/')) {
+      throw new ConfigError(
+        `labels.status_namespace must not contain "/". Got: ${JSON.stringify(lbl.status_namespace)}`,
+      );
+    }
+
+    for (const [field, value] of [
+      ['status_values', lbl.status_values],
+      ['not_planned_values', lbl.not_planned_values],
+    ]) {
+      if (!Array.isArray(value) || value.some((v) => typeof v !== 'string' || v.length === 0)) {
+        throw new ConfigError(`labels.${field} must be an array of non-empty strings. Got: ${JSON.stringify(value)}`);
+      }
+    }
+
+    if (lbl.axes !== undefined && lbl.axes !== null) {
+      if (typeof lbl.axes !== 'object' || Array.isArray(lbl.axes)) {
+        throw new ConfigError(`labels.axes must be an object. Got: ${JSON.stringify(lbl.axes)}`);
+      }
+      for (const [axisName, values] of Object.entries(lbl.axes)) {
+        if (axisName === lbl.status_namespace) {
+          throw new ConfigError(
+            `labels.axes contains "${axisName}", which collides with labels.status_namespace. ` +
+            'status/* must remain the single dedicated state axis (DD-012).',
+          );
+        }
+        if (!Array.isArray(values) || values.some((v) => typeof v !== 'string' || v.length === 0)) {
+          throw new ConfigError(`labels.axes.${axisName} must be an array of non-empty strings. Got: ${JSON.stringify(values)}`);
+        }
+      }
+    }
+
+    const notPlannedSet = new Set(lbl.not_planned_values ?? []);
+    const overlap = (lbl.status_values ?? []).filter((v) => notPlannedSet.has(v));
+    if (overlap.length > 0) {
+      throw new ConfigError(
+        `labels.status_values and labels.not_planned_values must be disjoint. Overlapping value(s): ${overlap.join(', ')}`,
+      );
     }
   }
 }
