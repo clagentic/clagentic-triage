@@ -11,3 +11,11 @@ export { getAdapter } from './adapters/index.js';
 export { AdapterError } from './adapters/github.js';
 export { AssessorError } from './assessor.js';
 export { LlmError } from './llm.js';
+export {
+  defaultVocabulary,
+  resolveVocabulary,
+  isStatusLabel,
+  normalizeLabels,
+  enforceSingleStatus,
+  STATUS_NAMESPACE,
+} from './labels.js';

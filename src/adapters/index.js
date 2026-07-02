@@ -5,7 +5,7 @@
  * interface defined in docs/ADAPTERS.md and docs/ARCHITECTURE.md:
  *
  *   name, list_events, post_comment, close_item,
- *   request_changes, approve_pr, label_item
+ *   request_changes, approve_pr, label_item, unlabel_item
  */
 
 import * as github from './github.js';

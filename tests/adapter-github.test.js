@@ -15,6 +15,7 @@ import {
   request_changes,
   approve_pr,
   label_item,
+  unlabel_item,
   AdapterError,
 } from '../src/adapters/github.js';
 
@@ -676,5 +677,58 @@ describe('label_item', () => {
       'https://api.github.com/repos/example/repo/issues/42/labels',
     );
     assert.deepEqual(capturedBody.labels, ['triage', 'needs-info']);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// unlabel_item
+// ---------------------------------------------------------------------------
+
+describe('unlabel_item', () => {
+  it('calls DELETE on the per-label endpoint', async () => {
+    let capturedUrl;
+    let capturedMethod;
+
+    globalThis.fetch = async (url, opts) => {
+      capturedUrl = url;
+      capturedMethod = opts.method;
+      return mockResponse(200, {});
+    };
+
+    const config = makeConfig();
+    const event = { type: 'issue', repo: 'example/repo', number: 42 };
+
+    await unlabel_item(config, event, 'status/needs-triage');
+
+    assert.equal(capturedMethod, 'DELETE');
+    assert.equal(
+      capturedUrl,
+      'https://api.github.com/repos/example/repo/issues/42/labels/status%2Fneeds-triage',
+    );
+  });
+
+  it('treats a 404 (label not applied) as a no-op success', async () => {
+    globalThis.fetch = async () => mockResponse(404, { message: 'Label does not exist' });
+
+    const config = makeConfig();
+    const event = { type: 'issue', repo: 'example/repo', number: 42 };
+
+    // Should resolve without throwing.
+    await unlabel_item(config, event, 'status/accepted');
+  });
+
+  it('throws AdapterError on a non-404 failure', async () => {
+    globalThis.fetch = async () => mockResponse(500, { message: 'Internal Server Error' });
+
+    const config = makeConfig();
+    const event = { type: 'issue', repo: 'example/repo', number: 42 };
+
+    await assert.rejects(
+      () => unlabel_item(config, event, 'status/accepted'),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        return true;
+      },
+    );
   });
 });

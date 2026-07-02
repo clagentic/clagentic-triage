@@ -907,6 +907,40 @@ export async function label_item(config, event, labels) {
 }
 
 // ---------------------------------------------------------------------------
+// unlabel_item
+// ---------------------------------------------------------------------------
+
+/**
+ * Remove a single label from an issue or PR.
+ *
+ * GitHub returns 404 both when the item doesn't exist and when the label
+ * isn't currently applied to it. The latter is treated as a no-op success
+ * (idempotent removal) rather than an error — callers enforcing the
+ * single-status invariant (src/labels.js) may attempt to remove a label
+ * that was already removed by a prior call or never applied.
+ *
+ * @param {object} config
+ * @param {object} event - Normalized Event
+ * @param {string} label - Label name to remove
+ * @returns {Promise<void>}
+ */
+export async function unlabel_item(config, event, label) {
+  const token = await _resolve_token(config);
+  const url = `${GITHUB_API}/repos/${event.repo}/issues/${event.number}/labels/${encodeURIComponent(label)}`;
+
+  const res = await globalThis.fetch(url, {
+    method: 'DELETE',
+    headers: _headers(token),
+  });
+
+  if (!res.ok && res.status !== 404) {
+    throw new AdapterError(`unlabel_item failed: ${res.status} ${res.statusText}`);
+  }
+
+  _invalidate_cache(event.repo);
+}
+
+// ---------------------------------------------------------------------------
 // Webhook interface methods
 // ---------------------------------------------------------------------------
 
