@@ -389,3 +389,62 @@ so it can be routed to a cheap model independently of the main assessment model.
 - `clagentic-router` is not compatible as a `pre_filter.runner` — the router endpoint expects
   the full assessment schema, not the binary `NOISE|REAL` response. Use a direct model runner
   for tier-1 filtering.
+
+---
+
+## DD-012: Namespaced label vocabulary — status/* is the single state axis
+
+**Decision:** Labels are namespaced (`<axis>/<value>`). `status/*` is the SINGLE lifecycle-state
+axis (`needs-triage`, `accepted`, `needs-info`, `blocked`, `in-progress`, `in-review`,
+`awaiting-release`, `released`). Terminal "not planned" closures use a separate, unnamespaced set
+(`wontfix`, `duplicate`, `invalid`) rather than status values, since they close the item instead
+of describing an in-flight state. `kind/*`, `priority/*`, and `area/*` are orthogonal axes — they
+describe the item, not its lifecycle state — and must never be folded into `status/*`. The entire
+vocabulary is config-driven (`config.labels`), never hardcoded in business logic.
+
+**Rationale:**
+- Prior art (Kubernetes/Prow `kind/`, `priority/`, `sig/`; Rust's `T-*`/`S-*`; VS Code's
+  `bug`/`feature-request` + separate triage states) converges on the same shape: exactly one
+  axis tracks "where is this in its lifecycle," and every other axis is free to combine with it.
+  Folding kind/priority/area into a single flat label list makes "what state is this in" an
+  ambiguous query — the same problem this vocabulary avoids by keeping `status/*` singular.
+- A single state axis is a precondition for a real state machine (T3/T7): "exactly one status/*
+  label" only has to be enforced against one namespace, not reasoned about across every label
+  an item might carry.
+- The tool is a released, generic library (CLAUDE.md: no hardcoded org/repo/model names). The
+  vocabulary itself — namespace names, status values, orthogonal axes — is exactly the kind of
+  per-deployment choice that must be config-driven, not baked into `src/`. Two different
+  operators triaging two different projects may legitimately want different `kind/*` values;
+  the code must not assume any specific set.
+
+**Implementation:**
+- `src/labels.js` is the ticketing-agnostic vocabulary module. It knows nothing about GitHub,
+  Jira, or any other backend — it only reasons about label strings and a vocabulary object.
+  - `resolveVocabulary(config)` — merges `config.labels` over built-in defaults, never mutating
+    either. An absent `config.labels` block is not an error; it means "use the defaults."
+  - `normalizeLabels(config, labels)` — splits candidate labels into `{ accepted, rejected }`.
+    Labels outside the vocabulary are rejected explicitly (not silently dropped) so callers can
+    decide how to surface a rejection.
+  - `enforceSingleStatus(config, currentLabels, incomingLabels)` — pure function; given an
+    item's current labels and the labels about to be applied, returns which existing `status/*`
+    label(s) must be removed to keep exactly one `status/*` label on the item. Throws
+    `RangeError` if more than one `status/*` label is supplied as incoming (a caller bug, not a
+    runtime data problem). This helper does not call any adapter; T7 wires the actual removal.
+- `config.labels` (see `src/config/loader.js` `defaults()`): `status_namespace`, `status_values`,
+  `not_planned_values`, `axes: { kind, priority, area, ...operator-defined }`. Validated at load
+  time: `status_namespace` must not collide with any axis name, `status_values` and
+  `not_planned_values` must be disjoint, and every value must be a non-empty string.
+- Env vars: `CLAGENTIC_TRIAGE_LABELS_STATUS_NAMESPACE`, `CLAGENTIC_TRIAGE_LABELS_STATUS_VALUES`
+  (comma-separated), `CLAGENTIC_TRIAGE_LABELS_NOT_PLANNED_VALUES` (comma-separated). Per-axis env
+  overrides for `axes.*` are not provided — operators needing to customize orthogonal axes use a
+  config file, consistent with how `dispatchers` and other structured blocks are configured.
+- `src/adapters/github.js` gained `unlabel_item(config, event, label)` — `DELETE
+  /repos/{owner}/{repo}/issues/{number}/labels/{name}` — additive alongside the existing
+  `label_item` (add) method. A 404 (label not currently applied) is treated as an idempotent
+  no-op, since `enforceSingleStatus` callers may attempt to remove a label that is already gone.
+  Registered in `docs/ADAPTERS.md` and `src/adapters/index.js`.
+
+**Scope note:** This DD covers the vocabulary, the adapter removal method, and the
+single-status helper. Wiring the pipeline to actually call `enforceSingleStatus` +
+`unlabel_item` on every label-applying action is deferred to T7 (the full lifecycle state
+machine) — `_applyLabels` in `src/pipeline.js` is unchanged by this decision.
