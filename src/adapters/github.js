@@ -770,6 +770,32 @@ export async function post_comment(config, event, body) {
 }
 
 // ---------------------------------------------------------------------------
+// list_comments
+// ---------------------------------------------------------------------------
+
+/**
+ * List all comments on an issue or PR.
+ *
+ * Used by idempotency checks (e.g. the status-callback route, T3) that need to
+ * scan existing comments before posting a duplicate. Not part of the poll/webhook
+ * ingress path — issue_comment events are already delivered via normalize_webhook.
+ *
+ * @param {object} config
+ * @param {object} event - Normalized Event
+ * @returns {Promise<object[]>} Raw GitHub comment objects (id, body, user, html_url, created_at)
+ */
+export async function list_comments(config, event) {
+  const token = await _resolve_token(config);
+  const url = `${GITHUB_API}/repos/${event.repo}/issues/${event.number}/comments?per_page=100`;
+
+  const result = await _fetchPaginated(url, token, null);
+  if (result.status !== 200) {
+    throw new AdapterError(`list_comments failed: ${result.status}`);
+  }
+  return result.items;
+}
+
+// ---------------------------------------------------------------------------
 // close_item
 // ---------------------------------------------------------------------------
 
@@ -875,6 +901,36 @@ export async function approve_pr(config, event) {
   }
 
   _invalidate_cache(event.repo);
+}
+
+// ---------------------------------------------------------------------------
+// get_item_labels
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the current label set on an issue or PR.
+ *
+ * Used by callers that must enforce the single-status invariant
+ * (src/labels.js enforceSingleStatus) against the item's live label state
+ * rather than a possibly-stale local copy — e.g. the release-notify path (T3)
+ * looks this up fresh before deciding which status/* label to remove.
+ *
+ * @param {object} config
+ * @param {object} event - Normalized Event
+ * @returns {Promise<string[]>} current label names
+ */
+export async function get_item_labels(config, event) {
+  const token = await _resolve_token(config);
+  const url = `${GITHUB_API}/repos/${event.repo}/issues/${event.number}`;
+
+  const res = await globalThis.fetch(url, { headers: _headers(token) });
+
+  if (!res.ok) {
+    throw new AdapterError(`get_item_labels failed: ${res.status} ${res.statusText}`);
+  }
+
+  const data = await res.json();
+  return (data.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name));
 }
 
 // ---------------------------------------------------------------------------

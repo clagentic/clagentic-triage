@@ -24,6 +24,8 @@ import { fileURLToPath } from 'node:url';
 import { enqueue, readAll, resolveItem } from '../src/queue.js';
 import { dispatch } from '../src/dispatchers/index.js';
 import { loadConfig, ConfigError } from '../src/config/loader.js';
+import { recordTask, lookupTask } from '../src/task_index.js';
+import { processEvent } from '../src/pipeline.js';
 
 // ---------------------------------------------------------------------------
 // Path to the fake dispatcher fixture
@@ -59,12 +61,20 @@ function tmpQueuePath() {
   return join(tmpdir(), `triage-wiring-test-${unique}`, 'pending.jsonl');
 }
 
-function makeQueueConfig(queuePath, dispatchers = []) {
-  return { pending_queue: queuePath, dispatchers };
+function tmpTaskIndexPath() {
+  const unique = randomBytes(6).toString('hex');
+  return join(tmpdir(), `triage-wiring-test-${unique}`, 'task-index.jsonl');
 }
 
-function makeEvent(id = 'owner/repo#1') {
-  return { id, type: 'issue', title: 'Test issue', repo: 'owner/repo' };
+function makeQueueConfig(queuePath, dispatchers = [], taskIndexPath = tmpTaskIndexPath()) {
+  return { pending_queue: queuePath, dispatchers, task_index: taskIndexPath };
+}
+
+function makeEvent(id = 'owner/repo#1', number = 1) {
+  return {
+    id, type: 'issue', title: 'Test issue', repo: 'owner/repo', number,
+    url: `https://github.com/owner/repo/issues/${number}`,
+  };
 }
 
 function makeAssessment(actionClass = 'dispatch') {
@@ -81,11 +91,27 @@ function makeAssessment(actionClass = 'dispatch') {
  * Mirrors _executeAction (dispatch case) + enqueue so tests can exercise the
  * wiring without spawning the full pipeline (which requires real enrich/assess).
  *
- * This shim must stay in sync with pipeline.js's _executeAction dispatch case.
+ * This shim must stay in sync with pipeline.js's _executeAction dispatch case,
+ * including the T3 (lr-f848) recordTask call added after a successful dispatch.
  */
 async function simulatePipelineDispatch(config, event, assessment) {
   // This mirrors what pipeline.js does for an auto-approved dispatch-class item.
   const dispatchResults = await dispatch(config, event, assessment);
+
+  for (const entry of dispatchResults) {
+    const taskId = entry.result?.id;
+    if (!taskId) continue;
+    await recordTask(config, {
+      dispatcher: entry.name,
+      task_id: taskId,
+      task_url: entry.result?.url ?? null,
+      event_id: event.id,
+      repo: event.repo,
+      number: event.number,
+      event_url: event.url,
+    });
+  }
+
   await enqueue(config, {
     event,
     assessment,
@@ -161,6 +187,70 @@ describe('pipeline auto-approve: dispatch-class item', () => {
     const all = await readAll(config);
     assert.equal(all.length, 1);
     assert.equal(all[0].dispatch_results, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// T3 (lr-f848): recordTask wiring — dispatch() success populates the durable
+// task index so the inbound status-callback can resolve task_id -> origin
+// after dispatch_results has scrolled out of the queue.
+// ---------------------------------------------------------------------------
+
+describe('pipeline auto-approve: recordTask wiring (T3, lr-f848)', () => {
+  it('records a task_index entry for each successful dispatcher result', async () => {
+    const queuePath = tmpQueuePath();
+    const taskIndexPath = tmpTaskIndexPath();
+    const config = makeQueueConfig(queuePath, [
+      { name: 'fake-tracker', module: FAKE_DISPATCHER_PATH },
+    ], taskIndexPath);
+    const event = makeEvent('owner/repo#263', 263);
+    const assessment = makeAssessment('dispatch');
+
+    await simulatePipelineDispatch(config, event, assessment);
+
+    const record = await lookupTask(config, 'fake-owner/repo#263', { dispatcher: 'fake-tracker' });
+    assert.ok(record, 'expected a task_index record for the dispatched task_id');
+    assert.equal(record.repo, 'owner/repo');
+    assert.equal(record.number, 263);
+    assert.equal(record.event_url, 'https://github.com/owner/repo/issues/263');
+    assert.equal(record.task_url, 'https://tracker.example/fake/1');
+  });
+
+  it('does not record anything when no dispatchers are configured', async () => {
+    const queuePath = tmpQueuePath();
+    const taskIndexPath = tmpTaskIndexPath();
+    const config = makeQueueConfig(queuePath, [], taskIndexPath);
+    const event = makeEvent('owner/repo#5', 5);
+    const assessment = makeAssessment('dispatch');
+
+    await simulatePipelineDispatch(config, event, assessment);
+
+    const record = await lookupTask(config, 'fake-owner/repo#5');
+    assert.equal(record, null);
+  });
+
+  it('the task_index record is queryable independently of the queue entry', async () => {
+    // This is the durability requirement from the task spec: dispatch_results
+    // only lived in the one-time queue blob. Simulate the queue entry being
+    // resolved/rotated away and confirm the task_index lookup still works.
+    const queuePath = tmpQueuePath();
+    const taskIndexPath = tmpTaskIndexPath();
+    const config = makeQueueConfig(queuePath, [
+      { name: 'fake-tracker', module: FAKE_DISPATCHER_PATH },
+    ], taskIndexPath);
+    const event = makeEvent('owner/repo#7', 7);
+    const assessment = makeAssessment('dispatch');
+
+    await simulatePipelineDispatch(config, event, assessment);
+
+    // Resolve the queue item away (simulating normal lifecycle progression).
+    const all = await readAll(config);
+    await resolveItem(config, all[0].id, { action: 'approved', dispatch_results: all[0].dispatch_results });
+
+    // The task_index lookup must still resolve — it is independent storage.
+    const record = await lookupTask(config, 'fake-owner/repo#7', { dispatcher: 'fake-tracker' });
+    assert.ok(record);
+    assert.equal(record.number, 7);
   });
 });
 
