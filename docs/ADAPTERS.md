@@ -24,7 +24,8 @@ export async function post_comment(config, event, body) { }
 export async function close_item(config, event) { }
 export async function request_changes(config, event, body) { }
 export async function approve_pr(config, event) { }
-export async function label_item(config, event, labels) { }
+export async function label_item(config, event, labels) { }         // add labels
+export async function unlabel_item(config, event, label) { }        // remove a single label
 
 // --- Webhook interface (required for inbound webhook server) ---
 export function verify_webhook(rawBody, headers, secret) { }      // returns boolean
@@ -36,6 +37,14 @@ export function is_bot_sender(payload, allowList) { }             // returns boo
 `since` is an ISO timestamp string. Return only events newer than `since`.
 
 The adapter must not throw on auth failure from `list_events` — return an empty array and log a warning.
+
+**`unlabel_item(config, event, label) -> void`**
+
+Remove a single label from an item. Additive to the interface — `label_item` (add) and
+`unlabel_item` (remove) are separate methods rather than one method with an add/remove flag,
+so existing callers of `label_item` are unaffected. Implementations should treat "label not
+currently applied" as an idempotent no-op, not an error, since callers enforcing the
+single-status invariant (`src/labels.js`) may attempt to remove a label that is already absent.
 
 ### Webhook interface
 
