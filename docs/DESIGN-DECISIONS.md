@@ -448,3 +448,115 @@ vocabulary is config-driven (`config.labels`), never hardcoded in business logic
 single-status helper. Wiring the pipeline to actually call `enforceSingleStatus` +
 `unlabel_item` on every label-applying action is deferred to T7 (the full lifecycle state
 machine) — `_applyLabels` in `src/pipeline.js` is unchanged by this decision.
+
+---
+
+## DD-013: Closed-loop status back-post — inbound status hook, not outbound polling
+
+**Decision:** clagentic:triage gains a **generic inbound** "task shipped" channel
+(`src/status_hook.js`) rather than an outbound poller that queries each configured
+backend for status changes. A durable side-index (`src/task_index.js`) records every
+dispatched task's `task_id -> { repo, number, url }` mapping so the inbound hook can
+resolve "which issue does task X belong to" independently of the one-time
+`dispatch_results` blob. When the hook fires, `src/release_notify.js` posts a
+config-driven comment and applies the `released` status/* label (DD-012) to the
+originating item — as the triage bot's own `clagentic-triage[bot]` identity, with no
+new App, gatekeeper, or "releaser" role. Issue bookkeeping remains triage's own job.
+
+**Rationale:**
+- **Inbound over outbound.** `src/webhooks/server.js` already establishes the inbound-hook
+  pattern for GitHub-side events (DD-007). Extending that shape to backend-side state
+  changes is more consistent than adding a second, backend-aware polling loop — triage
+  would otherwise need to know how to query N different backends' status APIs, which
+  directly violates the backend-agnostic rule (CLAUDE.md). A dispatcher-side push is
+  symmetric with `create_task` (triage -> backend) and closes the loop without adding any
+  backend-specific code to core.
+- **Distinct trust boundary from the GitHub webhook.** The GitHub webhook server
+  (`src/webhooks/server.js`) authenticates deliveries *from GitHub* using the adapter's
+  `verify_webhook`. The status-callback channel authenticates deliveries *from whichever
+  dispatcher backend the operator configured* — a different caller, a different secret
+  (`status_hooks.secret` / `CLAGENTIC_TRIAGE_STATUS_HOOK_SECRET`), and a different route
+  (`status_hooks.path`, default `/status-hook`) and port (default 8743). Reusing the
+  GitHub webhook secret would conflate two independent trust boundaries: anyone who can
+  forge a valid GitHub HMAC should not thereby gain the ability to post arbitrary "shipped"
+  comments, and vice versa.
+- **Same authentication discipline as RT-004.** `verify_status_hook` in `src/status_hook.js`
+  mirrors the GitHub adapter's `verify_webhook`: HMAC-SHA256 over the raw body, signature
+  carried in `x-clagentic-signature: sha256=<hex>`, `timingSafeEqual` comparison with a
+  length guard before it, and a hard refusal (`createStatusHookServer` throws) if the
+  channel is enabled with an empty secret. An unauthenticated call is rejected with 401
+  before the body is even parsed.
+- **The persistence gap was real.** Before this DD, `dispatch_results` (the `{ id, url }`
+  a dispatcher's `create_task` returns) was stored only on the one-time pending-queue entry
+  written at dispatch time (`src/queue.js`). There was no way to look up "which GitHub issue
+  does task `lr-a68f` correspond to" after that queue entry had been resolved, or from a
+  cold-started process. `src/task_index.js` is a small, ticketing-agnostic JSONL side-index
+  keyed by `(dispatcher name, task_id)` — recorded once per successful `create_task` result
+  (`src/pipeline.js`'s `_executeAction` dispatch case), queryable at any later point via
+  `lookupTask`.
+- **Idempotency by design, not by luck.** `applyReleaseNotice` (`src/release_notify.js`)
+  scans existing comments for a hidden marker (`<!-- clagentic-triage:release
+  task_id=... version=... -->`) before posting, and checks the item's live label state
+  (`adapter.get_item_labels`) before applying `released`. A repeated call for the same
+  `(task_id, version)` is a no-op on both axes — safe to retry, safe to replay.
+- **Loop prevention already exists; this DD verifies it covers the release path.** The
+  triage bot posts its own release comment as `clagentic-triage[bot]`. On the webhook
+  ingress path, GitHub's `issue_comment` event always carries `payload.sender` set to the
+  comment's actual author — so the existing DD-005 bot filter (`_isBot`, checked before
+  `normalize_webhook` in `src/webhooks/server.js`) already drops the bot's own release
+  comment at ingress, exactly as it would drop any other bot-authored comment. No new
+  loop-prevention logic was needed; a regression test
+  (`tests/webhook-server.test.js` — "drops the bot's own issue_comment delivery") pins this
+  behavior specifically for the release-comment shape so a future change to either the bot
+  filter or the webhook normalization path cannot silently reopen the loop. On the poll
+  path, comments are never separately event-sourced (`list_events` only lists issues/PRs,
+  not comments), so the loop risk is webhook-only by construction.
+
+**Implementation:**
+- `src/task_index.js` — durable `task_id -> { repo, number, event_url, task_url, event_id }`
+  side-index. `recordTask(config, opts)` upserts by `(dispatcher, task_id)` (re-recording
+  overwrites rather than duplicating); `lookupTask(config, task_id, { dispatcher })` reads
+  it back. Same JSONL-per-line convention as `src/queue.js`. Config key: `task_index`
+  (default `.triage/task-index.jsonl`).
+- `src/pipeline.js` — after a successful `dispatch()` call in the `'dispatch'` action-class
+  case, iterates the per-dispatcher results and calls `recordTask` for each one that
+  returned a task id. Recording failures are logged and non-fatal — the dispatch itself
+  already succeeded.
+- `src/release_notify.js` — `applyReleaseNotice(config, adapter, target)` is the
+  ticketing-agnostic core: renders `config.release_notify.comment_template` (default
+  `"Shipped in {version}: {task_url}"`, placeholders `{version} {task_url} {task_id} {repo}
+  {number}`), posts it via `adapter.post_comment` if not already posted, and applies the
+  `released` status/* label via `enforceSingleStatus` (DD-012) + `adapter.label_item` /
+  `adapter.unlabel_item` if not already applied. Never imports a dispatcher or any
+  backend-specific module.
+- `src/status_hook.js` — `createStatusHookServer(config, adapter)` /
+  `startStatusHookServer(config, adapter)`, mirroring the shape of
+  `src/webhooks/server.js`'s `createServer` / `startWebhookServer`. Accepts
+  `{ task_id, dispatcher?, status: "shipped", version? }` JSON payloads on
+  `status_hooks.path` (default `/status-hook`); only `status: "shipped"` is currently
+  handled (other values are acknowledged and ignored). Looks up `task_id` via
+  `lookupTask`; an unknown `task_id` is acknowledged (200) rather than treated as an error,
+  since a backend may legitimately call this for a task triage never dispatched.
+- `src/adapters/github.js` gained two new methods needed by the release-notify path:
+  `list_comments(config, event)` (paginated `GET .../issues/{number}/comments`, used for the
+  idempotency scan) and `get_item_labels(config, event)` (`GET .../issues/{number}`, used to
+  read the item's live label set before the single-status transition). Both are additive to
+  the adapter interface — existing callers of the adapter are unaffected.
+- `src/cli.js` `cmdWatch` starts the status-hook server alongside the existing webhook
+  server when `config.status_hooks.enabled` is true, and tears it down on `SIGINT`
+  alongside the webhook server.
+- Config (`src/config/loader.js`): `status_hooks: { enabled, port (default 8743), secret,
+  bind, path (default "/status-hook") }` and `release_notify: { comment_template }`. Env
+  vars: `CLAGENTIC_TRIAGE_STATUS_HOOK_SECRET`, `CLAGENTIC_TRIAGE_STATUS_HOOK_PORT`,
+  `CLAGENTIC_TRIAGE_RELEASE_COMMENT_TEMPLATE`. Validation mirrors the webhook block:
+  `status_hooks.enabled` requires a non-empty `status_hooks.secret` (RT-004 parity), and
+  `status_hooks.port` must be a valid port integer.
+
+**What is explicitly out of scope for this DD (see task lr-f848):**
+- The private lore-side dispatcher module that would actually call this hook when a lore
+  task ships — that is T4 (crew-manifest), a separate operator-config artifact, not core.
+- Any lore-specific field names, URLs, or identifiers in `src/` — the hook payload shape
+  (`task_id`, `dispatcher`, `status`, `version`) and the task-index record shape are generic
+  across any ticketing backend.
+- Wiring `enforceSingleStatus` into every other label-applying pipeline path (still T7,
+  per DD-012's scope note) — this DD only wires it into the new release-notify path.

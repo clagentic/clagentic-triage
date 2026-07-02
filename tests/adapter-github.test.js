@@ -11,11 +11,13 @@ import assert from 'node:assert/strict';
 import {
   list_events,
   post_comment,
+  list_comments,
   close_item,
   request_changes,
   approve_pr,
   label_item,
   unlabel_item,
+  get_item_labels,
   AdapterError,
 } from '../src/adapters/github.js';
 
@@ -725,6 +727,98 @@ describe('unlabel_item', () => {
 
     await assert.rejects(
       () => unlabel_item(config, event, 'status/accepted'),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// list_comments (T3, lr-f848 — release-notify idempotency scan)
+// ---------------------------------------------------------------------------
+
+describe('list_comments', () => {
+  it('returns raw comment objects from the comments endpoint', async () => {
+    let capturedUrl;
+    const rawComments = [
+      { id: 1, body: 'first comment', user: { login: 'alice' } },
+      { id: 2, body: 'second comment', user: { login: 'clagentic-triage[bot]' } },
+    ];
+
+    globalThis.fetch = async (url) => {
+      capturedUrl = url;
+      return mockResponse(200, rawComments);
+    };
+
+    const config = makeConfig();
+    const event = { repo: 'example/repo', number: 42 };
+
+    const comments = await list_comments(config, event);
+
+    assert.equal(
+      capturedUrl,
+      'https://api.github.com/repos/example/repo/issues/42/comments?per_page=100',
+    );
+    assert.deepEqual(comments, rawComments);
+  });
+
+  it('throws AdapterError on a non-2xx response', async () => {
+    globalThis.fetch = async () => mockResponse(500, { message: 'Internal Server Error' });
+
+    const config = makeConfig();
+    const event = { repo: 'example/repo', number: 42 };
+
+    await assert.rejects(
+      () => list_comments(config, event),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// get_item_labels (T3, lr-f848 — fresh label state for enforceSingleStatus)
+// ---------------------------------------------------------------------------
+
+describe('get_item_labels', () => {
+  it('returns the current label names for an issue', async () => {
+    let capturedUrl;
+    globalThis.fetch = async (url) => {
+      capturedUrl = url;
+      return mockResponse(200, { labels: [{ name: 'status/awaiting-release' }, { name: 'kind/feature' }] });
+    };
+
+    const config = makeConfig();
+    const event = { repo: 'example/repo', number: 42 };
+
+    const labels = await get_item_labels(config, event);
+
+    assert.equal(capturedUrl, 'https://api.github.com/repos/example/repo/issues/42');
+    assert.deepEqual(labels, ['status/awaiting-release', 'kind/feature']);
+  });
+
+  it('accepts plain-string labels (not just {name} objects)', async () => {
+    globalThis.fetch = async () => mockResponse(200, { labels: ['bug', 'p1'] });
+
+    const config = makeConfig();
+    const event = { repo: 'example/repo', number: 42 };
+
+    const labels = await get_item_labels(config, event);
+    assert.deepEqual(labels, ['bug', 'p1']);
+  });
+
+  it('throws AdapterError on a non-2xx response', async () => {
+    globalThis.fetch = async () => mockResponse(404, { message: 'Not Found' });
+
+    const config = makeConfig();
+    const event = { repo: 'example/repo', number: 42 };
+
+    await assert.rejects(
+      () => get_item_labels(config, event),
       (err) => {
         assert.ok(err instanceof AdapterError);
         return true;

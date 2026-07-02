@@ -309,6 +309,59 @@ describe('webhook server — github adapter', () => {
     }
   });
 
+  // T3 (lr-f848): loop-prevention regression. clagentic-triage[bot] is the
+  // same bot that posts the closed-loop release comment. Its own
+  // issue_comment webhook delivery must be dropped by the DD-005 bot filter
+  // just like any other bot sender — otherwise the release comment would be
+  // re-ingested as a new inbound event, potentially triggering the pipeline
+  // to reassess (or worse, re-dispatch) its own status notice.
+  it('drops the bot\'s own issue_comment delivery (release-comment loop prevention)', async () => {
+    let callCount = 0;
+    const { server, port } = await startServer(config, githubAdapter, {
+      onEvent: () => { callCount++; },
+    });
+
+    const releaseCommentPayload = JSON.stringify({
+      repository: { full_name: 'example/repo' },
+      sender: { login: 'clagentic-triage[bot]', type: 'Bot' },
+      action: 'created',
+      issue: {
+        number: 263,
+        title: 'Some feature request',
+        body: 'Original request body',
+        html_url: 'https://github.com/example/repo/issues/263',
+        state: 'open',
+        created_at: '2024-01-01T00:00:00Z',
+        node_id: 'I_263',
+        labels: [],
+        user: { login: 'alice', type: 'User' },
+      },
+      comment: {
+        body: 'Shipped in 1.0.0: https://lore.example/lr-a68f',
+        html_url: 'https://github.com/example/repo/issues/263#comment-1',
+        created_at: '2024-01-02T00:00:00Z',
+        node_id: 'IC_1',
+        user: { login: 'clagentic-triage[bot]', type: 'Bot' },
+      },
+    });
+    const releaseCommentBody = Buffer.from(releaseCommentPayload, 'utf8');
+
+    try {
+      const { status, body } = await sendWebhook(port, releaseCommentBody, {
+        'x-hub-signature-256': githubSig(SECRET, releaseCommentBody),
+        'x-github-event': 'issue_comment',
+        'x-github-delivery': 'delivery-release-comment-1',
+      });
+
+      assert.equal(status, 200);
+      assert.equal(body.status, 'ignored');
+      assert.equal(body.reason, 'bot');
+      assert.equal(callCount, 0, 'the bot\'s own release comment must not reach the pipeline');
+    } finally {
+      await closeServer(server);
+    }
+  });
+
   it('returns 200 ignored for unsupported event types', async () => {
     let callCount = 0;
     const { server, port } = await startServer(config, githubAdapter, {

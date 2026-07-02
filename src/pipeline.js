@@ -18,6 +18,7 @@ import { route } from './router.js';
 import { enqueue, readAll } from './queue.js';
 import { dispatch } from './dispatchers/index.js';
 import { runHooks } from './hooks/index.js';
+import { recordTask } from './task_index.js';
 
 // ---------------------------------------------------------------------------
 // Dispatch execution
@@ -68,6 +69,32 @@ async function _executeAction(config, event, assessment, adapter) {
       // Fire all configured dispatchers. dispatch() handles per-dispatcher errors
       // internally and never throws — failures are captured in the returned array.
       const dispatchResults = await dispatch(config, event, assessment);
+
+      // Record each successful dispatcher's task_id -> origin mapping in the
+      // durable side-index (src/task_index.js) so an inbound status-callback
+      // (T3, lr-f848) can resolve "which issue does task X belong to" after
+      // dispatch_results has scrolled out of the one-time queue entry. Recording
+      // failures are non-fatal — the dispatch itself already succeeded.
+      for (const entry of dispatchResults) {
+        const taskId = entry.result?.id;
+        if (!taskId) {
+          continue; // dispatcher errored, or returned no id — nothing to index
+        }
+        try {
+          await recordTask(config, {
+            dispatcher: entry.name,
+            task_id: taskId,
+            task_url: entry.result?.url ?? null,
+            event_id: event.id,
+            repo: event.repo,
+            number: event.number,
+            event_url: event.url,
+          });
+        } catch (indexErr) {
+          console.warn(`[pipeline] recordTask failed for dispatcher "${entry.name}": ${indexErr.message}`);
+        }
+      }
+
       return { action_taken: null, queue_reason: 'dispatch', dispatch_results: dispatchResults };
     }
 

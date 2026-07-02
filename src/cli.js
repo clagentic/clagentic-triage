@@ -13,6 +13,7 @@ import { loadConfig, ConfigError } from './config/loader.js';
 import { listItems, readAll, resolveItem, QueueError } from './queue.js';
 import { runPipeline, processEvent } from './pipeline.js';
 import { startWebhookServer } from './webhooks/server.js';
+import { startStatusHookServer } from './status_hook.js';
 import { dispatch } from './dispatchers/index.js';
 import { check_token_scopes } from './adapters/github.js';
 
@@ -197,6 +198,7 @@ async function cmdWatch(flags) {
   const adapter = await loadAdapter(config);
 
   let webhookServer = null;
+  let statusHookServer = null;
 
   // Webhook mode: if webhooks.enabled, start the inbound webhook server so that
   // real-time deliveries from GitHub feed directly into the pipeline.
@@ -215,6 +217,15 @@ async function cmdWatch(flags) {
     webhookServer = await startWebhookServer(config, adapter, { onEvent: webhookOnEvent });
     const addr = webhookServer.address();
     out(`[clagentic-triage] webhook server started on ${addr.address}:${addr.port}`);
+  }
+
+  // Status-hook mode (T3, lr-f848): if status_hooks.enabled, start the inbound
+  // "task shipped" callback server so any configured dispatcher backend can
+  // report a task's terminal state back to the originating issue/PR.
+  if (config.status_hooks?.enabled) {
+    statusHookServer = await startStatusHookServer(config, adapter);
+    const addr = statusHookServer.address();
+    out(`[clagentic-triage] status-hook server started on ${addr.address}:${addr.port}`);
   }
 
   out(`[clagentic-triage] watch: polling every ${intervalSec}s. Ctrl-C to stop.`);
@@ -240,6 +251,9 @@ async function cmdWatch(flags) {
     clearInterval(timer);
     if (webhookServer) {
       webhookServer.close();
+    }
+    if (statusHookServer) {
+      statusHookServer.close();
     }
     out('[clagentic-triage] watch: stopped.');
     process.exit(0);
@@ -420,6 +434,9 @@ Environment:
   CLAGENTIC_TRIAGE_RUNNER              LLM runner (claude-cli, anthropic-api, openai-compatible, clagentic-router)
   CLAGENTIC_TRIAGE_WEBHOOK_SECRET      Webhook HMAC secret (required when webhooks.enabled)
   CLAGENTIC_TRIAGE_WEBHOOK_PORT        Webhook server port (default: 8742)
+  CLAGENTIC_TRIAGE_STATUS_HOOK_SECRET  Status-callback HMAC secret (required when status_hooks.enabled)
+  CLAGENTIC_TRIAGE_STATUS_HOOK_PORT    Status-callback server port (default: 8743)
+  CLAGENTIC_TRIAGE_RELEASE_COMMENT_TEMPLATE  Release-notice comment template (default: "Shipped in {version}: {task_url}")
   CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD  Float 0-1 (default: 0.7)
 
 Config file: ~/.config/clagentic/triage/config.json or triage.config.json in cwd

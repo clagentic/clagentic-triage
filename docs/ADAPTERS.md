@@ -26,6 +26,8 @@ export async function request_changes(config, event, body) { }
 export async function approve_pr(config, event) { }
 export async function label_item(config, event, labels) { }         // add labels
 export async function unlabel_item(config, event, label) { }        // remove a single label
+export async function get_item_labels(config, event) { }            // returns string[] — current labels
+export async function list_comments(config, event) { }               // returns raw comment objects
 
 // --- Webhook interface (required for inbound webhook server) ---
 export function verify_webhook(rawBody, headers, secret) { }      // returns boolean
@@ -45,6 +47,19 @@ Remove a single label from an item. Additive to the interface — `label_item` (
 so existing callers of `label_item` are unaffected. Implementations should treat "label not
 currently applied" as an idempotent no-op, not an error, since callers enforcing the
 single-status invariant (`src/labels.js`) may attempt to remove a label that is already absent.
+
+**`get_item_labels(config, event) -> string[]`**
+
+Fetch the item's current label set fresh from the backend. Used by callers (e.g.
+`src/release_notify.js`, DD-013) that must enforce the single-status invariant against
+live state rather than a possibly-stale local copy.
+
+**`list_comments(config, event) -> object[]`**
+
+List all comments on an item as raw provider objects. Used by idempotency checks (DD-013)
+that need to scan for a prior marker before posting a duplicate comment. Not part of the
+poll/webhook ingress path — new comments are already delivered as `issue_comment` events on
+the GitHub webhook path.
 
 ### Webhook interface
 

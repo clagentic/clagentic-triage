@@ -117,6 +117,22 @@ function defaults() {
       // A per-minute bucket reset is used (not a full sliding window).
       max_events_per_minute: 300,
     },
+    // T3 (lr-f848): generic inbound "task shipped" callback channel. Distinct
+    // secret from webhooks.secret — this is a different trust boundary (any
+    // configured backend, not GitHub) — see src/status_hook.js.
+    status_hooks: {
+      enabled: false,
+      port: 8743,
+      secret: '',
+      bind: '127.0.0.1',
+      path: '/status-hook',
+    },
+    // T3 (lr-f848): closed-loop release notice — comment template posted (plus
+    // the `released` status/* label applied) when a dispatched task ships.
+    // See src/release_notify.js.
+    release_notify: {
+      comment_template: 'Shipped in {version}: {task_url}',
+    },
     notifications: {
       webhooks: [],
     },
@@ -303,6 +319,27 @@ function configFromEnv(env) {
     out.webhooks.port = parsed;
   }
 
+  if (env.CLAGENTIC_TRIAGE_STATUS_HOOK_SECRET !== undefined) {
+    out.status_hooks = out.status_hooks || {};
+    out.status_hooks.secret = env.CLAGENTIC_TRIAGE_STATUS_HOOK_SECRET;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_STATUS_HOOK_PORT !== undefined) {
+    const parsed = parseInt(env.CLAGENTIC_TRIAGE_STATUS_HOOK_PORT, 10);
+    if (isNaN(parsed)) {
+      throw new ConfigError(
+        `CLAGENTIC_TRIAGE_STATUS_HOOK_PORT must be an integer, got: ${env.CLAGENTIC_TRIAGE_STATUS_HOOK_PORT}`,
+      );
+    }
+    out.status_hooks = out.status_hooks || {};
+    out.status_hooks.port = parsed;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_RELEASE_COMMENT_TEMPLATE !== undefined) {
+    out.release_notify = out.release_notify || {};
+    out.release_notify.comment_template = env.CLAGENTIC_TRIAGE_RELEASE_COMMENT_TEMPLATE;
+  }
+
   if (env.CLAGENTIC_TRIAGE_LABELS_STATUS_NAMESPACE !== undefined) {
     out.labels = out.labels || {};
     out.labels.status_namespace = env.CLAGENTIC_TRIAGE_LABELS_STATUS_NAMESPACE;
@@ -402,6 +439,27 @@ function validate(cfg) {
       'Set CLAGENTIC_TRIAGE_WEBHOOK_SECRET or webhooks.secret in your config. ' +
       'An unauthenticated webhook server is refused.',
     );
+  }
+
+  // T3 (lr-f848) / RT-004 parity: the inbound status-callback channel is the
+  // same class of risk as the GitHub webhook — an unauthenticated "mark this
+  // task shipped" endpoint is a spam/abuse vector, so it must not start
+  // without a secret when enabled.
+  if (cfg.status_hooks?.enabled && !cfg.status_hooks?.secret) {
+    throw new ConfigError(
+      'status_hooks.enabled is true but status_hooks.secret is empty. ' +
+      'Set CLAGENTIC_TRIAGE_STATUS_HOOK_SECRET or status_hooks.secret in your config. ' +
+      'An unauthenticated status-hook server is refused.',
+    );
+  }
+
+  if (cfg.status_hooks !== undefined && cfg.status_hooks !== null) {
+    const shPort = cfg.status_hooks.port;
+    if (!Number.isInteger(shPort) || shPort < 1 || shPort > 65535) {
+      throw new ConfigError(
+        `status_hooks.port must be an integer between 1 and 65535. Got: ${shPort}`,
+      );
+    }
   }
 
   // Validate shape of each dispatchers entry. The dispatcher loader does
