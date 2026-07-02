@@ -1,0 +1,24 @@
+# .crew/bobbie.yaml — BOBBIE per-project configuration
+#
+# Generated from: examples/starter-bobbie.yaml (crew-manifest lr-c65e)
+# Schema: schemas/crew-config.schema.json (security block, lr-4d7c)
+#
+# What this file does:
+#   - Adds project-specific security rules ON TOP of BOBBIE's default
+#     RULEBOOK.md namespaces (bobbie.secret, bobbie.bleed, bobbie.dep,
+#     bobbie.sast)
+#   - Optionally overrides scanner defaults (secret/sast/dependency)
+#   - BOBBIE will cite your rules as <project>.<rule> in findings
+#
+# What this file does NOT do:
+#   - Replace the baseline RULEBOOK (default namespaces always apply)
+#   - Grant BOBBIE write access to code (it is read-only on code)
+#   - Gate merges itself (NAOMI is the merge gate; BOBBIE informs NAOMI)
+#
+# MINIMAL STARTER: no project-specific rules yet — BOBBIE applies only
+# the baseline defaults and default scanners (gitleaks/semgrep/osv-scanner).
+
+schema_version: 1
+
+security:
+  rules: []

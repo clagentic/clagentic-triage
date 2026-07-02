@@ -71,11 +71,10 @@ branch_conventions:
 scope:
   allow_all: true
   blocked_paths:
-    # Protect sensitive dirs by adding entries here. Examples:
-    # - ".secrets/**"
-    # - "production/**"
-    # - "config/prod.yaml"
-    []
+    - ".env*"
+    - ".secrets/**"
+    - "**/*.pem"
+    - "**/*.key"
 
 # OPTION B — explicit allowlist (use for projects where only specific
 #   paths should be touched automatically)
@@ -131,13 +130,14 @@ builder_identity:
 # -----------------------------------------------------------------------
 # permissions.bash  (optional — Bash command policy)
 # -----------------------------------------------------------------------
-# Bash safety policy. Default 'blocklist' mode: anything not matching
-# 'block' patterns runs. Use 'allowlist' mode to restrict to a specific
-# command set (harder to use, safer for high-risk repos).
+# Bash safety policy. 'blocklist' mode: anything not matching a 'block'
+# pattern runs (allow-all-with-explicit-block). Use 'allowlist' mode to
+# restrict to a specific command set (harder to use, safer for high-risk
+# repos).
 #
-# permissions:
-#   bash:
-#     mode: blocklist
-#     block:
-#       - "rm -rf /"
-#       - "git push --force"
+permissions:
+  bash:
+    mode: blocklist
+    block:
+      - "rm -rf /"
+      - "git push --force"
