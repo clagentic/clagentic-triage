@@ -352,6 +352,64 @@ The per-author cap reuses the `source.max_events_per_author_per_poll` threshold
 than that many events within `rate_limit_window_seconds` receives `429` until
 the window expires. Both caps are in-memory and reset on process restart.
 
+## Status-callback server (closed-loop status back-post)
+
+Generic inbound channel that lets any configured dispatcher backend (lore, Jira,
+Linear, an internal tool) report a dispatched task's terminal state back to
+clagentic:triage. See DD-013 in `docs/DESIGN-DECISIONS.md` for the full design.
+Disabled by default.
+
+```json
+{
+  "status_hooks": {
+    "enabled": true,
+    "port": 8743,
+    "secret": "your-status-hook-secret-here",
+    "path": "/status-hook"
+  },
+  "release_notify": {
+    "comment_template": "Shipped in {version}: {task_url}"
+  }
+}
+```
+
+**`status_hooks.secret` must be a non-empty string when `enabled` is `true`** — the
+same RT-004 posture as the webhook server. This is a **separate secret** from
+`webhooks.secret`: the two channels authenticate different callers (GitHub vs.
+whichever backend the operator configured) and must not share a trust boundary.
+
+| Key | Default | Description |
+|---|---|---|
+| `status_hooks.enabled` | `false` | Start the status-callback server in `watch` mode. |
+| `status_hooks.port` | `8743` | Listen port. Distinct from `webhooks.port` so both servers can run side by side. |
+| `status_hooks.secret` | `""` | HMAC-SHA256 secret. Required when `enabled` is `true`. |
+| `status_hooks.bind` | `"127.0.0.1"` | Bind address. Expose externally via a reverse proxy. |
+| `status_hooks.path` | `"/status-hook"` | HTTP path the server listens on. |
+| `release_notify.comment_template` | `"Shipped in {version}: {task_url}"` | Comment body template. Placeholders: `{version}`, `{task_url}`, `{task_id}`, `{repo}`, `{number}`. |
+| `task_index` | `".triage/task-index.jsonl"` | Path to the durable task_id -> origin side-index (`src/task_index.js`). |
+
+### Sending a status-callback request
+
+```
+POST /status-hook
+X-Clagentic-Signature: sha256=<hmac-sha256 hex of the raw body, using status_hooks.secret>
+Content-Type: application/json
+
+{ "task_id": "lr-a68f", "dispatcher": "lore", "status": "shipped", "version": "0.9.0" }
+```
+
+- `task_id` (required) — the id returned by the dispatcher's `create_task()`.
+- `dispatcher` (optional, recommended) — narrows the task-index lookup to a specific
+  dispatcher's id space.
+- `status` (required) — only `"shipped"` is currently handled; other values are
+  acknowledged (`200 { status: "ignored" }`) and otherwise no-op.
+- `version` (optional) — included in the rendered comment template.
+
+An unknown `task_id` (never dispatched, or dispatched before the task-index existed)
+is acknowledged with `200 { status: "unknown_task_id" }` rather than an error.
+Repeated calls for the same `(task_id, version)` are idempotent — the comment is not
+re-posted and the `released` label is not re-applied.
+
 ## Environment variable overrides
 
 | Variable | Config key | Notes |
@@ -372,4 +430,8 @@ the window expires. Both caps are in-memory and reset on process restart.
 | `CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID` | `source.github_app_installation_id` | |
 | `CLAGENTIC_TRIAGE_AUTO_APPROVE` | `auto_approve` | comma-separated |
 | `CLAGENTIC_TRIAGE_WEBHOOK_SECRET` | `webhooks.secret` | |
+| `CLAGENTIC_TRIAGE_WEBHOOK_PORT` | `webhooks.port` | integer |
+| `CLAGENTIC_TRIAGE_STATUS_HOOK_SECRET` | `status_hooks.secret` | separate secret from `webhooks.secret` |
+| `CLAGENTIC_TRIAGE_STATUS_HOOK_PORT` | `status_hooks.port` | integer |
+| `CLAGENTIC_TRIAGE_RELEASE_COMMENT_TEMPLATE` | `release_notify.comment_template` | |
 | `CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD` | `confidence_threshold` | float 0–1 |
