@@ -370,3 +370,91 @@ test('16. runner: anthropic-api is a valid runner value', async () => {
 
   assert.equal(cfg.runner, 'anthropic-api');
 });
+
+// ---------------------------------------------------------------------------
+// DD-012: label vocabulary config
+// ---------------------------------------------------------------------------
+
+test('17. default labels vocabulary is present with status/kind/priority/area', async () => {
+  const cfg = await load();
+
+  assert.equal(cfg.labels.status_namespace, 'status');
+  assert.ok(cfg.labels.status_values.includes('needs-triage'));
+  assert.ok(cfg.labels.status_values.includes('released'));
+  assert.deepEqual(cfg.labels.not_planned_values, ['wontfix', 'duplicate', 'invalid']);
+  assert.ok(cfg.labels.axes.kind.includes('bug'));
+  assert.ok(cfg.labels.axes.priority.includes('p1'));
+  assert.deepEqual(cfg.labels.axes.area, []);
+});
+
+test('18. CLAGENTIC_TRIAGE_LABELS_STATUS_VALUES overrides the status axis', async () => {
+  const cfg = await load({
+    env: { CLAGENTIC_TRIAGE_LABELS_STATUS_VALUES: 'new, doing, done' },
+  });
+
+  assert.deepEqual(cfg.labels.status_values, ['new', 'doing', 'done']);
+});
+
+test('19. CLAGENTIC_TRIAGE_LABELS_STATUS_NAMESPACE renames the state axis', async () => {
+  const cfg = await load({
+    env: { CLAGENTIC_TRIAGE_LABELS_STATUS_NAMESPACE: 'lifecycle' },
+  });
+
+  assert.equal(cfg.labels.status_namespace, 'lifecycle');
+});
+
+test('20. labels.axes entry colliding with status_namespace throws ConfigError', async () => {
+  await assert.rejects(
+    () =>
+      load({
+        configObj: {
+          labels: {
+            status_namespace: 'status',
+            status_values: ['a'],
+            not_planned_values: ['wontfix'],
+            axes: { status: ['oops'] },
+          },
+        },
+      }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(err.message.includes('collides'));
+      return true;
+    },
+  );
+});
+
+test('21. overlapping status_values and not_planned_values throws ConfigError', async () => {
+  await assert.rejects(
+    () =>
+      load({
+        configObj: {
+          labels: {
+            status_namespace: 'status',
+            status_values: ['accepted', 'wontfix'],
+            not_planned_values: ['wontfix'],
+          },
+        },
+      }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(err.message.includes('disjoint'));
+      return true;
+    },
+  );
+});
+
+test('22. non-string entries in labels.status_values throw ConfigError', async () => {
+  await assert.rejects(
+    () =>
+      load({
+        configObj: {
+          labels: { status_values: ['ok', 42], not_planned_values: ['wontfix'] },
+        },
+      }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      return true;
+    },
+  );
+});
