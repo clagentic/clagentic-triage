@@ -223,6 +223,29 @@ function splitCsv(value) {
 }
 
 /**
+ * Parse a boolean env var value. Strict by design: only 'true'/'false'
+ * (case-insensitive, trimmed) are accepted. This is released software —
+ * an operator typo (e.g. a stray truthy string) must fail loud rather than
+ * silently enabling a feature gate.
+ *
+ * @param {string} varName - Env var name, used in the error message only.
+ * @param {string} value   - Raw env var value.
+ * @returns {boolean}
+ */
+function parseBoolEnv(varName, value) {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true') {
+    return true;
+  }
+  if (normalized === 'false') {
+    return false;
+  }
+  throw new ConfigError(
+    `${varName} must be "true" or "false" (case-insensitive), got: ${value}`,
+  );
+}
+
+/**
  * Build a partial config object from CLAGENTIC_TRIAGE_* environment variables.
  * Only fields that are present in the env are included — absent vars do not
  * override file config with undefined values.
@@ -363,6 +386,46 @@ function configFromEnv(env) {
       );
     }
     out.confidence_threshold = parsed;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED !== undefined) {
+    out.pre_filter = out.pre_filter || {};
+    out.pre_filter.enabled = parseBoolEnv(
+      'CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED',
+      env.CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED,
+    );
+  }
+
+  if (env.CLAGENTIC_TRIAGE_PRE_FILTER_RUNNER !== undefined) {
+    out.pre_filter = out.pre_filter || {};
+    out.pre_filter.runner = env.CLAGENTIC_TRIAGE_PRE_FILTER_RUNNER;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_PRE_FILTER_MODEL !== undefined) {
+    out.pre_filter = out.pre_filter || {};
+    out.pre_filter.model = env.CLAGENTIC_TRIAGE_PRE_FILTER_MODEL;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_PRE_FILTER_TIMEOUT_MS !== undefined) {
+    const parsed = parseInt(env.CLAGENTIC_TRIAGE_PRE_FILTER_TIMEOUT_MS, 10);
+    if (isNaN(parsed)) {
+      throw new ConfigError(
+        `CLAGENTIC_TRIAGE_PRE_FILTER_TIMEOUT_MS must be an integer, got: ${env.CLAGENTIC_TRIAGE_PRE_FILTER_TIMEOUT_MS}`,
+      );
+    }
+    out.pre_filter = out.pre_filter || {};
+    out.pre_filter.timeout_ms = parsed;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_PRE_FILTER_CONFIDENCE_THRESHOLD !== undefined) {
+    const parsed = parseFloat(env.CLAGENTIC_TRIAGE_PRE_FILTER_CONFIDENCE_THRESHOLD);
+    if (isNaN(parsed)) {
+      throw new ConfigError(
+        `CLAGENTIC_TRIAGE_PRE_FILTER_CONFIDENCE_THRESHOLD must be a number, got: ${env.CLAGENTIC_TRIAGE_PRE_FILTER_CONFIDENCE_THRESHOLD}`,
+      );
+    }
+    out.pre_filter = out.pre_filter || {};
+    out.pre_filter.confidence_threshold = parsed;
   }
 
   return out;

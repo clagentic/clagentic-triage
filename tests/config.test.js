@@ -458,3 +458,136 @@ test('22. non-string entries in labels.status_values throw ConfigError', async (
     },
   );
 });
+
+// ---------------------------------------------------------------------------
+// lr-5e56: CLAGENTIC_TRIAGE_PRE_FILTER_* env wiring
+// ---------------------------------------------------------------------------
+
+test('23. CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED="true" sets pre_filter.enabled', async () => {
+  const cfg = await load({
+    env: { CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED: 'true' },
+  });
+
+  assert.equal(cfg.pre_filter.enabled, true);
+});
+
+test('23b. CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED="FALSE" (case-insensitive) sets pre_filter.enabled to false', async () => {
+  const cfg = await load({
+    env: { CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED: 'FALSE' },
+  });
+
+  assert.equal(cfg.pre_filter.enabled, false);
+});
+
+test('23c. CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED with an invalid value throws ConfigError', async () => {
+  await assert.rejects(
+    () => load({ env: { CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED: 'yes' } }),
+    (err) => {
+      assert.ok(err instanceof ConfigError, `expected ConfigError, got ${err.constructor.name}`);
+      assert.ok(err.message.includes('CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED'), `message: ${err.message}`);
+      return true;
+    },
+  );
+});
+
+test('24. CLAGENTIC_TRIAGE_PRE_FILTER_RUNNER sets pre_filter.runner', async () => {
+  const cfg = await load({
+    env: { CLAGENTIC_TRIAGE_PRE_FILTER_RUNNER: 'claude-cli' },
+  });
+
+  assert.equal(cfg.pre_filter.runner, 'claude-cli');
+});
+
+test('24b. CLAGENTIC_TRIAGE_PRE_FILTER_RUNNER with an invalid enum value throws ConfigError (validate() owns the enum check)', async () => {
+  await assert.rejects(
+    () => load({ env: { CLAGENTIC_TRIAGE_PRE_FILTER_RUNNER: 'banana' } }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(err.message.includes('pre_filter.runner'), `message: ${err.message}`);
+      return true;
+    },
+  );
+});
+
+test('25. CLAGENTIC_TRIAGE_PRE_FILTER_MODEL sets pre_filter.model', async () => {
+  const cfg = await load({
+    env: { CLAGENTIC_TRIAGE_PRE_FILTER_MODEL: 'claude-haiku-3' },
+  });
+
+  assert.equal(cfg.pre_filter.model, 'claude-haiku-3');
+});
+
+test('26. CLAGENTIC_TRIAGE_PRE_FILTER_TIMEOUT_MS sets pre_filter.timeout_ms', async () => {
+  const cfg = await load({
+    env: { CLAGENTIC_TRIAGE_PRE_FILTER_TIMEOUT_MS: '1500' },
+  });
+
+  assert.equal(cfg.pre_filter.timeout_ms, 1500);
+});
+
+test('26b. CLAGENTIC_TRIAGE_PRE_FILTER_TIMEOUT_MS with a non-integer value throws ConfigError', async () => {
+  await assert.rejects(
+    () => load({ env: { CLAGENTIC_TRIAGE_PRE_FILTER_TIMEOUT_MS: 'not-a-number' } }),
+    (err) => {
+      assert.ok(err instanceof ConfigError, `expected ConfigError, got ${err.constructor.name}`);
+      assert.ok(err.message.includes('CLAGENTIC_TRIAGE_PRE_FILTER_TIMEOUT_MS'), `message: ${err.message}`);
+      return true;
+    },
+  );
+});
+
+test('27. CLAGENTIC_TRIAGE_PRE_FILTER_CONFIDENCE_THRESHOLD sets pre_filter.confidence_threshold', async () => {
+  const cfg = await load({
+    env: { CLAGENTIC_TRIAGE_PRE_FILTER_CONFIDENCE_THRESHOLD: '0.42' },
+  });
+
+  assert.equal(cfg.pre_filter.confidence_threshold, 0.42);
+});
+
+test('27b. CLAGENTIC_TRIAGE_PRE_FILTER_CONFIDENCE_THRESHOLD with a non-numeric value throws ConfigError', async () => {
+  await assert.rejects(
+    () => load({ env: { CLAGENTIC_TRIAGE_PRE_FILTER_CONFIDENCE_THRESHOLD: 'nope' } }),
+    (err) => {
+      assert.ok(err instanceof ConfigError, `expected ConfigError, got ${err.constructor.name}`);
+      assert.ok(err.message.includes('CLAGENTIC_TRIAGE_PRE_FILTER_CONFIDENCE_THRESHOLD'), `message: ${err.message}`);
+      return true;
+    },
+  );
+});
+
+test('28. pre_filter env vars override file config (layering)', async () => {
+  const cfg = await load({
+    configObj: {
+      pre_filter: {
+        enabled: false,
+        runner: 'claude-cli',
+        model: 'file-model',
+        timeout_ms: 1000,
+        confidence_threshold: 0.3,
+      },
+    },
+    env: {
+      CLAGENTIC_TRIAGE_PRE_FILTER_ENABLED: 'true',
+      CLAGENTIC_TRIAGE_PRE_FILTER_MODEL: 'env-model',
+      CLAGENTIC_TRIAGE_PRE_FILTER_TIMEOUT_MS: '2000',
+      CLAGENTIC_TRIAGE_PRE_FILTER_CONFIDENCE_THRESHOLD: '0.9',
+    },
+  });
+
+  assert.equal(cfg.pre_filter.enabled, true);
+  assert.equal(cfg.pre_filter.model, 'env-model');
+  assert.equal(cfg.pre_filter.timeout_ms, 2000);
+  assert.equal(cfg.pre_filter.confidence_threshold, 0.9);
+  // Not overridden by env — file value should be retained via deep merge.
+  assert.equal(cfg.pre_filter.runner, 'claude-cli');
+});
+
+test('29. pre_filter defaults are untouched when no env vars are set', async () => {
+  const cfg = await load();
+
+  assert.equal(cfg.pre_filter.enabled, false);
+  assert.equal(cfg.pre_filter.runner, null);
+  assert.equal(cfg.pre_filter.model, null);
+  assert.equal(cfg.pre_filter.timeout_ms, null);
+  assert.equal(cfg.pre_filter.confidence_threshold, null);
+});
