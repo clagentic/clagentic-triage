@@ -43,6 +43,29 @@ describe('normalize_webhook — pull_request (default_branch carry-through)', ()
     const event = normalize_webhook(headers, payload);
     assert.equal(event.metadata.default_branch, null);
   });
+
+  it('carries payload.action into metadata.webhook_action (T10, lr-9e35)', () => {
+    const headers = { 'x-github-event': 'pull_request' };
+    const payload = {
+      action: 'ready_for_review',
+      repository: { full_name: 'owner/repo' },
+      pull_request: { number: 7, draft: false, base: { ref: 'main' }, user: { login: 'alice' } },
+    };
+
+    const event = normalize_webhook(headers, payload);
+    assert.equal(event.metadata.webhook_action, 'ready_for_review');
+  });
+
+  it('sets webhook_action to null when payload.action is absent', () => {
+    const headers = { 'x-github-event': 'pull_request' };
+    const payload = {
+      repository: { full_name: 'owner/repo' },
+      pull_request: { number: 7, base: { ref: 'main' } },
+    };
+
+    const event = normalize_webhook(headers, payload);
+    assert.equal(event.metadata.webhook_action, null);
+  });
 });
 
 describe('normalize_webhook — release', () => {

@@ -591,3 +591,99 @@ test('29. pre_filter defaults are untouched when no env vars are set', async () 
   assert.equal(cfg.pre_filter.timeout_ms, null);
   assert.equal(cfg.pre_filter.confidence_threshold, null);
 });
+
+// ---------------------------------------------------------------------------
+// T10 (lr-9e35): label_auto_approve and stale config
+// ---------------------------------------------------------------------------
+
+test('30. label_auto_approve and stale default to HITL-safe values', async () => {
+  const cfg = await load();
+
+  assert.deepEqual(cfg.label_auto_approve, []);
+  assert.equal(cfg.stale.enabled, false);
+  assert.equal(cfg.stale.needs_info_days, 60);
+  assert.equal(cfg.stale.close_after_days, 7);
+  assert.deepEqual(cfg.stale.exempt_labels, []);
+});
+
+test('31. label_auto_approve accepts a known axis name from labels.axes', async () => {
+  const cfg = await load({ configObj: { label_auto_approve: ['kind'] } });
+  assert.deepEqual(cfg.label_auto_approve, ['kind']);
+});
+
+test('32. label_auto_approve rejects an unknown axis name', async () => {
+  await assert.rejects(
+    () => load({ configObj: { label_auto_approve: ['not-a-real-axis'] } }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(err.message.includes('unknown axis'));
+      return true;
+    },
+  );
+});
+
+test('33. label_auto_approve rejects the status namespace itself', async () => {
+  await assert.rejects(
+    () => load({ configObj: { label_auto_approve: ['status'] } }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(err.message.includes('status namespace'));
+      return true;
+    },
+  );
+});
+
+test('34. CLAGENTIC_TRIAGE_LABEL_AUTO_APPROVE sets label_auto_approve (comma-separated)', async () => {
+  const cfg = await load({ env: { CLAGENTIC_TRIAGE_LABEL_AUTO_APPROVE: 'kind,priority' } });
+  assert.deepEqual(cfg.label_auto_approve, ['kind', 'priority']);
+});
+
+test('35. stale.needs_info_days must be a positive integer', async () => {
+  await assert.rejects(
+    () => load({ configObj: { stale: { needs_info_days: 0 } } }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(err.message.includes('needs_info_days'));
+      return true;
+    },
+  );
+});
+
+test('36. stale.close_after_days must be a positive integer', async () => {
+  await assert.rejects(
+    () => load({ configObj: { stale: { close_after_days: -1 } } }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(err.message.includes('close_after_days'));
+      return true;
+    },
+  );
+});
+
+test('37. CLAGENTIC_TRIAGE_STALE_ENABLED / NEEDS_INFO_DAYS / CLOSE_AFTER_DAYS / EXEMPT_LABELS override file config', async () => {
+  const cfg = await load({
+    configObj: { stale: { enabled: false, needs_info_days: 60, close_after_days: 7, exempt_labels: [] } },
+    env: {
+      CLAGENTIC_TRIAGE_STALE_ENABLED: 'true',
+      CLAGENTIC_TRIAGE_STALE_NEEDS_INFO_DAYS: '30',
+      CLAGENTIC_TRIAGE_STALE_CLOSE_AFTER_DAYS: '3',
+      CLAGENTIC_TRIAGE_STALE_EXEMPT_LABELS: 'pinned,help-wanted',
+    },
+  });
+
+  assert.equal(cfg.stale.enabled, true);
+  assert.equal(cfg.stale.needs_info_days, 30);
+  assert.equal(cfg.stale.close_after_days, 3);
+  assert.deepEqual(cfg.stale.exempt_labels, ['pinned', 'help-wanted']);
+});
+
+test('38. CLAGENTIC_TRIAGE_STALE_NEEDS_INFO_DAYS with a non-numeric value throws ConfigError', async () => {
+  await assert.rejects(
+    () => load({ env: { CLAGENTIC_TRIAGE_STALE_NEEDS_INFO_DAYS: 'nope' } }),
+    (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.ok(err.message.includes('CLAGENTIC_TRIAGE_STALE_NEEDS_INFO_DAYS'));
+      return true;
+    },
+  );
+});

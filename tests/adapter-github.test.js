@@ -26,6 +26,8 @@ import {
   list_merged_prs,
   list_releases,
   list_lifecycle_events,
+  list_open_prs,
+  list_issues_by_label,
   AdapterError,
 } from '../src/adapters/github.js';
 
@@ -1218,11 +1220,95 @@ describe('list_releases', () => {
 });
 
 // ---------------------------------------------------------------------------
+// list_open_prs (T10, lr-9e35)
+// ---------------------------------------------------------------------------
+
+describe('list_open_prs', () => {
+  it('returns open PRs normalized with metadata.merged=false', async () => {
+    const openPr = makeRawPr({ number: 9, merged_at: null, pull_request: { merged_at: null } });
+
+    let capturedUrl;
+    globalThis.fetch = async (url) => {
+      capturedUrl = url;
+      return mockResponse(200, [openPr]);
+    };
+
+    const config = makeConfig();
+    const events = await list_open_prs(config, 'example/repo');
+
+    assert.ok(capturedUrl.includes('state=open'));
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'pr');
+    assert.equal(events[0].number, 9);
+    assert.equal(events[0].metadata.merged, false);
+  });
+
+  it('returns empty array when no token is configured', async () => {
+    const config = makeConfig({ _token: null });
+    const events = await list_open_prs(config, 'example/repo');
+    assert.deepEqual(events, []);
+  });
+
+  it('returns empty array on auth failure (does not throw)', async () => {
+    globalThis.fetch = async () => mockResponse(401, { message: 'Bad credentials' });
+
+    const config = makeConfig();
+    const events = await list_open_prs(config, 'example/repo');
+    assert.deepEqual(events, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// list_issues_by_label (T10, lr-9e35)
+// ---------------------------------------------------------------------------
+
+describe('list_issues_by_label', () => {
+  it('returns open issues carrying the label, filtering out PRs', async () => {
+    const issue = makeRawIssue({ number: 5, labels: [{ name: 'status/needs-info' }] });
+    const prWithSameLabel = makeRawPr({ number: 6, labels: [{ name: 'status/needs-info' }] });
+
+    let capturedUrl;
+    globalThis.fetch = async (url) => {
+      capturedUrl = url;
+      return mockResponse(200, [issue, prWithSameLabel]);
+    };
+
+    const config = makeConfig();
+    const events = await list_issues_by_label(config, 'status/needs-info');
+
+    assert.ok(capturedUrl.includes('labels=status%2Fneeds-info'));
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'issue');
+    assert.equal(events[0].number, 5);
+  });
+
+  it('aggregates across every resolved repo', async () => {
+    globalThis.fetch = async (url) => {
+      if (url.includes('/repos/example/repo/')) {
+        return mockResponse(200, [makeRawIssue({ number: 1 })]);
+      }
+      return mockResponse(200, [makeRawIssue({ number: 2 })]);
+    };
+
+    const config = makeConfig({ source: { adapter: 'github', org: null, repos: ['example/repo', 'example/other'], allow_bot_logins: [] } });
+    const events = await list_issues_by_label(config, 'status/needs-info');
+
+    assert.equal(events.length, 2);
+  });
+
+  it('returns empty array when no token is configured', async () => {
+    const config = makeConfig({ _token: null });
+    const events = await list_issues_by_label(config, 'status/needs-info');
+    assert.deepEqual(events, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // list_lifecycle_events (T6, lr-d557)
 // ---------------------------------------------------------------------------
 
 describe('list_lifecycle_events', () => {
-  it('aggregates merged PRs and releases across resolved repos', async () => {
+  it('aggregates merged PRs, releases, and open PRs across resolved repos', async () => {
     const mergedPr = makeRawPr({
       number: 7,
       merged_at: '2026-07-04T00:00:00Z',
@@ -1230,10 +1316,19 @@ describe('list_lifecycle_events', () => {
       base: { ref: 'main' },
     });
     const release = { id: 1, tag_name: 'v1.0.0', draft: false, body: 'Closes #1' };
+    const openPr = makeRawPr({
+      number: 9,
+      merged_at: null,
+      pull_request: { merged_at: null },
+      state: 'open',
+    });
 
     globalThis.fetch = async (url) => {
-      if (url.includes('/pulls')) {
+      if (url.includes('state=closed') && url.includes('/pulls')) {
         return mockResponse(200, [mergedPr]);
+      }
+      if (url.includes('state=open') && url.includes('/pulls')) {
+        return mockResponse(200, [openPr]);
       }
       if (url.includes('/releases')) {
         return mockResponse(200, [release]);
@@ -1243,18 +1338,21 @@ describe('list_lifecycle_events', () => {
     };
 
     const config = makeConfig({ source: { adapter: 'github', org: null, repos: ['example/repo'], allow_bot_logins: [] } });
-    const { mergedPrs, releases } = await list_lifecycle_events(config);
+    const { mergedPrs, releases, openPrs } = await list_lifecycle_events(config);
 
     assert.equal(mergedPrs.length, 1);
     assert.equal(mergedPrs[0].number, 7);
     assert.equal(releases.length, 1);
     assert.equal(releases[0].metadata.tag_name, 'v1.0.0');
+    assert.equal(openPrs.length, 1);
+    assert.equal(openPrs[0].number, 9);
+    assert.equal(openPrs[0].metadata.merged, false);
   });
 
   it('returns empty lists when no token is configured', async () => {
     const config = makeConfig({ _token: null });
     const result = await list_lifecycle_events(config);
-    assert.deepEqual(result, { mergedPrs: [], releases: [] });
+    assert.deepEqual(result, { mergedPrs: [], releases: [], openPrs: [] });
   });
 
   it("throws AdapterError when repos=['*'] and no org is set", async () => {
