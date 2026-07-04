@@ -16,7 +16,14 @@ import { startWebhookServer } from './webhooks/server.js';
 import { startStatusHookServer } from './status_hook.js';
 import { dispatch } from './dispatchers/index.js';
 import { check_token_scopes } from './adapters/github.js';
-import { isMergedToDefaultBranch, applyMergeTransition, applyReleaseTransition } from './lifecycle.js';
+import {
+  isMergedToDefaultBranch,
+  applyMergeTransition,
+  applyReleaseTransition,
+  applyPrOpenedTransition,
+  applyPrReadyForReviewTransition,
+} from './lifecycle.js';
+import { checkStaleNeedsInfo } from './stale.js';
 
 // NOTE(RT-009): the `hooks` config field is stored but not yet dynamically
 // imported. When hook module loading is implemented, apply _validate_module_path
@@ -208,6 +215,22 @@ export async function routeEvent(config, event, adapter) {
     return { kind: 'merge', event_id: event.id, ...result };
   }
 
+  // T10 (lr-9e35): PR-opened -> in-progress (draft PRs), PR ready-for-review ->
+  // in-review (non-draft PRs). Both are checked ahead of the LLM pipeline for
+  // the same reason merge/release are: these are deterministic facts about a
+  // PR's linkage/state, not something to assess. The two are mutually
+  // exclusive by the PR's draft flag (src/lifecycle.js's
+  // _applyLinkedIssueStatus docblock), so exactly one branch is eligible for
+  // any given PR event — no double-apply race between them.
+  if (event.type === 'pr') {
+    const kind = event.metadata?.draft ? 'pr_opened' : 'pr_ready_for_review';
+    const transition = event.metadata?.draft ? applyPrOpenedTransition : applyPrReadyForReviewTransition;
+    const result = await transition(config, adapter, event);
+    if (result.issues.length > 0) {
+      return { kind, event_id: event.id, ...result };
+    }
+  }
+
   const result = await processEvent(config, event, adapter);
   return { kind: 'triage', ...result };
 }
@@ -280,27 +303,40 @@ async function cmdWatch(flags) {
       err(`[clagentic-triage] cycle error: ${e.message}`);
     }
 
-    // Lifecycle poll (T6, lr-d557): merged PRs and published releases are
-    // deterministic transitions, not LLM-assessed — routed directly to
-    // src/lifecycle.js, never through runPipeline/processEvent. Optional on
-    // adapters that do not implement list_lifecycle_events (interface is
-    // additive; other adapters may not have it yet).
+    // Lifecycle poll (T6 lr-d557, T10 lr-9e35): merged PRs, published releases,
+    // and open PRs (opened/ready-for-review) are deterministic transitions,
+    // not LLM-assessed — routed directly to src/lifecycle.js, never through
+    // runPipeline/processEvent. Optional on adapters that do not implement
+    // list_lifecycle_events (interface is additive; other adapters may not
+    // have it yet).
     if (typeof adapter.list_lifecycle_events === 'function') {
       try {
-        const { mergedPrs, releases } = await adapter.list_lifecycle_events(config);
+        const { mergedPrs, releases, openPrs = [] } = await adapter.list_lifecycle_events(config);
         let appliedCount = 0;
-        for (const event of [...mergedPrs, ...releases]) {
+        for (const event of [...mergedPrs, ...releases, ...openPrs]) {
           const result = await routeEvent(config, event, adapter);
           if (result.applied) {
             appliedCount += 1;
           }
         }
         out(
-          `[clagentic-triage] lifecycle cycle: merged_prs=${mergedPrs.length} releases=${releases.length} applied=${appliedCount}`,
+          `[clagentic-triage] lifecycle cycle: merged_prs=${mergedPrs.length} releases=${releases.length} ` +
+          `open_prs=${openPrs.length} applied=${appliedCount}`,
         );
       } catch (e) {
         err(`[clagentic-triage] lifecycle cycle error: ${e.message}`);
       }
+    }
+
+    // Stale needs-info auto-close (T10, lr-9e35) — see cmdRun for rationale.
+    try {
+      const staleResult = await checkStaleNeedsInfo(config, adapter);
+      out(
+        `[clagentic-triage] stale needs-info: checked=${staleResult.checked} warned=${staleResult.warned} ` +
+        `closed=${staleResult.closed}`,
+      );
+    } catch (e) {
+      err(`[clagentic-triage] stale needs-info check error: ${e.message}`);
     }
   };
 
@@ -341,20 +377,35 @@ async function cmdRun(flags) {
     `[clagentic-triage] run complete: dispatched=${dispatched.length} queued=${queued.length} errors=${errors.length}`,
   );
 
-  // Lifecycle poll (T6, lr-d557) — see cmdWatch's tick for the rationale on
-  // routing these outside runPipeline.
+  // Lifecycle poll (T6 lr-d557, T10 lr-9e35) — see cmdWatch's tick for the
+  // rationale on routing these outside runPipeline.
   if (typeof adapter.list_lifecycle_events === 'function') {
-    const { mergedPrs, releases } = await adapter.list_lifecycle_events(config);
+    const { mergedPrs, releases, openPrs = [] } = await adapter.list_lifecycle_events(config);
     let appliedCount = 0;
-    for (const event of [...mergedPrs, ...releases]) {
+    for (const event of [...mergedPrs, ...releases, ...openPrs]) {
       const result = await routeEvent(config, event, adapter);
       if (result.applied) {
         appliedCount += 1;
       }
     }
     out(
-      `[clagentic-triage] lifecycle run: merged_prs=${mergedPrs.length} releases=${releases.length} applied=${appliedCount}`,
+      `[clagentic-triage] lifecycle run: merged_prs=${mergedPrs.length} releases=${releases.length} ` +
+      `open_prs=${openPrs.length} applied=${appliedCount}`,
     );
+  }
+
+  // Stale needs-info auto-close (T10, lr-9e35) — deterministic idle-close, not
+  // LLM-assessed. Runs after the lifecycle poll so a PR event that just moved
+  // an issue off needs-info in this same pass is reflected before the stale
+  // check reads live labels.
+  try {
+    const staleResult = await checkStaleNeedsInfo(config, adapter);
+    out(
+      `[clagentic-triage] stale needs-info: checked=${staleResult.checked} warned=${staleResult.warned} ` +
+      `closed=${staleResult.closed}`,
+    );
+  } catch (e) {
+    err(`[clagentic-triage] stale needs-info check error: ${e.message}`);
   }
 
   if (errors.length > 0) {
