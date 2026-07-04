@@ -33,6 +33,7 @@ try {
 // ---------------------------------------------------------------------------
 
 const GITHUB_API = 'https://api.github.com';
+const GITHUB_GRAPHQL_API = 'https://api.github.com/graphql';
 const ACCEPT_HEADER = 'application/vnd.github+json';
 const API_VERSION_HEADER = 'X-GitHub-Api-Version';
 const API_VERSION = '2022-11-28';
@@ -1229,4 +1230,173 @@ export async function check_token_scopes(config) {
   } catch (err) {
     return { ok: false, error: err.message ?? String(err) };
   }
+}
+
+// ---------------------------------------------------------------------------
+// get_pr_closing_issues (T5, lr-6857)
+// ---------------------------------------------------------------------------
+
+/**
+ * GraphQL query for a PR's `closingIssuesReferences` — the authoritative
+ * same-repo closing set. REST has no equivalent endpoint (verified against
+ * community #24706, cli/cli #10529): a PR merge only auto-closes issues in
+ * the SAME repo via body keyword refs, and GraphQL is the only API surface
+ * that exposes the resolved set directly, without re-implementing GitHub's
+ * own keyword-parsing rules.
+ */
+const CLOSING_ISSUES_QUERY = `
+  query($owner: String!, $name: String!, $number: Int!) {
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: $number) {
+        closingIssuesReferences(first: 100) {
+          nodes {
+            number
+            title
+            url
+            state
+            repository {
+              owner { login }
+              name
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+/**
+ * Closing-keyword regex, shared by the cross-repo body-parse supplement.
+ * Matches "close/closes/closed/fix/fixes/fixed/resolve/resolves/resolved"
+ * (case-insensitive) followed by either a cross-repo `owner/repo#N` or a
+ * bare same-repo `#N` reference.
+ */
+const CLOSING_KEYWORD_REF_RE =
+  /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+(?:([\w.-]+)\/([\w.-]+))?#(\d+)/gi;
+
+/**
+ * Parse a PR body for closing-keyword references (close/closes/closed/fix/
+ * fixes/fixed/resolve/resolves/resolved followed by an issue reference).
+ *
+ * GitHub's automatic keyword-close behavior is SAME-REPO ONLY: a cross-repo
+ * `owner/repo#N` reference in a closing-keyword position creates a link but
+ * does NOT auto-close the target issue on merge. This function surfaces
+ * cross-repo refs separately from same-repo refs so callers never conflate
+ * "linked" with "will close" — same-repo truth should come from
+ * `get_pr_closing_issues` (GraphQL), not from this body-parse.
+ *
+ * @param {string} body       - PR body/description text
+ * @param {string} defaultRepo - "owner/repo" of the PR itself, used to label
+ *   same-repo bare `#N` refs found in the body (for completeness; the
+ *   authoritative same-repo closing set still comes from GraphQL).
+ * @returns {{ sameRepoRefs: {owner: string, repo: string, number: number}[],
+ *             crossRepoRefs: {owner: string, repo: string, number: number}[] }}
+ */
+export function parse_closing_keyword_refs(body, defaultRepo) {
+  const [defaultOwner, defaultRepoName] = (defaultRepo ?? '').split('/');
+  const sameRepoRefs = [];
+  const crossRepoRefs = [];
+
+  if (!body) {
+    return { sameRepoRefs, crossRepoRefs };
+  }
+
+  // Reset lastIndex defensively: the regex is a module-level /g literal, and
+  // an uncaught throw mid-iteration in a prior call could otherwise leave it
+  // pointing mid-string for the next call.
+  CLOSING_KEYWORD_REF_RE.lastIndex = 0;
+
+  let match;
+  while ((match = CLOSING_KEYWORD_REF_RE.exec(body)) !== null) {
+    const [, owner, repo, numberStr] = match;
+    const number = parseInt(numberStr, 10);
+
+    if (owner && repo) {
+      crossRepoRefs.push({ owner, repo, number });
+    } else if (defaultOwner && defaultRepoName) {
+      sameRepoRefs.push({ owner: defaultOwner, repo: defaultRepoName, number });
+    }
+  }
+
+  return { sameRepoRefs, crossRepoRefs };
+}
+
+/**
+ * Read a PR's reliable closing-issue links.
+ *
+ * Combines two sources, kept structurally distinct because they answer
+ * different questions:
+ *   - `closingIssues`: the same-repo closing set from GraphQL
+ *     `closingIssuesReferences` — the authoritative source GitHub itself
+ *     uses to decide what closes on merge. REST exposes no equivalent.
+ *   - `crossRepoRefs`: cross-repo `owner/repo#N` closing-keyword references
+ *     found by parsing the PR body. GitHub's keyword auto-close is same-repo
+ *     only, so a cross-repo keyword ref LINKS the issue but does not close
+ *     it — surfacing it separately prevents a caller from treating it as
+ *     "will close" by mistake.
+ *
+ * Do not substitute commit-message parsing for either source: squash/merge
+ * strategies make commit messages an unreliable carrier of the original PR
+ * body's closing keywords.
+ *
+ * @param {object} config
+ * @param {object} event - Normalized Event (type='pr'); event.repo is
+ *   "owner/repo", event.number is the PR number.
+ * @returns {Promise<{
+ *   closingIssues: {owner: string, repo: string, number: number, title: string, url: string, state: string}[],
+ *   crossRepoRefs: {owner: string, repo: string, number: number}[],
+ * }>}
+ */
+export async function get_pr_closing_issues(config, event) {
+  if (event.type !== 'pr') {
+    throw new AdapterError(`get_pr_closing_issues is only valid for PRs; got type='${event.type}'`);
+  }
+
+  const token = await _resolve_token(config);
+  const [owner, name] = event.repo.split('/');
+
+  const res = await globalThis.fetch(GITHUB_GRAPHQL_API, {
+    method: 'POST',
+    headers: { ..._headers(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      query: CLOSING_ISSUES_QUERY,
+      variables: { owner, name, number: event.number },
+    }),
+  });
+
+  if (res.status === 401) {
+    throw new AdapterError('GitHub token invalid or missing', 'auth_failure');
+  }
+
+  if (!res.ok) {
+    throw new AdapterError(`get_pr_closing_issues failed: ${res.status} ${res.statusText}`);
+  }
+
+  const data = await res.json();
+
+  // GraphQL returns 200 with an `errors` array on query-level failures
+  // (e.g. bad credentials can surface here instead of via HTTP status).
+  if (Array.isArray(data.errors) && data.errors.length > 0) {
+    const authError = data.errors.find((e) => e.type === 'UNAUTHORIZED' || e.type === 'FORBIDDEN');
+    if (authError) {
+      throw new AdapterError(`GitHub GraphQL auth failure: ${authError.message}`, 'auth_failure');
+    }
+    throw new AdapterError(
+      `get_pr_closing_issues GraphQL error: ${data.errors.map((e) => e.message).join('; ')}`,
+    );
+  }
+
+  const nodes = data.data?.repository?.pullRequest?.closingIssuesReferences?.nodes ?? [];
+  const closingIssues = nodes.map((n) => ({
+    owner: n.repository?.owner?.login ?? '',
+    repo: n.repository?.name ?? '',
+    number: n.number,
+    title: n.title ?? '',
+    url: n.url ?? '',
+    state: n.state ?? '',
+  }));
+
+  const { crossRepoRefs } = parse_closing_keyword_refs(event.body, event.repo);
+
+  return { closingIssues, crossRepoRefs };
 }
