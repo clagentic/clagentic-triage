@@ -63,7 +63,11 @@ The assessor takes an enriched event and a config-defined intent specification a
   confidence: 0.0–1.0,
   reasoning: string,
   suggested_action: {
-    class: 'approve' | 'respond' | 'request_changes' | 'close' | 'dispatch' | 'escalate',
+    // T7 (lr-f0f2): one or more action classes — a single verdict may
+    // comment, set a status label, and dispatch atomically. Legacy callers
+    // that still emit a singular `class: string` are normalized to a
+    // one-element `classes` array by src/llm.js.
+    classes: Array<'approve' | 'respond' | 'request_changes' | 'close' | 'dispatch' | 'escalate'>,
     body: string | null,      // comment/response text if applicable
     dispatch_target: string | null,
     labels: string[]

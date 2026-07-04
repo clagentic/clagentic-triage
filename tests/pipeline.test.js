@@ -64,7 +64,7 @@ function makeAssessment(overrides = {}) {
     confidence: 0.9,
     reasoning: 'Looks good.',
     suggested_action: {
-      class: 'respond',
+      classes: ['respond'],
       body: 'Thank you for the report.',
       dispatch_target: null,
       labels: [],
@@ -91,6 +91,8 @@ function makeAdapter(spies = {}) {
     request_changes: spies.request_changes ?? (() => Promise.resolve()),
     approve_pr: spies.approve_pr ?? (() => Promise.resolve()),
     label_item: spies.label_item ?? (() => Promise.resolve()),
+    unlabel_item: spies.unlabel_item ?? (() => Promise.resolve()),
+    get_item_labels: spies.get_item_labels ?? (() => Promise.resolve([])),
   };
 }
 
@@ -113,11 +115,16 @@ function makeAdapter(spies = {}) {
 
 /**
  * Inline reimplementation of processEvent with injectable enrich/assess.
- * Mirrors src/pipeline.js logic exactly, but takes enrich and assess as
- * parameters so tests can inject doubles without an ESM loader hook.
+ * Mirrors src/pipeline.js's control flow (enrich → assess → route → execute →
+ * label), but takes enrich and assess as parameters so tests can inject
+ * doubles without an ESM loader hook.
  *
- * This shim must stay in sync with pipeline.js. Any behavioral change to
- * pipeline.js must be mirrored here.
+ * T7 (lr-f0f2): the actual action-execution and label-application logic
+ * (multi-action classes[] looping, single-status-invariant enforcement) is no
+ * longer re-derived here — it delegates to the real, exported
+ * `_executeAction`/`_applyLabels` from src/pipeline.js so this shim cannot
+ * silently drift from the code it stands in for. Only the enrich/assess/route
+ * sequencing (which has no test seam of its own) remains reimplemented.
  *
  * @param {object}   config
  * @param {object}   event
@@ -137,13 +144,10 @@ async function processEventShim(config, event, adapter, enrichFn, assessFn, rout
 
     if (!should_dispatch) {
       // Apply labels on queued items if auto_label is true.
-      const labels = assessment.suggested_action?.labels;
-      if (config.auto_label && Array.isArray(labels) && labels.length > 0) {
-        try {
-          await adapter.label_item(config, event, labels);
-        } catch {
-          // Non-fatal.
-        }
+      try {
+        await _applyLabels(config, event, assessment, adapter, 'queued');
+      } catch {
+        // Non-fatal.
       }
 
       return {
@@ -151,51 +155,33 @@ async function processEventShim(config, event, adapter, enrichFn, assessFn, rout
         status: 'queued',
         assessment,
         action_taken: null,
+        actions_taken: [],
         queue_reason,
         dispatched_at: null,
         error: null,
       };
     }
 
-    // Execute the action.
-    const actionClass = assessment.suggested_action.class;
-    const body = assessment.suggested_action.body ?? '';
-    let action_taken = null;
-    let deferredQueueReason = null;
+    const { actions_taken, queue_reason: deferredQueueReason } = await _executeAction(
+      config,
+      event,
+      assessment,
+      adapter,
+    );
 
-    switch (actionClass) {
-      case 'respond':
-        await adapter.post_comment(config, event, body);
-        action_taken = 'respond';
-        break;
-      case 'request_changes':
-        await adapter.request_changes(config, event, body);
-        action_taken = 'request_changes';
-        break;
-      case 'approve':
-        await adapter.approve_pr(config, event);
-        action_taken = 'approve';
-        break;
-      case 'close':
-        await adapter.close_item(config, event);
-        action_taken = 'close';
-        break;
-      case 'dispatch':
-        deferredQueueReason = 'dispatch';
-        break;
-      case 'escalate':
-        deferredQueueReason = 'escalate';
-        break;
-      default:
-        deferredQueueReason = 'escalate';
-    }
+    if (deferredQueueReason !== null) {
+      try {
+        await _applyLabels(config, event, assessment, adapter, 'queued');
+      } catch {
+        // Non-fatal.
+      }
 
-    if (action_taken === null) {
       return {
         event_id: eventId,
         status: 'queued',
         assessment,
-        action_taken: null,
+        action_taken: actions_taken[0] ?? null,
+        actions_taken,
         queue_reason: deferredQueueReason,
         dispatched_at: null,
         error: null,
@@ -203,20 +189,18 @@ async function processEventShim(config, event, adapter, enrichFn, assessFn, rout
     }
 
     // Apply labels unconditionally on dispatched items.
-    const labels = assessment.suggested_action?.labels;
-    if (Array.isArray(labels) && labels.length > 0) {
-      try {
-        await adapter.label_item(config, event, labels);
-      } catch {
-        // Non-fatal.
-      }
+    try {
+      await _applyLabels(config, event, assessment, adapter, 'dispatched');
+    } catch {
+      // Non-fatal.
     }
 
     return {
       event_id: eventId,
       status: 'dispatched',
       assessment,
-      action_taken,
+      action_taken: actions_taken[0] ?? null,
+      actions_taken,
       queue_reason: null,
       dispatched_at: new Date().toISOString(),
       error: null,
@@ -227,6 +211,7 @@ async function processEventShim(config, event, adapter, enrichFn, assessFn, rout
       status: 'error',
       assessment: null,
       action_taken: null,
+      actions_taken: [],
       queue_reason: null,
       dispatched_at: null,
       error: err.message ?? String(err),
@@ -255,6 +240,7 @@ async function runPipelineShim(config, events, adapter, enrichFn, assessFn, rout
 // ---------------------------------------------------------------------------
 
 import { route } from '../src/router.js';
+import { _executeAction, _applyLabels } from '../src/pipeline.js';
 
 // ---------------------------------------------------------------------------
 // Tests — router.js (pure, no mocking needed)
@@ -285,7 +271,7 @@ describe('router.route()', () => {
 
   it('returns awaiting_approval for action class NOT in auto_approve', () => {
     const config = makeConfig({ confidence_threshold: 0.7, auto_approve: [] });
-    const assessment = makeAssessment({ confidence: 0.9, suggested_action: { class: 'respond', body: null, dispatch_target: null, labels: [] } });
+    const assessment = makeAssessment({ confidence: 0.9, suggested_action: { classes: ['respond'], body: null, dispatch_target: null, labels: [] } });
     const result = route(config, assessment);
     assert.deepEqual(result, { should_dispatch: false, queue_reason: 'awaiting_approval' });
   });
@@ -297,6 +283,40 @@ describe('router.route()', () => {
     const result = route(config, assessment);
     assert.equal(result.should_dispatch, false);
     assert.equal(result.queue_reason, 'low_confidence');
+  });
+
+  // T7 (lr-f0f2): multi-action verdicts — every named class must be
+  // individually trusted for the whole verdict to auto-dispatch.
+  it('dispatches a multi-action verdict when every class is in auto_approve', () => {
+    const config = makeConfig({ confidence_threshold: 0.7, auto_approve: ['respond', 'dispatch'] });
+    const assessment = makeAssessment({
+      confidence: 0.9,
+      suggested_action: { classes: ['respond', 'dispatch'], body: null, dispatch_target: null, labels: [] },
+    });
+    const result = route(config, assessment);
+    assert.deepEqual(result, { should_dispatch: true, queue_reason: null });
+  });
+
+  it('queues a multi-action verdict when only SOME of its classes are auto_approved', () => {
+    // 'respond' is trusted but 'close' is not — the whole verdict must queue,
+    // not partially auto-execute the trusted class.
+    const config = makeConfig({ confidence_threshold: 0.7, auto_approve: ['respond'] });
+    const assessment = makeAssessment({
+      confidence: 0.9,
+      suggested_action: { classes: ['respond', 'close'], body: null, dispatch_target: null, labels: [] },
+    });
+    const result = route(config, assessment);
+    assert.deepEqual(result, { should_dispatch: false, queue_reason: 'awaiting_approval' });
+  });
+
+  it('normalizes a legacy singular suggested_action.class to a one-element classes list', () => {
+    const config = makeConfig({ confidence_threshold: 0.7, auto_approve: ['respond'] });
+    const assessment = makeAssessment({
+      confidence: 0.9,
+      suggested_action: { class: 'respond', body: null, dispatch_target: null, labels: [] },
+    });
+    const result = route(config, assessment);
+    assert.deepEqual(result, { should_dispatch: true, queue_reason: null });
   });
 });
 
@@ -472,5 +492,191 @@ describe('runPipeline shim', () => {
     assert.equal(queued[0].event_id, 'r#B');
     assert.equal(errors.length, 1);
     assert.equal(errors[0].event_id, 'r#C');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// _executeAction — multi-action verdicts (T7, lr-f0f2)
+// ---------------------------------------------------------------------------
+
+describe('_executeAction — multi-action verdicts', () => {
+  it('executes every class in order and reports all of them in actions_taken', async () => {
+    const calls = [];
+    const adapter = makeAdapter({
+      post_comment: async (_c, _e, body) => { calls.push(['post_comment', body]); },
+      close_item: async () => { calls.push(['close_item']); },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['respond', 'close'], body: 'Thanks, closing this.', dispatch_target: null, labels: [] },
+    });
+
+    const result = await _executeAction({}, event, assessment, adapter);
+
+    assert.deepEqual(result.actions_taken, ['respond', 'close']);
+    assert.equal(result.queue_reason, null);
+    // Order matters: respond (the comment) must run before close.
+    assert.deepEqual(calls, [['post_comment', 'Thanks, closing this.'], ['close_item']]);
+  });
+
+  it('runs executable classes immediately AND still surfaces a deferred queue_reason', async () => {
+    let commented = false;
+    const adapter = makeAdapter({
+      post_comment: async () => { commented = true; },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['respond', 'escalate'], body: 'Escalating.', dispatch_target: null, labels: [] },
+    });
+
+    const result = await _executeAction({}, event, assessment, adapter);
+
+    assert.ok(commented, 'respond should have executed immediately');
+    assert.deepEqual(result.actions_taken, ['respond']);
+    assert.equal(result.queue_reason, 'escalate');
+  });
+
+  it('normalizes a legacy singular suggested_action.class to a one-element classes list', async () => {
+    let approved = false;
+    const adapter = makeAdapter({ approve_pr: async () => { approved = true; } });
+
+    const event = makeEvent({ type: 'pr' });
+    const assessment = makeAssessment({
+      suggested_action: { class: 'approve', body: null, dispatch_target: null, labels: [] },
+    });
+
+    const result = await _executeAction({}, event, assessment, adapter);
+
+    assert.ok(approved);
+    assert.deepEqual(result.actions_taken, ['approve']);
+  });
+
+  it('returns no actions_taken and escalate queue_reason for an empty/missing classes list', async () => {
+    const adapter = makeAdapter();
+    const event = makeEvent();
+    const assessment = makeAssessment({ suggested_action: { body: null, dispatch_target: null, labels: [] } });
+
+    const result = await _executeAction({}, event, assessment, adapter);
+
+    assert.deepEqual(result.actions_taken, []);
+    assert.equal(result.queue_reason, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// _applyLabels — single-status invariant (T2 lr-a192 / T7 lr-f0f2)
+// ---------------------------------------------------------------------------
+
+describe('_applyLabels — single-status invariant', () => {
+  it('removes the prior status/* label before applying the new one', async () => {
+    const calls = [];
+    const adapter = makeAdapter({
+      get_item_labels: async () => ['status/needs-triage', 'kind/bug'],
+      unlabel_item: async (_c, _e, label) => { calls.push(['unlabel', label]); },
+      label_item: async (_c, _e, labels) => { calls.push(['label', labels]); },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['respond'], body: null, dispatch_target: null, labels: ['status/accepted'] },
+    });
+
+    await _applyLabels({}, event, assessment, adapter, 'dispatched');
+
+    assert.deepEqual(calls, [
+      ['unlabel', 'status/needs-triage'],
+      ['label', ['status/accepted']],
+    ]);
+  });
+
+  it('never applies the new label before removing the stale one (removal-before-apply ordering)', async () => {
+    const order = [];
+    const adapter = makeAdapter({
+      get_item_labels: async () => ['status/in-progress'],
+      unlabel_item: async () => { order.push('unlabel'); },
+      label_item: async () => { order.push('label'); },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['respond'], body: null, dispatch_target: null, labels: ['status/in-review'] },
+    });
+
+    await _applyLabels({}, event, assessment, adapter, 'dispatched');
+
+    assert.deepEqual(order, ['unlabel', 'label']);
+  });
+
+  it('does not touch non-status labels when no status/* label is incoming', async () => {
+    let unlabelCalled = false;
+    const adapter = makeAdapter({
+      get_item_labels: async () => ['status/accepted', 'kind/bug'],
+      unlabel_item: async () => { unlabelCalled = true; },
+      label_item: async () => {},
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['respond'], body: null, dispatch_target: null, labels: ['priority/p1'] },
+    });
+
+    await _applyLabels({}, event, assessment, adapter, 'dispatched');
+
+    assert.equal(unlabelCalled, false, 'no status/* label incoming means no removal');
+  });
+
+  it('is a no-op when suggested_action.labels is empty', async () => {
+    let labelsFetched = false;
+    const adapter = makeAdapter({
+      get_item_labels: async () => { labelsFetched = true; return []; },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['respond'], body: null, dispatch_target: null, labels: [] },
+    });
+
+    await _applyLabels({}, event, assessment, adapter, 'dispatched');
+
+    assert.equal(labelsFetched, false, 'should not even fetch live labels when there is nothing to apply');
+  });
+
+  it('skips labeling a queued item when auto_label is not enabled', async () => {
+    let labelsFetched = false;
+    const adapter = makeAdapter({
+      get_item_labels: async () => { labelsFetched = true; return []; },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['dispatch'], body: null, dispatch_target: null, labels: ['status/accepted'] },
+    });
+
+    await _applyLabels({ auto_label: false }, event, assessment, adapter, 'queued');
+
+    assert.equal(labelsFetched, false);
+  });
+
+  it('applies labels on a queued item when auto_label is enabled, enforcing single-status', async () => {
+    const calls = [];
+    const adapter = makeAdapter({
+      get_item_labels: async () => ['status/needs-triage'],
+      unlabel_item: async (_c, _e, label) => { calls.push(['unlabel', label]); },
+      label_item: async (_c, _e, labels) => { calls.push(['label', labels]); },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['dispatch'], body: null, dispatch_target: null, labels: ['status/accepted'] },
+    });
+
+    await _applyLabels({ auto_label: true }, event, assessment, adapter, 'queued');
+
+    assert.deepEqual(calls, [
+      ['unlabel', 'status/needs-triage'],
+      ['label', ['status/accepted']],
+    ]);
   });
 });

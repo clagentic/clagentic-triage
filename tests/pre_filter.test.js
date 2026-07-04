@@ -249,7 +249,7 @@ describe('noiseAssessment', () => {
     assert.strictEqual(assessment.confidence, 0.92);
     assert.strictEqual(assessment.model_used, 'haiku-model');
     assert.ok(assessment.reasoning.includes('Detected as spam.'));
-    assert.strictEqual(assessment.suggested_action.class, 'close');
+    assert.deepStrictEqual(assessment.suggested_action.classes, ['close']);
     assert.strictEqual(assessment.event_id, event.id);
     assert.ok(typeof assessment.assessed_at === 'string', 'assessed_at should be a string');
   });

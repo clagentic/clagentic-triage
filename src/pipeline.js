@@ -19,13 +19,15 @@ import { enqueue, readAll } from './queue.js';
 import { dispatch } from './dispatchers/index.js';
 import { runHooks } from './hooks/index.js';
 import { recordTask } from './task_index.js';
+import { enforceSingleStatus } from './labels.js';
 
 // ---------------------------------------------------------------------------
-// Dispatch execution
+// Single-action execution (T7, lr-f0f2: extracted so classes[] can loop it)
 // ---------------------------------------------------------------------------
 
 /**
- * Execute the action described by an auto-approved Assessment via the adapter.
+ * Execute exactly one action class described by an auto-approved Assessment
+ * via the adapter.
  *
  * Dispatch map (per task spec):
  *   'respond'          → adapter.post_comment(config, event, body)
@@ -39,13 +41,13 @@ import { recordTask } from './task_index.js';
  * @param {object} event       - Normalized Event
  * @param {object} assessment  - Assessment from assessor
  * @param {object} adapter     - Source adapter
+ * @param {string} actionClass - Single action class to execute
  * @returns {Promise<{ action_taken: string | null, queue_reason: string | null, dispatch_results: Array|null }>}
  *   action_taken is the action class that was executed, or null if deferred to queue.
  *   queue_reason is set for 'dispatch' and 'escalate' classes.
  *   dispatch_results is set when the action class is 'dispatch' — per-dispatcher outcomes.
  */
-async function _executeAction(config, event, assessment, adapter) {
-  const actionClass = assessment.suggested_action.class;
+async function _executeSingleAction(config, event, assessment, adapter, actionClass) {
   const body = assessment.suggested_action.body ?? '';
 
   switch (actionClass) {
@@ -107,16 +109,87 @@ async function _executeAction(config, event, assessment, adapter) {
   }
 }
 
+/**
+ * Execute every action class named by an auto-approved Assessment, in order,
+ * via the adapter (T7, lr-f0f2 — multi-action verdicts).
+ *
+ * A single verdict may name more than one class (e.g. ['respond', 'dispatch'])
+ * so a comment, a status transition, and a link can be applied atomically for
+ * one triage decision. Classes execute serially in the order the LLM listed
+ * them — 'respond' before 'close' is the natural order for "comment then
+ * close," and the LLM is instructed (assessor.js) not to pad the list, so
+ * ordering is meaningful.
+ *
+ * 'dispatch' and 'escalate' both defer to the pending queue (no adapter call
+ * beyond dispatch()'s own dispatcher fan-out) — if either appears alongside
+ * an executable class (e.g. ['respond', 'dispatch']), the executable classes
+ * still run immediately and the item is additionally queued for the
+ * dispatch/escalate portion. The first queue_reason encountered wins if both
+ * 'dispatch' and 'escalate' are somehow both present (LLM should never emit
+ * both, but this is defensive rather than a hard failure).
+ *
+ * @param {object} config
+ * @param {object} event       - Normalized Event
+ * @param {object} assessment  - Assessment from assessor (suggested_action.classes[])
+ * @param {object} adapter     - Source adapter
+ * @returns {Promise<{ actions_taken: string[], queue_reason: string | null, dispatch_results: Array|null }>}
+ *   actions_taken lists every class that executed an adapter action immediately.
+ *   queue_reason is set if any class ('dispatch' or 'escalate') deferred to the queue.
+ *   dispatch_results is set when 'dispatch' was among the classes.
+ */
+// Exported for direct unit testing only (tests/pipeline.test.js) — the module's
+// public API surface for actual callers remains processEvent/runPipeline.
+// Node's built-in test runner has no stable import-mock hook (see the
+// hand-rolled shim this replaces for multi-action/label coverage), so testing
+// these two functions directly against a spy adapter is more reliable than
+// re-deriving their logic a second time in test-only code that can drift.
+export async function _executeAction(config, event, assessment, adapter) {
+  const suggestedAction = assessment.suggested_action ?? {};
+  const classes = Array.isArray(suggestedAction.classes)
+    ? suggestedAction.classes
+    : typeof suggestedAction.class === 'string'
+      ? [suggestedAction.class]
+      : [];
+
+  const actionsTaken = [];
+  let queueReason = null;
+  let dispatchResults = null;
+
+  for (const actionClass of classes) {
+    const result = await _executeSingleAction(config, event, assessment, adapter, actionClass);
+    if (result.action_taken !== null) {
+      actionsTaken.push(result.action_taken);
+    }
+    if (result.queue_reason !== null && queueReason === null) {
+      queueReason = result.queue_reason;
+    }
+    if (result.dispatch_results !== null) {
+      dispatchResults = result.dispatch_results;
+    }
+  }
+
+  return { actions_taken: actionsTaken, queue_reason: queueReason, dispatch_results: dispatchResults };
+}
+
 // ---------------------------------------------------------------------------
-// Label application
+// Label application (single-status invariant, T7 lr-f0f2 / T2 lr-a192)
 // ---------------------------------------------------------------------------
 
 /**
  * Apply labels to an event if the assessment includes labels and the relevant
- * label config is satisfied.
+ * label config is satisfied — enforcing the single-status invariant (exactly
+ * one status/* label present after any transition, DD-012/T2) along the way.
  *
  * Labels are applied on auto-approved items unconditionally.
  * Labels are applied on queued items only when config.auto_label is true.
+ *
+ * When the incoming labels include a status/* value, the item's live label
+ * set is fetched (adapter.get_item_labels) and any other status/* label
+ * currently present is removed (adapter.unlabel_item) BEFORE the new label is
+ * applied — never the reverse order, so the item is never observed carrying
+ * two status/* labels at once. Non-status labels (kind/*, priority/*, area/*)
+ * pass through unaffected; enforceSingleStatus (src/labels.js) never touches
+ * them.
  *
  * @param {object} config
  * @param {object} event
@@ -125,7 +198,7 @@ async function _executeAction(config, event, assessment, adapter) {
  * @param {'dispatched'|'queued'} resultStatus
  * @returns {Promise<void>}
  */
-async function _applyLabels(config, event, assessment, adapter, resultStatus) {
+export async function _applyLabels(config, event, assessment, adapter, resultStatus) {
   const labels = assessment.suggested_action?.labels;
   if (!Array.isArray(labels) || labels.length === 0) {
     return;
@@ -136,7 +209,15 @@ async function _applyLabels(config, event, assessment, adapter, resultStatus) {
     return;
   }
 
-  await adapter.label_item(config, event, labels);
+  const currentLabels = await adapter.get_item_labels(config, event);
+  const { toRemove, toApply } = enforceSingleStatus(config, currentLabels, labels);
+
+  for (const label of toRemove) {
+    await adapter.unlabel_item(config, event, label);
+  }
+  if (toApply.length > 0) {
+    await adapter.label_item(config, event, toApply);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +296,7 @@ export async function processEvent(config, event, adapter) {
         status: 'queued',
         assessment,
         action_taken: null,
+        actions_taken: [],
         queue_reason,
         dispatch_results: null,
         dispatched_at: null,
@@ -222,9 +304,9 @@ export async function processEvent(config, event, adapter) {
       };
     }
 
-    // Stage 4: Dispatch — execute the adapter action.
+    // Stage 4: Dispatch — execute the adapter action(s).
     // Pass enrichedEvent so dispatchers receive the full context block.
-    const { action_taken, queue_reason: deferredQueueReason, dispatch_results } = await _executeAction(
+    const { actions_taken, queue_reason: deferredQueueReason, dispatch_results } = await _executeAction(
       config,
       enrichedEvent,
       assessment,
@@ -232,10 +314,12 @@ export async function processEvent(config, event, adapter) {
     );
 
     // 'dispatch' and 'escalate' classes always land in the pending queue even
-    // when they are in auto_approve — _executeAction returns no action_taken.
-    // For 'dispatch', _executeAction already fired the dispatchers; the queue
-    // entry records the per-dispatcher outcomes via dispatch_results.
-    if (action_taken === null) {
+    // when they are in auto_approve. A multi-action verdict (T7, lr-f0f2) may
+    // execute one or more classes immediately (actions_taken non-empty) AND
+    // still carry a queue_reason from a 'dispatch'/'escalate' class in the
+    // same verdict — the item is queued in that case so the deferred portion
+    // is tracked, but the already-executed actions are not undone or re-run.
+    if (deferredQueueReason !== null) {
       try {
         await _applyLabels(config, event, assessment, adapter, 'queued');
       } catch (labelErr) {
@@ -252,7 +336,8 @@ export async function processEvent(config, event, adapter) {
         event_id: eventId,
         status: 'queued',
         assessment,
-        action_taken: null,
+        action_taken: actions_taken[0] ?? null,
+        actions_taken,
         queue_reason: deferredQueueReason,
         dispatch_results: dispatch_results ?? null,
         dispatched_at: null,
@@ -271,7 +356,10 @@ export async function processEvent(config, event, adapter) {
       event_id: eventId,
       status: 'dispatched',
       assessment,
-      action_taken,
+      // action_taken is retained for backward compat (first action executed);
+      // actions_taken is the full ordered list (T7, lr-f0f2).
+      action_taken: actions_taken[0] ?? null,
+      actions_taken,
       queue_reason: null,
       dispatch_results: null,
       dispatched_at: new Date().toISOString(),
@@ -284,6 +372,7 @@ export async function processEvent(config, event, adapter) {
       status: 'error',
       assessment: null,
       action_taken: null,
+      actions_taken: [],
       queue_reason: null,
       dispatch_results: null,
       dispatched_at: null,

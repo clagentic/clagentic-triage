@@ -12,7 +12,7 @@ import { join, dirname } from 'path';
 import { tmpdir } from 'os';
 import { randomBytes } from 'crypto';
 
-import { enqueue, readAll, listItems, resolveItem, QueueError } from '../src/queue.js';
+import { enqueue, readAll, listItems, resolveItem, getLifecycleState, QueueError } from '../src/queue.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -296,5 +296,60 @@ describe('readAll record validation', () => {
     const items = await readAll(config);
     assert.equal(items.length, 1, 'only the valid record should be returned');
     assert.equal(items[0].id, good.id);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getLifecycleState (T7, lr-f0f2) — derives state from live labels, not a
+// parallel store.
+// ---------------------------------------------------------------------------
+
+describe('getLifecycleState', () => {
+  function makeAdapter(labels) {
+    return {
+      get_item_labels: async () => labels,
+    };
+  }
+
+  test('returns the bare status/* value (namespace stripped) when present', async () => {
+    const adapter = makeAdapter(['status/in-progress', 'kind/bug']);
+    const result = await getLifecycleState({}, adapter, { repo: 'owner/repo', number: 1 });
+
+    assert.equal(result.status, 'in-progress');
+    assert.deepEqual(result.labels, ['status/in-progress', 'kind/bug']);
+  });
+
+  test('returns status: null when no status/* label is present (not an error)', async () => {
+    const adapter = makeAdapter(['kind/bug', 'priority/p1']);
+    const result = await getLifecycleState({}, adapter, { repo: 'owner/repo', number: 2 });
+
+    assert.equal(result.status, null);
+    assert.deepEqual(result.labels, ['kind/bug', 'priority/p1']);
+  });
+
+  test('reads live labels via adapter.get_item_labels — never a local store', async () => {
+    let called = false;
+    const adapter = {
+      get_item_labels: async (config, event) => {
+        called = true;
+        assert.equal(event.repo, 'owner/repo');
+        assert.equal(event.number, 7);
+        return ['status/awaiting-release'];
+      },
+    };
+
+    const result = await getLifecycleState({}, adapter, { repo: 'owner/repo', number: 7 });
+
+    assert.ok(called, 'get_item_labels should be called');
+    assert.equal(result.status, 'awaiting-release');
+  });
+
+  test('honors a config-driven renamed status namespace', async () => {
+    const adapter = makeAdapter(['lifecycle/done']);
+    const config = { labels: { status_namespace: 'lifecycle' } };
+
+    const result = await getLifecycleState(config, adapter, { repo: 'owner/repo', number: 3 });
+
+    assert.equal(result.status, 'done');
   });
 });

@@ -684,3 +684,114 @@ only ever applies `released`) — there is no code path that lets a merge apply 
 - **T8** (generic v*-tag release detector with true commit-range-to-PR association) — the
   release-body closing-keyword parse here is the interim, named-trade-off mechanism; T8 is the
   long-term fix for releases whose notes do not repeat each PR's closing keyword.
+
+---
+
+## DD-015: Multi-action verdicts (`suggested_action.classes[]`), single-status invariant enforced on every label-applying path, and lifecycle state derived live from labels
+
+**Decision:** `suggested_action.class` (a single string) becomes `suggested_action.classes`
+(an array of one or more action classes) so a single LLM verdict can, in one atomic step,
+comment on an item, transition its `status/*` label, and dispatch it to a backend — three
+actions that previously required three separate auto-approved verdicts (or three manual
+approvals) to land together. `src/pipeline.js`'s label-application path (`_applyLabels`,
+consumed by both the auto-approve and human-approval flows) now enforces the single-status
+invariant that T2 (lr-a192, `enforceSingleStatus`) built but explicitly deferred wiring into
+the pipeline: on any transition, the prior `status/*` label is removed (`adapter.unlabel_item`)
+before the new one is applied (`adapter.label_item`), so an item is never observed carrying two
+`status/*` labels. A new `getLifecycleState(config, adapter, event)` (`src/queue.js`) lets any
+caller (CLI `state` command, future callers) ask "what lifecycle state is this issue in right
+now?" — answered by reading the item's live labels, not a parallel store.
+
+**Rationale:**
+- **Why `classes[]` instead of a second `dispatch_action`/`label_action` field, or three
+  separate suggested-action objects.** A flat array of the existing action-class vocabulary is
+  the smallest change that removes the "one verdict, one action" ceiling: every existing
+  execution path (`pipeline.js`'s per-class switch, `cli.js`'s `approve` command) already
+  understands individual action classes: they just needed to loop instead of switch once. A
+  richer structure (e.g. per-class metadata objects) was considered and rejected as scope
+  creep — nothing in this task's acceptance criteria needs anything beyond "run these classes,
+  in this order."
+- **Backward compatibility is a named, deliberate trade-off, not an oversight.** `src/llm.js`'s
+  `_validatePayload` accepts either `suggested_action.classes` (array) or the legacy singular
+  `suggested_action.class` (string), normalizing the latter to a one-element array before
+  returning. `src/assessor.js`, `src/router.js`, `src/pipeline.js`, and `src/cli.js`'s
+  `cmdApprove` all apply the same normalization defensively. This exists because: (1) an
+  operator's `clagentic-router` deployment (a config-driven external runner, DD is silent on its
+  upgrade cadence) may not be redeployed in lockstep with triage's own release, and (2) items
+  already sitting in the pending queue (`.triage/pending.jsonl`) at upgrade time were serialized
+  under the old schema and must still be approvable after the upgrade. The LLM prompt schema
+  block (`assessor.js`) only asks for `classes[]` going forward — the singular shape is an
+  input-compatibility path, not a supported output target.
+- **`route()`'s auto-approve rule requires every named class to be individually trusted, not
+  just one of them (structural decision, not a trade-off).** A verdict naming
+  `['respond', 'close']` must not auto-dispatch just because `respond` is in
+  `config.auto_approve` while `close` is not — that would silently auto-execute a write action
+  the operator never opted into, breaking DD-001's per-action-class HITL contract. `route()`
+  therefore checks `actionClasses.every((c) => autoApprove.includes(c))`; if any single class in
+  the verdict is not trusted, the whole verdict queues for human review. This is conservative by
+  construction: a multi-action verdict is *harder* to auto-approve than a single-action one, in
+  keeping with DD-001's "the cost of a missed automation is low; the cost of a false action is
+  high."
+- **Classes execute serially, in the LLM's listed order — not merged, not parallelized, not
+  reordered.** `_executeAction` (`src/pipeline.js`) loops `suggested_action.classes` in order and
+  calls the existing per-class adapter action for each (`_executeSingleAction`, the same switch
+  the pre-T7 code had, factored out unchanged). "Respond, then close" is the natural order for
+  "leave an explanatory comment before closing"; the assessor prompt instructs the LLM not to pad
+  the list with classes that do not truly apply, so the emitted order carries real intent.
+  `'dispatch'` and `'escalate'` both defer their queue_reason exactly as before; if either
+  appears alongside an executable class, the executable classes still run immediately and the
+  item is additionally queued for the deferred portion — already-executed actions are never
+  undone or re-run.
+- **Single-status invariant: enforced in exactly one place (`_applyLabels`), not duplicated at
+  every call site.** `_applyLabels` already existed as the single label-application chokepoint
+  for both the auto-approve and queued/`auto_label` paths (pre-T7 code); T7 adds
+  `adapter.get_item_labels` (T2's live-label fetch) + `enforceSingleStatus` (T2's pure decision
+  function) + `adapter.unlabel_item` (T2's removal call) to that one function, exactly mirroring
+  the pattern `src/lifecycle.js`'s private `_applyStatusLabel` already established for the T6
+  merge/release transitions (`enforceSingleStatus` → remove stale `status/*` → apply new). T7
+  does not duplicate that pattern into a second helper; the pipeline's only label-application
+  path now uses the same invariant-enforcement shape as the lifecycle-transition path.
+  Non-status labels (`kind/*`, `priority/*`, `area/*`, unnamespaced `wontfix`/`duplicate`/
+  `invalid`) pass through `enforceSingleStatus` unaffected — only a `status/*` value in the
+  incoming label list triggers a removal.
+- **Lifecycle state is derived from live labels, never from a parallel local store — this is a
+  requirement from the task spec, not a preference.** A side-index (e.g. a JSON file keyed by
+  `repo#number` tracking "last known state") would drift the moment a human relabels an issue
+  directly on GitHub, via a GitHub Action, or through any path other than triage itself — the
+  exact failure mode a single-source-of-truth state machine exists to prevent. `getLifecycleState`
+  (`src/queue.js`) calls `adapter.get_item_labels` (the same T2 method `_applyLabels` already
+  calls) and resolves the vocabulary via `resolveVocabulary`/`isStatusLabel` (`src/labels.js`) —
+  no new adapter method, no new storage, no new reading path. A `status: null` result (no
+  `status/*` label present) is a valid, expected answer — an untouched or newly-opened issue has
+  no lifecycle state yet — not an error.
+
+**Config keys:** none new — `getLifecycleState` and the single-status enforcement in
+`_applyLabels` both resolve the vocabulary from the existing `config.labels` block (DD-012).
+
+**Implementation:**
+- `src/llm.js` — `_validatePayload` accepts `suggested_action.classes[]` or legacy
+  `suggested_action.class` (string), validates every entry against `VALID_ACTION_CLASSES`, and
+  normalizes onto `payload.suggested_action.classes` so every downstream caller sees the array
+  shape regardless of which shape the runner returned.
+- `src/assessor.js` — prompt schema block now asks for `suggested_action.classes[]`; the
+  `<rules>` block explains the array semantics and warns against padding it. `_degradedAssessment`
+  and the success-path Assessment builder both emit `classes` (defensively normalizing a legacy
+  `class` string if `assess()` is ever called on a payload that bypassed `callLlm`'s validation).
+- `src/router.js` — `route()` reads `suggested_action.classes` (or normalizes a legacy `class`),
+  requires every class to be in `config.auto_approve` to dispatch; any single untrusted class
+  forces the whole verdict to HITL.
+- `src/pipeline.js` — `_executeSingleAction` (the pre-T7 per-class switch, unchanged) is now
+  looped by `_executeAction` over `suggested_action.classes`, accumulating `actions_taken[]`,
+  a single `queue_reason` (first one seen), and `dispatch_results`. `_applyLabels` fetches live
+  labels and runs them through `enforceSingleStatus` before calling `unlabel_item`/`label_item`.
+  `processEvent`'s PipelineResult keeps `action_taken` (first action, backward-compatible) and
+  adds `actions_taken` (the full ordered list).
+- `src/cli.js` — `cmdApprove` loops `suggested_action.classes` the same way for manually-approved
+  queue items. New `cmdState`/`state` command reports an issue's lifecycle state via
+  `getLifecycleState`.
+- `src/queue.js` — new `getLifecycleState(config, adapter, event)`, returning
+  `{ status: string|null, labels: string[] }`.
+- `src/assessors/pre_filter.js`, `src/dispatchers/{webhook,noop,scaffold}.js`,
+  `src/hooks/console.js` — updated to read/construct `classes[]` instead of `class` (display/
+  logging/payload sites only; no behavioral branching on the value beyond formatting).
+- `docs/ARCHITECTURE.md` — Assessment schema updated to `suggested_action.classes[]`.

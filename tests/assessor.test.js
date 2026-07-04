@@ -103,7 +103,7 @@ function validLlmPayload(overrides = {}) {
     confidence: 0.9,
     reasoning: 'Clear bug report with reproduction steps.',
     suggested_action: {
-      class: 'approve',
+      classes: ['approve'],
       body: null,
       dispatch_target: null,
       labels: ['bug'],
@@ -257,7 +257,7 @@ describe('assess() — success', () => {
     assert.equal(result.confidence, 0.9);
     assert.ok(typeof result.reasoning === 'string', 'reasoning should be string');
     assert.ok(result.suggested_action, 'suggested_action should exist');
-    assert.equal(result.suggested_action.class, 'approve');
+    assert.deepEqual(result.suggested_action.classes, ['approve']);
     assert.deepEqual(result.suggested_action.labels, ['bug']);
     assert.ok(typeof result.model_used === 'string', 'model_used should be string');
     assert.ok(typeof result.assessed_at === 'string', 'assessed_at should be string');
@@ -306,7 +306,7 @@ describe('assess() — degraded paths', () => {
     assert.equal(result.verdict, 'escalate', 'degraded verdict should be escalate');
     assert.equal(result.confidence, 0, 'degraded confidence should be 0');
     assert.ok(result.reasoning.includes('parsed'), 'reasoning should mention parsing');
-    assert.equal(result.suggested_action.class, 'escalate');
+    assert.deepEqual(result.suggested_action.classes, ['escalate']);
   });
 
   it('returns degraded Assessment on timeout', async () => {
@@ -320,7 +320,7 @@ describe('assess() — degraded paths', () => {
     assert.equal(result.verdict, 'escalate');
     assert.equal(result.confidence, 0);
     assert.ok(result.reasoning.toLowerCase().includes('timed out'), 'reasoning should mention timeout');
-    assert.equal(result.suggested_action.class, 'escalate');
+    assert.deepEqual(result.suggested_action.classes, ['escalate']);
   });
 
   it('returns degraded Assessment on non-zero exit code', async () => {
@@ -331,7 +331,7 @@ describe('assess() — degraded paths', () => {
     assert.equal(result.verdict, 'escalate');
     assert.equal(result.confidence, 0);
     assert.ok(result.reasoning.length > 0, 'should have reasoning text');
-    assert.equal(result.suggested_action.class, 'escalate');
+    assert.deepEqual(result.suggested_action.classes, ['escalate']);
   });
 
   it('returns degraded Assessment when LLM response is missing required fields', async () => {
@@ -343,7 +343,7 @@ describe('assess() — degraded paths', () => {
 
     assert.equal(result.verdict, 'escalate');
     assert.equal(result.confidence, 0);
-    assert.equal(result.suggested_action.class, 'escalate');
+    assert.deepEqual(result.suggested_action.classes, ['escalate']);
   });
 
   // RT-007: strict schema validation — bad_response code paths
@@ -388,6 +388,65 @@ describe('assess() — degraded paths', () => {
 
     assert.equal(result.verdict, 'escalate', 'invalid action class → degraded escalate');
     assert.equal(result.confidence, 0);
+  });
+
+  // T7 (lr-f0f2): multi-action verdicts — suggested_action.classes[]
+  it('returns degraded Assessment when any entry in suggested_action.classes is invalid (RT-007)', async () => {
+    const bad = validLlmPayload({
+      suggested_action: { classes: ['respond', 'do_everything'], body: null, dispatch_target: null, labels: [] },
+    });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(bad), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent());
+
+    assert.equal(result.verdict, 'escalate', 'one invalid class in the array → degraded escalate');
+    assert.equal(result.confidence, 0);
+  });
+
+  it('returns degraded Assessment when suggested_action.classes is an empty array', async () => {
+    const bad = validLlmPayload({
+      suggested_action: { classes: [], body: null, dispatch_target: null, labels: [] },
+    });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(bad), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent());
+
+    assert.equal(result.verdict, 'escalate', 'empty classes array → degraded escalate');
+    assert.equal(result.confidence, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// assess() — multi-action verdicts (T7, lr-f0f2)
+// ---------------------------------------------------------------------------
+
+describe('assess() — multi-action verdicts (classes[])', () => {
+  it('returns every class from a multi-action suggested_action.classes payload', async () => {
+    const payload = validLlmPayload({
+      suggested_action: {
+        classes: ['respond', 'dispatch'],
+        body: 'Thanks, filing this now.',
+        dispatch_target: 'backend',
+        labels: ['status/accepted'],
+      },
+    });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(payload), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent());
+
+    assert.deepEqual(result.suggested_action.classes, ['respond', 'dispatch']);
+    assert.equal(result.suggested_action.body, 'Thanks, filing this now.');
+  });
+
+  it('normalizes a legacy singular suggested_action.class into a one-element classes array', async () => {
+    const payload = validLlmPayload({
+      suggested_action: { class: 'approve', body: null, dispatch_target: null, labels: [] },
+    });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(payload), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent());
+
+    assert.deepEqual(result.suggested_action.classes, ['approve']);
   });
 });
 
