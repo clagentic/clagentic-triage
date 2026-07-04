@@ -19,7 +19,7 @@ import { enqueue, readAll } from './queue.js';
 import { dispatch } from './dispatchers/index.js';
 import { runHooks } from './hooks/index.js';
 import { recordTask } from './task_index.js';
-import { enforceSingleStatus } from './labels.js';
+import { enforceSingleStatus, resolveVocabulary, isStatusLabel } from './labels.js';
 
 // ---------------------------------------------------------------------------
 // Single-action execution (T7, lr-f0f2: extracted so classes[] can loop it)
@@ -176,12 +176,75 @@ export async function _executeAction(config, event, assessment, adapter) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Split a namespaced label into its axis name (the part before "/"), or null
+ * for an unnamespaced label (e.g. a not_planned closure label).
+ *
+ * @param {string} label
+ * @returns {string|null}
+ */
+function _axisOf(label) {
+  const idx = label.indexOf('/');
+  return idx === -1 ? null : label.slice(0, idx);
+}
+
+/**
+ * Filter intake-suggestion labels (kind/*, priority/*, area/*, and any other
+ * orthogonal axis — never status/*) down to only those axes the operator has
+ * explicitly trusted via `config.label_auto_approve` (T10, lr-9e35).
+ *
+ * This is a per-axis trust gate, separate from and in addition to the
+ * existing `resultStatus`/`config.auto_label` gate below: an operator may
+ * trust `kind` suggestions (low blast radius — a wrong kind label is
+ * cosmetic) while still holding `area` or `priority` suggestions for human
+ * review. Per DD-001's posture, an axis absent from `label_auto_approve`
+ * (the default: empty) is never auto-applied — the intake suggestion still
+ * reaches the assessment/queue record for a human to apply manually via
+ * `clagentic-triage review`/`approve`.
+ *
+ * status/* labels are exempt from this gate — they are not intake
+ * suggestions, and their own trust boundary is the existing dispatched/
+ * queued+auto_label gate in `_applyLabels`, unchanged by this filter.
+ *
+ * @param {object} config
+ * @param {string[]} labels
+ * @returns {string[]} labels whose axis is trusted, plus every status/* label
+ *   (status labels are never filtered here)
+ */
+function _filterTrustedAxisLabels(config, labels) {
+  const vocabulary = resolveVocabulary(config);
+  const trustedAxes = Array.isArray(config.label_auto_approve) ? config.label_auto_approve : [];
+
+  return labels.filter((label) => {
+    if (isStatusLabel(label, vocabulary)) {
+      return true; // status/* is gated elsewhere, not here.
+    }
+    const axis = _axisOf(label);
+    if (axis === null) {
+      // Unnamespaced label (e.g. a not_planned closure label like "wontfix") —
+      // treated as always-trusted, matching pre-T10 behavior for these labels.
+      return true;
+    }
+    return trustedAxes.includes(axis);
+  });
+}
+
+/**
  * Apply labels to an event if the assessment includes labels and the relevant
  * label config is satisfied — enforcing the single-status invariant (exactly
  * one status/* label present after any transition, DD-012/T2) along the way.
  *
  * Labels are applied on auto-approved items unconditionally.
  * Labels are applied on queued items only when config.auto_label is true.
+ *
+ * Independent of the above (T10, lr-9e35): non-status intake-suggestion
+ * labels (kind/*, priority/*, area/*) are further filtered down to only the
+ * axes the operator has trusted via `config.label_auto_approve` — see
+ * `_filterTrustedAxisLabels`. This applies to BOTH the dispatched and
+ * auto_label-gated-queued paths; an untrusted axis is never auto-applied
+ * regardless of the item's dispatch status, matching the task's explicit
+ * "HITL until trusted per class" requirement. The full, untrusted label set
+ * remains visible in `assessment.suggested_action.labels` on the queue
+ * record for a human to apply manually.
  *
  * When the incoming labels include a status/* value, the item's live label
  * set is fetched (adapter.get_item_labels) and any other status/* label
@@ -199,13 +262,18 @@ export async function _executeAction(config, event, assessment, adapter) {
  * @returns {Promise<void>}
  */
 export async function _applyLabels(config, event, assessment, adapter, resultStatus) {
-  const labels = assessment.suggested_action?.labels;
-  if (!Array.isArray(labels) || labels.length === 0) {
+  const suggestedLabels = assessment.suggested_action?.labels;
+  if (!Array.isArray(suggestedLabels) || suggestedLabels.length === 0) {
     return;
   }
 
   // For queued items, only label if auto_label is explicitly enabled.
   if (resultStatus === 'queued' && !config.auto_label) {
+    return;
+  }
+
+  const labels = _filterTrustedAxisLabels(config, suggestedLabels);
+  if (labels.length === 0) {
     return;
   }
 

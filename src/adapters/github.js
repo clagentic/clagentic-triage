@@ -362,9 +362,16 @@ function _actorOf(raw) {
  *   (webhook callers read it from `payload.repository.default_branch`; poll callers
  *   pass it from `get_default_branch`). Carried in metadata so callers can detect
  *   "merged to default branch" without a second lookup. null when not resolved.
+ * @param {string|null} [webhookAction] - The webhook payload's top-level `action`
+ *   field (e.g. 'opened', 'ready_for_review', 'closed'), when this Event was built
+ *   from a webhook delivery (T10, lr-9e35). Poll-path callers pass null — REST
+ *   list items carry no equivalent "what just happened" signal, only current
+ *   state. Carried in metadata so lifecycle transitions that key off a specific
+ *   webhook action (as opposed to current PR state) can read it without a second
+ *   payload plumb-through.
  * @returns {object}    - Normalized Event
  */
-function _normalize(raw, repo, forceType = null, defaultBranch = null) {
+function _normalize(raw, repo, forceType = null, defaultBranch = null, webhookAction = null) {
   const isPr = forceType !== null ? forceType === 'pr' : Boolean(raw.pull_request);
   const type = isPr ? 'pr' : 'issue';
 
@@ -384,6 +391,7 @@ function _normalize(raw, repo, forceType = null, defaultBranch = null) {
       labels: (raw.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name)),
       author_association: raw.author_association ?? null,
       state: raw.state ?? '',
+      updated_at: raw.updated_at ?? '',
       draft: isPr ? Boolean(raw.draft) : false,
       // Three possible shapes for "is this PR merged": the issues-list endpoint
       // nests it under raw.pull_request.merged_at; the webhook PR payload and
@@ -394,6 +402,7 @@ function _normalize(raw, repo, forceType = null, defaultBranch = null) {
       head_ref: isPr ? (raw.head?.ref ?? '') : '',
       base_ref: isPr ? (raw.base?.ref ?? '') : '',
       default_branch: defaultBranch,
+      webhook_action: webhookAction,
     },
   };
 }
@@ -883,6 +892,59 @@ export async function list_merged_prs(config, repo, since) {
 }
 
 // ---------------------------------------------------------------------------
+// list_open_prs (T10, lr-9e35)
+// ---------------------------------------------------------------------------
+
+/**
+ * List open (unmerged) PRs for a repo — poll-path equivalent of the
+ * `pull_request` webhook's `opened`/`ready_for_review` signals.
+ *
+ * The main poll path (`list_events`) already fetches open PRs via the
+ * issues-list endpoint, but routes every result through the LLM-assessment
+ * pipeline (`processEvent`) — appropriate for triaging a *new* issue/PR, but
+ * wrong for the deterministic in-progress/in-review transitions, which must
+ * never reach the assessor (same rule `list_merged_prs`/`list_releases`
+ * follow). This is a dedicated pulls-list fetch, mirroring `list_merged_prs`'s
+ * shape (`state=open` in place of `state=closed` + merged_at filter), so the
+ * lifecycle poll cycle can source open PRs without repurposing/duplicating
+ * `list_events`'s own filtering (bot/actor/cap logic that has no bearing on a
+ * deterministic state transition).
+ *
+ * @param {object} config
+ * @param {string} repo - "owner/repo"
+ * @returns {Promise<object[]>} Normalized PR Events (type='pr'), metadata.merged=false
+ */
+export async function list_open_prs(config, repo) {
+  const token = await _resolve_token(config);
+  if (!token) {
+    console.warn('[github adapter] no GitHub token configured; returning empty list');
+    return [];
+  }
+
+  const url = `${GITHUB_API}/repos/${repo}/pulls?state=open&sort=updated&direction=desc&per_page=100`;
+
+  let result;
+  try {
+    result = await _fetchPaginated(url, token, null);
+  } catch (err) {
+    if (err instanceof AdapterError && err.code === 'auth_failure') {
+      console.warn(`[github adapter] auth failure listing open PRs for ${repo}: ${err.message}`);
+      return [];
+    }
+    throw err;
+  }
+
+  if (result.status !== 200) {
+    console.warn(
+      `[github adapter] non-2xx (${result.status}) listing open PRs for ${repo}; returning empty`,
+    );
+    return [];
+  }
+
+  return result.items.map((raw) => _normalize(raw, repo, 'pr', null));
+}
+
+// ---------------------------------------------------------------------------
 // list_releases (T6, lr-d557)
 // ---------------------------------------------------------------------------
 
@@ -936,38 +998,44 @@ export async function list_releases(config, repo) {
 // ---------------------------------------------------------------------------
 
 /**
- * Poll-path entry point for the two lifecycle-transition signals: merged PRs
- * and published releases, across every repo `config.source` resolves to.
+ * Poll-path entry point for the three lifecycle-transition signals: merged
+ * PRs, published releases, and open PRs (T10, lr-9e35 — in-progress/in-review
+ * auto-transitions), across every repo `config.source` resolves to.
  *
  * Kept as a single function (rather than requiring the CLI poll loop to call
- * `list_merged_prs`/`list_releases` per-repo itself) so the repo-scoping logic
- * (`_resolveRepos` — org-wildcard expansion vs an explicit repo list) is
- * exercised in exactly one place, matching `list_events`'s existing contract.
+ * `list_merged_prs`/`list_releases`/`list_open_prs` per-repo itself) so the
+ * repo-scoping logic (`_resolveRepos` — org-wildcard expansion vs an explicit
+ * repo list) is exercised in exactly one place, matching `list_events`'s
+ * existing contract.
  *
  * Does not apply the `since` timestamp for releases (`list_releases` has no
  * `since` parameter — GitHub's releases-list endpoint is small enough per repo
  * that `applyReleaseTransition`'s idempotent close/label calls make repeated
  * processing of already-released issues a no-op) but does pass it through to
- * `list_merged_prs`.
+ * `list_merged_prs`. `list_open_prs` also has no `since` parameter — every
+ * still-open PR is re-observed each poll cycle, which is safe because
+ * `applyPrOpenedTransition`/`applyPrReadyForReviewTransition` are idempotent
+ * (T10, lr-9e35).
  *
  * @param {object} config
  * @param {string} [since] - ISO 8601 timestamp, passed through to list_merged_prs
- * @returns {Promise<{ mergedPrs: object[], releases: object[] }>}
+ * @returns {Promise<{ mergedPrs: object[], releases: object[], openPrs: object[] }>}
  */
 export async function list_lifecycle_events(config, since) {
   const token = await _resolve_token(config);
   if (!token) {
     console.warn('[github adapter] no GitHub token configured; returning empty lifecycle lists');
-    return { mergedPrs: [], releases: [] };
+    return { mergedPrs: [], releases: [], openPrs: [] };
   }
 
   const repos = await _resolveRepos(config, token);
   if (repos === null) {
-    return { mergedPrs: [], releases: [] };
+    return { mergedPrs: [], releases: [], openPrs: [] };
   }
 
   const mergedPrs = [];
   const releases = [];
+  const openPrs = [];
 
   for (const repo of repos) {
     try {
@@ -983,9 +1051,76 @@ export async function list_lifecycle_events(config, since) {
     } catch (err) {
       console.warn(`[github adapter] error listing releases for ${repo}: ${err.message}`);
     }
+
+    try {
+      const open = await list_open_prs(config, repo);
+      openPrs.push(...open);
+    } catch (err) {
+      console.warn(`[github adapter] error listing open PRs for ${repo}: ${err.message}`);
+    }
   }
 
-  return { mergedPrs, releases };
+  return { mergedPrs, releases, openPrs };
+}
+
+// ---------------------------------------------------------------------------
+// list_issues_by_label (T10, lr-9e35)
+// ---------------------------------------------------------------------------
+
+/**
+ * List open issues carrying a specific label, across every repo
+ * `config.source` resolves to.
+ *
+ * Used by the stale needs-info auto-close sweep (src/stale.js) to find every
+ * issue currently in the `status/needs-info` state without repurposing
+ * `list_events`'s bot/actor-association/cap filtering — a deterministic
+ * idle-close sweep must see every open needs-info issue regardless of who
+ * commented on it last, unlike ordinary intake triage. GitHub's issues-list
+ * endpoint accepts a `labels` query param natively (server-side AND filter for
+ * comma-separated values; a single label here means server-side exact match).
+ *
+ * @param {object} config
+ * @param {string} label - fully-namespaced label to filter by (e.g. "status/needs-info")
+ * @returns {Promise<object[]>} Normalized Events (type='issue'), metadata.updated_at populated
+ */
+export async function list_issues_by_label(config, label) {
+  const token = await _resolve_token(config);
+  if (!token) {
+    console.warn('[github adapter] no GitHub token configured; returning empty list');
+    return [];
+  }
+
+  const repos = await _resolveRepos(config, token);
+  if (repos === null) {
+    return [];
+  }
+
+  const issues = [];
+  for (const repo of repos) {
+    const url = `${GITHUB_API}/repos/${repo}/issues?state=open&labels=${encodeURIComponent(label)}&per_page=100`;
+    try {
+      const result = await _fetchPaginated(url, token, null);
+      if (result.status !== 200) {
+        console.warn(
+          `[github adapter] non-2xx (${result.status}) listing "${label}" issues for ${repo}; returning empty`,
+        );
+        continue;
+      }
+      // The issues-list endpoint also returns PRs with the given label; filter
+      // them out here since the stale-close sweep is issue-only (a PR's own
+      // lifecycle is driven by the PR-event transitions, not needs-info).
+      for (const raw of result.items) {
+        if (raw.pull_request) {
+          continue;
+        }
+        issues.push(_normalize(raw, repo, 'issue'));
+      }
+    } catch (err) {
+      console.warn(`[github adapter] error listing "${label}" issues for ${repo}: ${err.message}`);
+    }
+  }
+
+  return issues;
 }
 
 // ---------------------------------------------------------------------------
@@ -1371,8 +1506,12 @@ export function normalize_webhook(headers, payload) {
     // lr-d557) can detect "merged to default branch" without a second API call —
     // the webhook payload already has it; the poll path resolves it separately
     // via get_default_branch since the REST issues-list endpoint does not include it.
+    // payload.action ('opened', 'ready_for_review', 'closed', ...) is carried
+    // through as metadata.webhook_action (T10, lr-9e35) so the auto-transition
+    // layer (src/lifecycle.js) can key off the specific event that fired, not
+    // just the PR's current state.
     const defaultBranch = payload.repository?.default_branch ?? null;
-    return _normalize(payload.pull_request ?? {}, repo, 'pr', defaultBranch);
+    return _normalize(payload.pull_request ?? {}, repo, 'pr', defaultBranch, payload.action ?? null);
   }
 
   if (eventType === 'issue_comment') {

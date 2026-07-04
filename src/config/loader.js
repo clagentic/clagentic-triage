@@ -168,6 +168,27 @@ function defaults() {
         area: [],
       },
     },
+    // T10 (lr-9e35): per-axis trust for intake kind/priority/area suggestions.
+    // HITL by default (empty list, DD-001 posture) — an axis is only
+    // auto-applied once the operator explicitly lists it here, independent of
+    // config.auto_label/auto_approve (those gate action classes and the
+    // status axis; this gates the orthogonal kind/priority/area axes only).
+    // See src/pipeline.js's _filterTrustedAxisLabels.
+    label_auto_approve: [],
+    // T10 (lr-9e35): needs-info idle auto-close, modeled on actions/stale's
+    // defaults (60 days idle before a warning comment, 7 more days before
+    // close). See src/stale.js.
+    stale: {
+      enabled: false,
+      needs_info_days: 60,
+      close_after_days: 7,
+      exempt_labels: [],
+      stale_comment_template:
+        'This issue has had no activity for {days} days while marked needs-info. ' +
+        'It will be closed in {close_after_days} days if no update is provided.',
+      close_comment_template:
+        'Closing due to inactivity — no update was provided after the needs-info notice.',
+    },
   };
 }
 
@@ -428,6 +449,43 @@ function configFromEnv(env) {
     out.pre_filter.confidence_threshold = parsed;
   }
 
+  // T10 (lr-9e35): needs-info idle auto-close.
+  if (env.CLAGENTIC_TRIAGE_STALE_ENABLED !== undefined) {
+    out.stale = out.stale || {};
+    out.stale.enabled = parseBoolEnv('CLAGENTIC_TRIAGE_STALE_ENABLED', env.CLAGENTIC_TRIAGE_STALE_ENABLED);
+  }
+
+  if (env.CLAGENTIC_TRIAGE_STALE_NEEDS_INFO_DAYS !== undefined) {
+    const parsed = parseInt(env.CLAGENTIC_TRIAGE_STALE_NEEDS_INFO_DAYS, 10);
+    if (isNaN(parsed)) {
+      throw new ConfigError(
+        `CLAGENTIC_TRIAGE_STALE_NEEDS_INFO_DAYS must be an integer, got: ${env.CLAGENTIC_TRIAGE_STALE_NEEDS_INFO_DAYS}`,
+      );
+    }
+    out.stale = out.stale || {};
+    out.stale.needs_info_days = parsed;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_STALE_CLOSE_AFTER_DAYS !== undefined) {
+    const parsed = parseInt(env.CLAGENTIC_TRIAGE_STALE_CLOSE_AFTER_DAYS, 10);
+    if (isNaN(parsed)) {
+      throw new ConfigError(
+        `CLAGENTIC_TRIAGE_STALE_CLOSE_AFTER_DAYS must be an integer, got: ${env.CLAGENTIC_TRIAGE_STALE_CLOSE_AFTER_DAYS}`,
+      );
+    }
+    out.stale = out.stale || {};
+    out.stale.close_after_days = parsed;
+  }
+
+  if (env.CLAGENTIC_TRIAGE_STALE_EXEMPT_LABELS !== undefined) {
+    out.stale = out.stale || {};
+    out.stale.exempt_labels = splitCsv(env.CLAGENTIC_TRIAGE_STALE_EXEMPT_LABELS);
+  }
+
+  if (env.CLAGENTIC_TRIAGE_LABEL_AUTO_APPROVE !== undefined) {
+    out.label_auto_approve = splitCsv(env.CLAGENTIC_TRIAGE_LABEL_AUTO_APPROVE);
+  }
+
   return out;
 }
 
@@ -651,6 +709,48 @@ function validate(cfg) {
     if (overlap.length > 0) {
       throw new ConfigError(
         `labels.status_values and labels.not_planned_values must be disjoint. Overlapping value(s): ${overlap.join(', ')}`,
+      );
+    }
+  }
+
+  // T10 (lr-9e35): label_auto_approve entries must be known, non-status axes.
+  if (!Array.isArray(cfg.label_auto_approve) || cfg.label_auto_approve.some((v) => typeof v !== 'string')) {
+    throw new ConfigError(
+      `label_auto_approve must be an array of strings. Got: ${JSON.stringify(cfg.label_auto_approve)}`,
+    );
+  }
+  if (lbl !== undefined && lbl !== null) {
+    const knownAxes = new Set(Object.keys(lbl.axes ?? {}));
+    for (const axis of cfg.label_auto_approve) {
+      if (axis === lbl.status_namespace) {
+        throw new ConfigError(
+          `label_auto_approve contains "${axis}", which is the status namespace — status/* trust is ` +
+          'governed by auto_approve/auto_label, not label_auto_approve.',
+        );
+      }
+      if (!knownAxes.has(axis)) {
+        throw new ConfigError(
+          `label_auto_approve contains unknown axis "${axis}". Known axes: ${[...knownAxes].join(', ') || '(none configured)'}`,
+        );
+      }
+    }
+  }
+
+  // T10 (lr-9e35): needs-info idle auto-close thresholds.
+  const stale = cfg.stale;
+  if (stale !== undefined && stale !== null) {
+    if (typeof stale.enabled !== 'boolean') {
+      throw new ConfigError(`stale.enabled must be a boolean. Got: ${JSON.stringify(stale.enabled)}`);
+    }
+    for (const field of ['needs_info_days', 'close_after_days']) {
+      const value = stale[field];
+      if (!Number.isInteger(value) || value <= 0) {
+        throw new ConfigError(`stale.${field} must be a positive integer. Got: ${JSON.stringify(value)}`);
+      }
+    }
+    if (!Array.isArray(stale.exempt_labels) || stale.exempt_labels.some((v) => typeof v !== 'string')) {
+      throw new ConfigError(
+        `stale.exempt_labels must be an array of strings. Got: ${JSON.stringify(stale.exempt_labels)}`,
       );
     }
   }

@@ -1,21 +1,26 @@
 /**
- * Issue-lifecycle transitions driven by PR-merge and release/tag events (T6, lr-d557).
+ * Issue-lifecycle transitions driven by PR-merge, release/tag, and PR-open/
+ * ready-for-review events (T6 lr-d557, T10 lr-9e35).
  *
  * These transitions are deterministic label/close operations, not LLM assessments —
- * a merged PR or a published release is a fact, not something to triage. This module
- * therefore never imports enrich/assess (src/enricher.js, src/assessor.js); callers
- * (src/cli.js) branch on `event.type` before the pipeline so `pull_request`-merge and
- * `release` events never reach the LLM-assessment path (docs/ADAPTERS.md, DD-013 for
- * the analogous release_notify.js precedent).
+ * a merged PR, a published release, an opened PR, or a PR leaving draft state are
+ * all facts, not something to triage. This module therefore never imports
+ * enrich/assess (src/enricher.js, src/assessor.js); callers (src/cli.js) branch on
+ * `event.type` before the pipeline so these events never reach the LLM-assessment
+ * path (docs/ADAPTERS.md, DD-013 for the analogous release_notify.js precedent).
  *
- * Two transitions, kept in one module because they share the same closing-issue
+ * Four transitions, kept in one module because they share the same closing-issue
  * resolution and single-status-invariant machinery, and because the #1 rule for
- * released tools is that they must never be conflated:
+ * released tools is that the release pair must never be conflated:
  *
- *   applyMergeTransition   — PR merged to the repo's default branch
- *                             -> status/awaiting-release on each linked issue.
- *   applyReleaseTransition — release/tag published
- *                             -> released on each linked issue (+ close if open).
+ *   applyMergeTransition       — PR merged to the repo's default branch
+ *                                 -> status/awaiting-release on each linked issue.
+ *   applyReleaseTransition     — release/tag published
+ *                                 -> released on each linked issue (+ close if open).
+ *   applyPrOpenedTransition    — PR opened, linking one or more issues
+ *                                 -> status/in-progress on each linked issue.
+ *   applyPrReadyForReviewTransition — draft PR marked ready for review
+ *                                 -> status/in-review on each linked issue.
  *
  * awaiting-release != released: a merge-close must NOT masquerade as shipped. Only a
  * published release/tag may apply the terminal `released` label; merge only ever
@@ -27,6 +32,12 @@ import { parse_closing_keyword_refs, is_repo_in_watch_scope } from './adapters/g
 
 /** The status/* value applied when a PR merges to the default branch. */
 const AWAITING_RELEASE_STATUS_VALUE = 'awaiting-release';
+
+/** The status/* value applied when a PR opens, linking an issue (T10, lr-9e35). */
+const IN_PROGRESS_STATUS_VALUE = 'in-progress';
+
+/** The status/* value applied when a linked PR leaves draft state (T10, lr-9e35). */
+const IN_REVIEW_STATUS_VALUE = 'in-review';
 
 /** The status/* value applied when a release/tag is published. */
 const RELEASED_STATUS_VALUE = 'released';
@@ -135,6 +146,142 @@ export async function applyMergeTransition(config, adapter, prEvent) {
   }
 
   return { applied: true, issues };
+}
+
+// ---------------------------------------------------------------------------
+// PR-opened / ready-for-review transitions (T10, lr-9e35)
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared implementation for the two "PR is open and linked to an issue"
+ * transitions (`applyPrOpenedTransition` -> in-progress, draft PRs;
+ * `applyPrReadyForReviewTransition` -> in-review, non-draft PRs). Mutually
+ * exclusive by construction: GitHub's own draft flag is the boundary between
+ * them, mirroring the real `opened`/`ready_for_review` webhook pair (a PR
+ * opened directly as non-draft goes straight to in-review; a draft PR that
+ * later leaves draft state fires `ready_for_review`). This is also what makes
+ * the poll path (which never sees a webhook `action`) safe to call
+ * unconditionally on every open, unmerged PR each cycle: exactly one of the
+ * two transitions is eligible for a given PR's current draft state, so there
+ * is no double-apply race between them regardless of ingress path.
+ *
+ * Idempotent per issue via `_applyStatusLabel` (no-op if the target status is
+ * already applied), and guarded against regressing an issue that has already
+ * advanced past the target status (e.g. a stale poll re-observing an old,
+ * already-in-review PR must never revert an issue's status back to
+ * in-progress, and neither transition may revert `awaiting-release`/`released`).
+ *
+ * @param {object} config
+ * @param {object} adapter
+ * @param {object} prEvent      - Normalized Event (type='pr')
+ * @param {string} statusValue  - bare status value to apply (e.g. 'in-progress')
+ * @param {string[]} laterValues - bare status values that must never be regressed
+ * @returns {Promise<{ applied: boolean, issues: {repo:string, number:number, labeled:boolean}[] }>}
+ */
+async function _applyLinkedIssueStatus(config, adapter, prEvent, statusValue, laterValues) {
+  const { closingIssues } = await adapter.get_pr_closing_issues(config, prEvent);
+  if (closingIssues.length === 0) {
+    return { applied: false, issues: [] };
+  }
+
+  const statusLabel = _statusLabel(config, statusValue);
+  const laterStatuses = new Set(laterValues.map((v) => _statusLabel(config, v)));
+
+  const issues = [];
+  let anyLabeled = false;
+
+  for (const closing of closingIssues) {
+    const targetRepo = `${closing.owner}/${closing.repo}`;
+    const targetEvent = { repo: targetRepo, number: closing.number, url: closing.url };
+
+    const currentLabels = await adapter.get_item_labels(config, targetEvent);
+    if (currentLabels.some((l) => laterStatuses.has(l))) {
+      issues.push({ repo: targetRepo, number: closing.number, labeled: false });
+      continue;
+    }
+
+    const labeled = await _applyStatusLabel(config, adapter, targetEvent, statusLabel);
+    anyLabeled = anyLabeled || labeled;
+    issues.push({ repo: targetRepo, number: closing.number, labeled });
+  }
+
+  return { applied: anyLabeled, issues };
+}
+
+/**
+ * Apply the `in-progress` transition to every issue an open, draft, unmerged
+ * PR closes.
+ *
+ * Resolves the closing-issue set via `adapter.get_pr_closing_issues` (T5,
+ * lr-6857 — GraphQL `closingIssuesReferences`), the same authoritative source
+ * `applyMergeTransition` uses. A PR with no linked issue is a no-op — omit the
+ * trailer, no signal, no state change (same "don't fail closed on absence"
+ * rule the plan applies to the merge/release paths).
+ *
+ * Only fires for a **draft** PR — a non-draft PR (opened ready for review, or
+ * a draft that has since left draft state) is `applyPrReadyForReviewTransition`'s
+ * responsibility instead, keeping the two transitions mutually exclusive by
+ * construction (see `_applyLinkedIssueStatus`'s docblock).
+ *
+ * @param {object} config
+ * @param {object} adapter - source adapter (must implement get_pr_closing_issues,
+ *   get_item_labels, label_item, unlabel_item)
+ * @param {object} prEvent - Normalized Event (type='pr')
+ * @returns {Promise<{ applied: boolean, issues: {repo:string, number:number, labeled:boolean}[] }>}
+ */
+export async function applyPrOpenedTransition(config, adapter, prEvent) {
+  if (prEvent?.type !== 'pr') {
+    return { applied: false, issues: [] };
+  }
+  const meta = prEvent.metadata ?? {};
+  if (meta.merged || !meta.draft) {
+    return { applied: false, issues: [] };
+  }
+
+  return _applyLinkedIssueStatus(config, adapter, prEvent, IN_PROGRESS_STATUS_VALUE, [
+    IN_REVIEW_STATUS_VALUE,
+    AWAITING_RELEASE_STATUS_VALUE,
+    'released',
+  ]);
+}
+
+/**
+ * Apply the `in-review` transition to every issue a non-draft, unmerged,
+ * linked PR closes.
+ *
+ * Webhook delivery fires this on the exact `ready_for_review` action, or on
+ * `opened` when a PR is created directly as non-draft (no separate
+ * `ready_for_review` event fires in that case — GitHub only sends it when a
+ * PR *transitions* out of draft, so a PR that was never a draft must reach
+ * `in-review` via its `opened` delivery instead). Poll-path callers have no
+ * such edge signal at all — this function is safe to call unconditionally on
+ * any open, non-draft, unmerged PR because `_applyLinkedIssueStatus` is
+ * idempotent and mutually exclusive with `applyPrOpenedTransition` by draft
+ * state.
+ *
+ * A draft PR is excluded — draft status means work has not yet reached
+ * review; `applyPrOpenedTransition` owns that case. A merged PR is handled
+ * entirely by `applyMergeTransition`.
+ *
+ * @param {object} config
+ * @param {object} adapter - source adapter (must implement get_pr_closing_issues,
+ *   get_item_labels, label_item, unlabel_item)
+ * @param {object} prEvent - Normalized Event (type='pr')
+ * @returns {Promise<{ applied: boolean, issues: {repo:string, number:number, labeled:boolean}[] }>}
+ */
+export async function applyPrReadyForReviewTransition(config, adapter, prEvent) {
+  if (prEvent?.type !== 'pr') {
+    return { applied: false, issues: [] };
+  }
+  const meta = prEvent.metadata ?? {};
+  if (meta.merged || meta.draft) {
+    return { applied: false, issues: [] };
+  }
+
+  return _applyLinkedIssueStatus(config, adapter, prEvent, IN_REVIEW_STATUS_VALUE, [
+    AWAITING_RELEASE_STATUS_VALUE,
+    'released',
+  ]);
 }
 
 // ---------------------------------------------------------------------------

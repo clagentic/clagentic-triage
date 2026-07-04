@@ -181,6 +181,26 @@ scoped and are not subject to this check.
 Default: `false`. When `true`, labels suggested by the LLM are applied to
 queued items immediately (without waiting for human approval of the full action).
 
+### `label_auto_approve` (T10, lr-9e35)
+
+Default: `[]` (fully HITL, DD-001 posture). Per-axis trust for intake
+`kind/*`/`priority/*`/`area/*` suggestions, separate from `auto_approve`
+(which gates action classes) and from the `status/*` axis (governed by
+`auto_approve`/`auto_label` as before). List the axis names you trust:
+
+```json
+{ "label_auto_approve": ["kind"] }
+```
+
+This trusts `kind/*` suggestions (e.g. `kind/bug`, `kind/feature`) to be
+applied automatically — on both auto-approved and `auto_label`-queued
+items — while `priority/*` and `area/*` suggestions still require a human to
+apply them via `clagentic-triage review`/`approve`. An axis not listed here is
+never auto-applied, regardless of `auto_label`. Each entry must be a known
+axis name from `labels.axes` (see below); the status namespace itself is
+rejected here — its trust is governed by `auto_approve`/`auto_label`, not this
+key.
+
 ### `pre_filter`
 
 Optional tier-1 cheap LLM pass that classifies events as noise or real before
@@ -410,6 +430,59 @@ is acknowledged with `200 { status: "unknown_task_id" }` rather than an error.
 Repeated calls for the same `(task_id, version)` are idempotent — the comment is not
 re-posted and the `released` label is not re-applied.
 
+## Auto-transitions off PR events (T10, lr-9e35)
+
+When a PR is opened linking an issue via a closing keyword (`Closes #NN`), or a
+linked draft PR is marked ready for review, clagentic:triage automatically
+transitions the linked issue's `status/*` label — the same deterministic,
+non-LLM-assessed pattern the PR-merge/release transitions use
+(`docs/DESIGN-DECISIONS.md`, T6). No config flag gates this — it activates
+whenever the PR-merge/release lifecycle poll already applies (i.e. whenever
+the adapter implements `list_lifecycle_events`).
+
+| PR state | Linked issue transition |
+|---|---|
+| Opened, still a draft | `status/in-progress` |
+| Opened directly as non-draft, or a draft PR marked ready for review | `status/in-review` |
+| Merged to the default branch | `status/awaiting-release` (existing, T6) |
+
+Both transitions never regress an issue that has already advanced past their
+target status (e.g. a stale poll re-observing an old PR never reverts
+`status/awaiting-release` back to `status/in-progress`).
+
+## Stale needs-info auto-close (T10, lr-9e35)
+
+Modeled on [`actions/stale`](https://github.com/actions/stale)'s own defaults:
+an issue marked `status/needs-info` gets a warning comment after N idle days,
+then closes after M further idle days with no response. Disabled by default.
+
+```json
+{
+  "stale": {
+    "enabled": true,
+    "needs_info_days": 60,
+    "close_after_days": 7,
+    "exempt_labels": ["pinned"],
+    "stale_comment_template": "This issue has had no activity for {days} days while marked needs-info. It will be closed in {close_after_days} days if no update is provided.",
+    "close_comment_template": "Closing due to inactivity — no update was provided after the needs-info notice."
+  }
+}
+```
+
+| Key | Default | Description |
+|---|---|---|
+| `stale.enabled` | `false` | Enable the sweep. Runs once per `run`/`watch` poll cycle. |
+| `stale.needs_info_days` | `60` | Idle days (measured from the issue's `updated_at`) before the warning comment posts. Matches `actions/stale`'s default. |
+| `stale.close_after_days` | `7` | Further idle days after the warning before the issue is closed. Matches `actions/stale`'s default. |
+| `stale.exempt_labels` | `[]` | Labels that exempt an issue from the sweep entirely, even if it carries `status/needs-info`. |
+| `stale.stale_comment_template` | see above | Warning comment body. Placeholders: `{days}`, `{close_after_days}`. |
+| `stale.close_comment_template` | see above | Comment posted immediately before the issue is closed (best-effort — a comment failure does not block the close). No placeholders. |
+
+Idle time is derived from the issue's live `updated_at` (GitHub's own
+last-activity timestamp), not a parallel store. The warning is idempotent per
+idle window — a repeat sweep checks existing comments for a marker before
+posting a second warning.
+
 ## Environment variable overrides
 
 | Variable | Config key | Notes |
@@ -435,3 +508,8 @@ re-posted and the `released` label is not re-applied.
 | `CLAGENTIC_TRIAGE_STATUS_HOOK_PORT` | `status_hooks.port` | integer |
 | `CLAGENTIC_TRIAGE_RELEASE_COMMENT_TEMPLATE` | `release_notify.comment_template` | |
 | `CLAGENTIC_TRIAGE_CONFIDENCE_THRESHOLD` | `confidence_threshold` | float 0–1 |
+| `CLAGENTIC_TRIAGE_LABEL_AUTO_APPROVE` | `label_auto_approve` | comma-separated axis names |
+| `CLAGENTIC_TRIAGE_STALE_ENABLED` | `stale.enabled` | `"true"`/`"false"` |
+| `CLAGENTIC_TRIAGE_STALE_NEEDS_INFO_DAYS` | `stale.needs_info_days` | integer |
+| `CLAGENTIC_TRIAGE_STALE_CLOSE_AFTER_DAYS` | `stale.close_after_days` | integer |
+| `CLAGENTIC_TRIAGE_STALE_EXEMPT_LABELS` | `stale.exempt_labels` | comma-separated |

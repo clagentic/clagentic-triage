@@ -680,3 +680,125 @@ describe('_applyLabels — single-status invariant', () => {
     ]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// _applyLabels — per-axis trust for intake labels (T10, lr-9e35)
+// ---------------------------------------------------------------------------
+
+describe('_applyLabels — label_auto_approve per-axis trust', () => {
+  it('does not auto-apply an intake label whose axis is not in label_auto_approve', async () => {
+    let labelCalled = false;
+    const adapter = makeAdapter({
+      get_item_labels: async () => [],
+      label_item: async () => { labelCalled = true; },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['respond'], body: null, dispatch_target: null, labels: ['kind/bug'] },
+    });
+
+    await _applyLabels({ label_auto_approve: [] }, event, assessment, adapter, 'dispatched');
+
+    assert.equal(labelCalled, false, 'kind/* is not trusted by default — must not auto-apply');
+  });
+
+  it('auto-applies an intake label whose axis IS in label_auto_approve', async () => {
+    const calls = [];
+    const adapter = makeAdapter({
+      get_item_labels: async () => [],
+      label_item: async (_c, _e, labels) => { calls.push(labels); },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['respond'], body: null, dispatch_target: null, labels: ['kind/bug'] },
+    });
+
+    await _applyLabels({ label_auto_approve: ['kind'] }, event, assessment, adapter, 'dispatched');
+
+    assert.deepEqual(calls, [['kind/bug']]);
+  });
+
+  it('filters a mixed label set down to only the trusted axis', async () => {
+    const calls = [];
+    const adapter = makeAdapter({
+      get_item_labels: async () => [],
+      label_item: async (_c, _e, labels) => { calls.push(labels); },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: {
+        classes: ['respond'],
+        body: null,
+        dispatch_target: null,
+        labels: ['kind/bug', 'priority/p1', 'area/backend'],
+      },
+    });
+
+    await _applyLabels({ label_auto_approve: ['kind'] }, event, assessment, adapter, 'dispatched');
+
+    assert.deepEqual(calls, [['kind/bug']]);
+  });
+
+  it('never filters status/* labels — the status axis is gated elsewhere, not by label_auto_approve', async () => {
+    const calls = [];
+    const adapter = makeAdapter({
+      get_item_labels: async () => [],
+      label_item: async (_c, _e, labels) => { calls.push(labels); },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: {
+        classes: ['respond'],
+        body: null,
+        dispatch_target: null,
+        labels: ['status/accepted', 'area/backend'],
+      },
+    });
+
+    await _applyLabels({ label_auto_approve: [] }, event, assessment, adapter, 'dispatched');
+
+    assert.deepEqual(calls, [['status/accepted']]);
+  });
+
+  it('applies per-axis trust on the auto_label-gated queued path too, not just dispatched', async () => {
+    const calls = [];
+    const adapter = makeAdapter({
+      get_item_labels: async () => [],
+      label_item: async (_c, _e, labels) => { calls.push(labels); },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: {
+        classes: ['dispatch'],
+        body: null,
+        dispatch_target: null,
+        labels: ['kind/bug', 'priority/p1'],
+      },
+    });
+
+    await _applyLabels({ auto_label: true, label_auto_approve: ['kind'] }, event, assessment, adapter, 'queued');
+
+    assert.deepEqual(calls, [['kind/bug']]);
+  });
+
+  it('is a no-op (no adapter calls) when every incoming label is filtered out', async () => {
+    let labelsFetched = false;
+    const adapter = makeAdapter({
+      get_item_labels: async () => { labelsFetched = true; return []; },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['respond'], body: null, dispatch_target: null, labels: ['area/backend'] },
+    });
+
+    await _applyLabels({ label_auto_approve: [] }, event, assessment, adapter, 'dispatched');
+
+    assert.equal(labelsFetched, false, 'should short-circuit before fetching live labels');
+  });
+});
