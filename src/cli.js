@@ -16,6 +16,7 @@ import { startWebhookServer } from './webhooks/server.js';
 import { startStatusHookServer } from './status_hook.js';
 import { dispatch } from './dispatchers/index.js';
 import { check_token_scopes } from './adapters/github.js';
+import { isMergedToDefaultBranch, applyMergeTransition, applyReleaseTransition } from './lifecycle.js';
 
 // NOTE(RT-009): the `hooks` config field is stored but not yet dynamically
 // imported. When hook module loading is implemented, apply _validate_module_path
@@ -179,6 +180,39 @@ export async function loadAdapter(config) {
 }
 
 // ---------------------------------------------------------------------------
+// Event routing (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+/**
+ * Route a single normalized Event to either a lifecycle transition (merged PR,
+ * published release) or the LLM-assessment pipeline (issue/PR triage).
+ *
+ * Lifecycle events are deterministic state transitions, not something an LLM
+ * should assess — they never reach enrich/assess (src/lifecycle.js docblock).
+ * Both ingress paths (webhook `onEvent`, poll `tick`) call this single
+ * function so the branch lives in exactly one place.
+ *
+ * @param {object} config
+ * @param {object} event   - Normalized Event
+ * @param {object} adapter - source adapter
+ * @returns {Promise<object>} a summary object for logging — shape varies by branch
+ */
+export async function routeEvent(config, event, adapter) {
+  if (event.type === 'release') {
+    const result = await applyReleaseTransition(config, adapter, event);
+    return { kind: 'release', event_id: event.id, ...result };
+  }
+
+  if (event.type === 'pr' && isMergedToDefaultBranch(event)) {
+    const result = await applyMergeTransition(config, adapter, event);
+    return { kind: 'merge', event_id: event.id, ...result };
+  }
+
+  const result = await processEvent(config, event, adapter);
+  return { kind: 'triage', ...result };
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -209,10 +243,15 @@ async function cmdWatch(flags) {
   // poll_interval_seconds to a large value.
   if (config.webhooks?.enabled) {
     const webhookOnEvent = async (event) => {
-      const result = await processEvent(config, event, adapter);
-      out(
-        `[clagentic-triage] webhook event: id=${result.event_id} status=${result.status}`,
-      );
+      const result = await routeEvent(config, event, adapter);
+      if (result.kind === 'triage') {
+        out(`[clagentic-triage] webhook event: id=${result.event_id} status=${result.status}`);
+      } else {
+        out(
+          `[clagentic-triage] webhook lifecycle event: kind=${result.kind} id=${result.event_id} ` +
+          `applied=${result.applied} issues=${result.issues.length}`,
+        );
+      }
     };
     webhookServer = await startWebhookServer(config, adapter, { onEvent: webhookOnEvent });
     const addr = webhookServer.address();
@@ -239,6 +278,29 @@ async function cmdWatch(flags) {
       );
     } catch (e) {
       err(`[clagentic-triage] cycle error: ${e.message}`);
+    }
+
+    // Lifecycle poll (T6, lr-d557): merged PRs and published releases are
+    // deterministic transitions, not LLM-assessed — routed directly to
+    // src/lifecycle.js, never through runPipeline/processEvent. Optional on
+    // adapters that do not implement list_lifecycle_events (interface is
+    // additive; other adapters may not have it yet).
+    if (typeof adapter.list_lifecycle_events === 'function') {
+      try {
+        const { mergedPrs, releases } = await adapter.list_lifecycle_events(config);
+        let appliedCount = 0;
+        for (const event of [...mergedPrs, ...releases]) {
+          const result = await routeEvent(config, event, adapter);
+          if (result.applied) {
+            appliedCount += 1;
+          }
+        }
+        out(
+          `[clagentic-triage] lifecycle cycle: merged_prs=${mergedPrs.length} releases=${releases.length} applied=${appliedCount}`,
+        );
+      } catch (e) {
+        err(`[clagentic-triage] lifecycle cycle error: ${e.message}`);
+      }
     }
   };
 
@@ -278,6 +340,22 @@ async function cmdRun(flags) {
   out(
     `[clagentic-triage] run complete: dispatched=${dispatched.length} queued=${queued.length} errors=${errors.length}`,
   );
+
+  // Lifecycle poll (T6, lr-d557) — see cmdWatch's tick for the rationale on
+  // routing these outside runPipeline.
+  if (typeof adapter.list_lifecycle_events === 'function') {
+    const { mergedPrs, releases } = await adapter.list_lifecycle_events(config);
+    let appliedCount = 0;
+    for (const event of [...mergedPrs, ...releases]) {
+      const result = await routeEvent(config, event, adapter);
+      if (result.applied) {
+        appliedCount += 1;
+      }
+    }
+    out(
+      `[clagentic-triage] lifecycle run: merged_prs=${mergedPrs.length} releases=${releases.length} applied=${appliedCount}`,
+    );
+  }
 
   if (errors.length > 0) {
     process.exit(1);

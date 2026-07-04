@@ -358,9 +358,13 @@ function _actorOf(raw) {
  * @param {string|null} [forceType] - Override type detection: 'pr' or 'issue'.
  *   Webhook callers pass this explicitly because the webhook event type header, not
  *   the presence of `raw.pull_request`, determines whether the item is a PR.
+ * @param {string|null} [defaultBranch] - The repo's default branch name, when known
+ *   (webhook callers read it from `payload.repository.default_branch`; poll callers
+ *   pass it from `get_default_branch`). Carried in metadata so callers can detect
+ *   "merged to default branch" without a second lookup. null when not resolved.
  * @returns {object}    - Normalized Event
  */
-function _normalize(raw, repo, forceType = null) {
+function _normalize(raw, repo, forceType = null, defaultBranch = null) {
   const isPr = forceType !== null ? forceType === 'pr' : Boolean(raw.pull_request);
   const type = isPr ? 'pr' : 'issue';
 
@@ -381,9 +385,15 @@ function _normalize(raw, repo, forceType = null) {
       author_association: raw.author_association ?? null,
       state: raw.state ?? '',
       draft: isPr ? Boolean(raw.draft) : false,
-      merged: isPr ? Boolean(raw.pull_request?.merged_at ?? raw.merged) : false,
+      // Three possible shapes for "is this PR merged": the issues-list endpoint
+      // nests it under raw.pull_request.merged_at; the webhook PR payload and
+      // the pulls-list REST endpoint (list_merged_prs, T6/lr-d557) carry
+      // merged_at directly on the object; raw.merged is a plain boolean some
+      // callers may already have resolved. Check all three, most-specific first.
+      merged: isPr ? Boolean(raw.pull_request?.merged_at ?? raw.merged_at ?? raw.merged) : false,
       head_ref: isPr ? (raw.head?.ref ?? '') : '',
       base_ref: isPr ? (raw.base?.ref ?? '') : '',
+      default_branch: defaultBranch,
     },
   };
 }
@@ -436,6 +446,74 @@ function _filterAndNormalize(raw, repo, config, allowBotLogins, capEnabled, auth
     authorCounts.set(author, count + 1);
   }
   return _normalize(raw, repo);
+}
+
+/**
+ * Return true if `repo` ("owner/repo") falls within the operator's configured
+ * watch scope (`config.source.repos` / `config.source.org`), without making
+ * any network call.
+ *
+ * This is the same scoping contract `_resolveRepos` enforces for polling,
+ * expressed as a pure membership check so callers that only have a single
+ * candidate repo (e.g. a cross-repo ref parsed out of release-note text,
+ * T6/lr-d557's `applyReleaseTransition`) can validate it without listing
+ * every repo the config resolves to:
+ *
+ *   - `source.repos` is an explicit list (not `['*']`): `repo` must appear in
+ *     it verbatim, or as `org/name` once qualified with `source.org` for any
+ *     unqualified entries — mirroring `_resolveRepos`'s own qualification step.
+ *   - `source.repos` is `['*']` (the default): every repo is qualified by
+ *     `source.org`; a repo is in scope only if its owner matches `source.org`.
+ *     With no `source.org` set, nothing is in scope (fail closed — the operator
+ *     has not told triage which org it watches).
+ *
+ * @param {object} config
+ * @param {string} repo - "owner/repo" string to check
+ * @returns {boolean}
+ */
+export function is_repo_in_watch_scope(config, repo) {
+  const cfgRepos = config.source?.repos ?? ['*'];
+  const org = config.source?.org ?? null;
+
+  if (cfgRepos.includes('*')) {
+    if (!org) {
+      return false;
+    }
+    const [repoOwner] = repo.split('/');
+    return repoOwner === org;
+  }
+
+  const qualified = cfgRepos.map((r) => (org && !r.includes('/') ? `${org}/${r}` : r));
+  return qualified.includes(repo);
+}
+
+/**
+ * Resolve the list of "owner/repo" strings to query, expanding the `['*']`
+ * wildcard against `config.source.org` when needed.
+ *
+ * Extracted from `list_events` so `list_merged_prs`/`list_releases` callers
+ * (via `list_lifecycle_events`) share the exact same repo-scoping semantics —
+ * an explicit `source.repos` list is used as-is (never expanded to the full
+ * org), matching the existing "operator scoped the watch" contract.
+ *
+ * @param {object} config
+ * @param {string} token
+ * @returns {Promise<string[]|null>} resolved repo list, or null on auth failure
+ *   while expanding the org wildcard.
+ */
+async function _resolveRepos(config, token) {
+  const cfgRepos = config.source?.repos ?? ['*'];
+  if (cfgRepos.includes('*')) {
+    if (!config.source?.org) {
+      throw new AdapterError(
+        "source.repos=['*'] requires source.org to be set — cannot list all repos without an org",
+      );
+    }
+    return _listOrgRepos(config.source.org, token);
+  }
+  // Explicit repo list: qualify unqualified names with org if present.
+  const org = config.source?.org;
+  return cfgRepos.map((r) => (org && !r.includes('/') ? `${org}/${r}` : r));
 }
 
 /**
@@ -499,27 +577,10 @@ export async function list_events(config, since) {
   const repoPostFilterCap = config.source?.max_events_per_repo_per_poll ?? 200;
   const repoCapEnabled = repoPostFilterCap !== 0 && repoPostFilterCap !== null;
 
-  // Resolve the list of repos to query.
-  // When source.repos is explicit (not ['*']), use it directly — org is used
-  // only to resolve the wildcard. This prevents enumerating all org repos when
-  // the operator has scoped the watch to a specific list.
-  let repos;
-  const cfgRepos = config.source?.repos ?? ['*'];
-  if (cfgRepos.includes('*')) {
-    if (!config.source?.org) {
-      throw new AdapterError(
-        "source.repos=['*'] requires source.org to be set — cannot list all repos without an org",
-      );
-    }
-    repos = await _listOrgRepos(config.source.org, token);
-    if (repos === null) {
-      // Auth failure from org listing
-      return [];
-    }
-  } else {
-    // Explicit repo list: qualify unqualified names with org if present.
-    const org = config.source?.org;
-    repos = cfgRepos.map((r) => (org && !r.includes('/') ? `${org}/${r}` : r));
+  const repos = await _resolveRepos(config, token);
+  if (repos === null) {
+    // Auth failure from org listing
+    return [];
   }
 
   const events = [];
@@ -739,6 +800,195 @@ async function _listOrgRepos(org, token) {
 }
 
 // ---------------------------------------------------------------------------
+// get_default_branch (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch a repo's default branch name.
+ *
+ * The REST issues-list endpoint used by `list_events` does not include
+ * repo-level fields like `default_branch`, so the poll path resolves it with a
+ * dedicated call. The webhook path gets it for free from
+ * `payload.repository.default_branch` (see `normalize_webhook`).
+ *
+ * @param {object} config
+ * @param {string} repo - "owner/repo"
+ * @returns {Promise<string|null>} default branch name, or null on failure
+ */
+export async function get_default_branch(config, repo) {
+  const token = await _resolve_token(config);
+  const url = `${GITHUB_API}/repos/${repo}`;
+
+  const res = await globalThis.fetch(url, { headers: _headers(token) });
+  if (!res.ok) {
+    console.warn(`[github adapter] get_default_branch failed (${res.status}) for ${repo}`);
+    return null;
+  }
+
+  const data = await res.json();
+  return data.default_branch ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// list_merged_prs (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+/**
+ * List recently-merged, closed PRs for a repo (poll-path equivalent of the
+ * `pull_request` webhook's merged-to-default signal).
+ *
+ * Filters to `state=closed` PRs with a non-null `merged_at`, sorted by
+ * `updated` so the caller can bound how far back to look via `since`. The
+ * default-branch check happens in the caller (lifecycle layer) using
+ * `get_default_branch`, since this listing does not repeat that call per PR.
+ *
+ * @param {object} config
+ * @param {string} repo    - "owner/repo"
+ * @param {string} [since] - ISO 8601 timestamp; PRs updated before this are excluded
+ * @returns {Promise<object[]>} Normalized PR Events (type='pr') with metadata.merged=true
+ */
+export async function list_merged_prs(config, repo, since) {
+  const token = await _resolve_token(config);
+  if (!token) {
+    console.warn('[github adapter] no GitHub token configured; returning empty list');
+    return [];
+  }
+
+  const sinceParam = since ? `&since=${encodeURIComponent(since)}` : '';
+  const url = `${GITHUB_API}/repos/${repo}/pulls?state=closed&sort=updated&direction=desc${sinceParam}&per_page=100`;
+
+  let result;
+  try {
+    result = await _fetchPaginated(url, token, null);
+  } catch (err) {
+    if (err instanceof AdapterError && err.code === 'auth_failure') {
+      console.warn(`[github adapter] auth failure listing merged PRs for ${repo}: ${err.message}`);
+      return [];
+    }
+    throw err;
+  }
+
+  if (result.status !== 200) {
+    console.warn(
+      `[github adapter] non-2xx (${result.status}) listing merged PRs for ${repo}; returning empty`,
+    );
+    return [];
+  }
+
+  const defaultBranch = await get_default_branch(config, repo);
+
+  return result.items
+    .filter((raw) => Boolean(raw.merged_at))
+    .map((raw) => _normalize(raw, repo, 'pr', defaultBranch));
+}
+
+// ---------------------------------------------------------------------------
+// list_releases (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+/**
+ * List published releases for a repo (poll-path equivalent of the `release`
+ * webhook's `published` action).
+ *
+ * GitHub's `GET /repos/{owner}/{repo}/releases` only returns published
+ * releases (drafts are excluded by the API itself unless the caller has push
+ * access and asks for them explicitly via a different scope) — no extra
+ * draft filter is needed here.
+ *
+ * @param {object} config
+ * @param {string} repo - "owner/repo"
+ * @returns {Promise<object[]>} Normalized Release Events (type='release')
+ */
+export async function list_releases(config, repo) {
+  const token = await _resolve_token(config);
+  if (!token) {
+    console.warn('[github adapter] no GitHub token configured; returning empty list');
+    return [];
+  }
+
+  const url = `${GITHUB_API}/repos/${repo}/releases?per_page=100`;
+
+  let result;
+  try {
+    result = await _fetchPaginated(url, token, null);
+  } catch (err) {
+    if (err instanceof AdapterError && err.code === 'auth_failure') {
+      console.warn(`[github adapter] auth failure listing releases for ${repo}: ${err.message}`);
+      return [];
+    }
+    throw err;
+  }
+
+  if (result.status !== 200) {
+    console.warn(
+      `[github adapter] non-2xx (${result.status}) listing releases for ${repo}; returning empty`,
+    );
+    return [];
+  }
+
+  return result.items
+    .filter((raw) => !raw.draft)
+    .map((raw) => _normalizeRelease(raw, repo));
+}
+
+// ---------------------------------------------------------------------------
+// list_lifecycle_events (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+/**
+ * Poll-path entry point for the two lifecycle-transition signals: merged PRs
+ * and published releases, across every repo `config.source` resolves to.
+ *
+ * Kept as a single function (rather than requiring the CLI poll loop to call
+ * `list_merged_prs`/`list_releases` per-repo itself) so the repo-scoping logic
+ * (`_resolveRepos` — org-wildcard expansion vs an explicit repo list) is
+ * exercised in exactly one place, matching `list_events`'s existing contract.
+ *
+ * Does not apply the `since` timestamp for releases (`list_releases` has no
+ * `since` parameter — GitHub's releases-list endpoint is small enough per repo
+ * that `applyReleaseTransition`'s idempotent close/label calls make repeated
+ * processing of already-released issues a no-op) but does pass it through to
+ * `list_merged_prs`.
+ *
+ * @param {object} config
+ * @param {string} [since] - ISO 8601 timestamp, passed through to list_merged_prs
+ * @returns {Promise<{ mergedPrs: object[], releases: object[] }>}
+ */
+export async function list_lifecycle_events(config, since) {
+  const token = await _resolve_token(config);
+  if (!token) {
+    console.warn('[github adapter] no GitHub token configured; returning empty lifecycle lists');
+    return { mergedPrs: [], releases: [] };
+  }
+
+  const repos = await _resolveRepos(config, token);
+  if (repos === null) {
+    return { mergedPrs: [], releases: [] };
+  }
+
+  const mergedPrs = [];
+  const releases = [];
+
+  for (const repo of repos) {
+    try {
+      const prs = await list_merged_prs(config, repo, since);
+      mergedPrs.push(...prs);
+    } catch (err) {
+      console.warn(`[github adapter] error listing merged PRs for ${repo}: ${err.message}`);
+    }
+
+    try {
+      const rels = await list_releases(config, repo);
+      releases.push(...rels);
+    } catch (err) {
+      console.warn(`[github adapter] error listing releases for ${repo}: ${err.message}`);
+    }
+  }
+
+  return { mergedPrs, releases };
+}
+
+// ---------------------------------------------------------------------------
 // post_comment
 // ---------------------------------------------------------------------------
 
@@ -832,6 +1082,46 @@ export async function close_item(config, event) {
 
   if (!res.ok) {
     throw new AdapterError(`close_item failed: ${res.status} ${res.statusText}`);
+  }
+
+  _invalidate_cache(event.repo);
+}
+
+// ---------------------------------------------------------------------------
+// close_item_completed (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+/**
+ * Close an issue as genuinely resolved (`state_reason: 'completed'`), distinct
+ * from `close_item`'s `not_planned` reason.
+ *
+ * `close_item` is used by the LLM-assessed `close` action class, where
+ * `not_planned` is the correct semantic (the triage verdict was to reject/
+ * decline the issue, not to say it shipped). The release lifecycle transition
+ * (src/lifecycle.js) closes an issue because its fix was released — the
+ * opposite meaning — so it needs its own method rather than overloading
+ * `close_item`'s hardcoded reason. Issues only; PRs are already closed by the
+ * merge that triggered this path.
+ *
+ * Idempotent: PATCHing state=closed on an already-closed issue is a no-op on
+ * GitHub's side (no error), safe to call unconditionally.
+ *
+ * @param {object} config
+ * @param {object} event - Normalized Event (issue shape: repo, number)
+ * @returns {Promise<void>}
+ */
+export async function close_item_completed(config, event) {
+  const token = await _resolve_token(config);
+  const url = `${GITHUB_API}/repos/${event.repo}/issues/${event.number}`;
+
+  const res = await globalThis.fetch(url, {
+    method: 'PATCH',
+    headers: { ..._headers(token), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ state: 'closed', state_reason: 'completed' }),
+  });
+
+  if (!res.ok) {
+    throw new AdapterError(`close_item_completed failed: ${res.status} ${res.statusText}`);
   }
 
   _invalidate_cache(event.repo);
@@ -1077,7 +1367,12 @@ export function normalize_webhook(headers, payload) {
   if (eventType === 'pull_request') {
     // payload.pull_request is the PR object, but lacks the REST-list's pull_request
     // sentinel field that _normalize uses to detect PRs. Pass forceType='pr'.
-    return _normalize(payload.pull_request ?? {}, repo, 'pr');
+    // payload.repository.default_branch is carried into metadata so callers (T6,
+    // lr-d557) can detect "merged to default branch" without a second API call —
+    // the webhook payload already has it; the poll path resolves it separately
+    // via get_default_branch since the REST issues-list endpoint does not include it.
+    const defaultBranch = payload.repository?.default_branch ?? null;
+    return _normalize(payload.pull_request ?? {}, repo, 'pr', defaultBranch);
   }
 
   if (eventType === 'issue_comment') {
@@ -1118,8 +1413,55 @@ export function normalize_webhook(headers, payload) {
     return _normalize(synthetic, repo, 'pr');
   }
 
+  if (eventType === 'release') {
+    // Only a published release (not draft creation/edit/deletion) advances the
+    // lifecycle. GitHub sends this event for every release action
+    // (published, unpublished, created, edited, deleted, released, prereleased);
+    // "created" fires for both drafts and immediate publishes, so `published` is
+    // the one unambiguous "this is now live" signal (also fired for prereleases).
+    if (payload.action !== 'published') {
+      return null;
+    }
+    return _normalizeRelease(payload.release ?? {}, repo);
+  }
+
   // Unsupported event type — caller handles this case.
   return null;
+}
+
+/**
+ * Normalize a raw GitHub release object (REST or webhook payload.release) to a
+ * Release-shaped Event.
+ *
+ * Distinct `type: 'release'` — a release is not an issue or PR, so it does not
+ * fit the issue/PR Event shape. Callers (T6, lr-d557) branch on `event.type`
+ * before routing to the lifecycle transition, never into the LLM-assessment
+ * pipeline (enrich/assess assume issue/PR content).
+ *
+ * @param {object} raw  - Raw GitHub release object
+ * @param {string} repo - "owner/repo" string
+ * @returns {object} Release Event
+ */
+function _normalizeRelease(raw, repo) {
+  return {
+    id: `${repo}#release-${raw.id}`,
+    type: 'release',
+    title: raw.name ?? raw.tag_name ?? '',
+    body: raw.body ?? '',
+    author: raw.author?.login ?? '',
+    created_at: raw.created_at ?? '',
+    url: raw.html_url ?? '',
+    source: 'github',
+    repo,
+    number: null,
+    metadata: {
+      tag_name: raw.tag_name ?? '',
+      target_commitish: raw.target_commitish ?? '',
+      draft: Boolean(raw.draft),
+      prerelease: Boolean(raw.prerelease),
+      published_at: raw.published_at ?? null,
+    },
+  };
 }
 
 /**

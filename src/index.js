@@ -19,3 +19,8 @@ export {
   enforceSingleStatus,
   STATUS_NAMESPACE,
 } from './labels.js';
+export {
+  isMergedToDefaultBranch,
+  applyMergeTransition,
+  applyReleaseTransition,
+} from './lifecycle.js';
