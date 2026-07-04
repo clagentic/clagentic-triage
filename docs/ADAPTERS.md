@@ -32,7 +32,10 @@ export async function list_comments(config, event) { }               // returns 
 export async function get_default_branch(config, repo) { }           // returns string|null
 export async function list_merged_prs(config, repo, since) { }        // returns merged PR Event[]
 export async function list_releases(config, repo) { }                 // returns published release Event[]
+export async function list_open_prs(config, repo) { }                  // returns open (unmerged) PR Event[]
+export async function list_issues_by_label(config, label) { }          // returns open issue Event[] carrying `label`
 export function is_repo_in_watch_scope(config, repo) { }               // returns boolean (no network call)
+export function get_pr_closing_issues(config, event) { }               // returns { closingIssues, crossRepoRefs }
 
 // --- Webhook interface (required for inbound webhook server) ---
 export function verify_webhook(rawBody, headers, secret) { }      // returns boolean
@@ -94,6 +97,19 @@ non-null `merged_at`, normalized the same way as the webhook path (`type: 'pr'`,
 Poll-path equivalent of the `release` webhook's `published` action: lists non-draft releases,
 normalized to `type: 'release'` Events (distinct from issue/PR Events — see
 `docs/ARCHITECTURE.md`).
+
+**`list_open_prs(config, repo) -> Event[]`** (T10, lr-9e35)
+
+Poll-path equivalent of the `pull_request` webhook's `opened`/`ready_for_review` signals:
+lists open (unmerged) PRs. Used by the lifecycle poll cycle to drive the in-progress/
+in-review auto-transitions (`src/lifecycle.js`) without repurposing `list_events`'s own
+bot/actor/cap filtering, which has no bearing on a deterministic state transition.
+
+**`list_issues_by_label(config, label) -> Event[]`** (T10, lr-9e35)
+
+List every open issue (PRs excluded) carrying the given fully-namespaced label, across
+every repo `config.source` resolves to. Used by the stale needs-info auto-close sweep
+(`src/stale.js`) to find every issue currently in the `status/needs-info` state.
 
 **`is_repo_in_watch_scope(config, repo) -> boolean`**
 

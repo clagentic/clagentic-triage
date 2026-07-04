@@ -70,6 +70,11 @@ The assessor takes an enriched event and a config-defined intent specification a
     classes: Array<'approve' | 'respond' | 'request_changes' | 'close' | 'dispatch' | 'escalate'>,
     body: string | null,      // comment/response text if applicable
     dispatch_target: string | null,
+    // labels may include a status/* transition AND intake kind/*, priority/*,
+    // area/* suggestions (T10, lr-9e35) in the same verdict. Applying an
+    // intake label is gated per-axis by config.label_auto_approve — see
+    // docs/CONFIG.md — independent of the status axis's own auto_approve/
+    // auto_label gate.
     labels: string[]
   },
   model_used: string

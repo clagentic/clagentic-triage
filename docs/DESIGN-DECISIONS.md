@@ -795,3 +795,159 @@ now?" — answered by reading the item's live labels, not a parallel store.
   `src/hooks/console.js` — updated to read/construct `classes[]` instead of `class` (display/
   logging/payload sites only; no behavioral branching on the value beyond formatting).
 - `docs/ARCHITECTURE.md` — Assessment schema updated to `suggested_action.classes[]`.
+
+---
+
+## DD-016: Triage v3 — PR-open/ready-for-review auto-transitions, needs-info idle auto-close, and per-axis trust for intake labels (T10, lr-9e35)
+
+**Decision:** Three additive, independently-gated components complete the "full triage-driven
+flow" layer of the lifecycle-engine plan (tome #670):
+
+1. **Auto-transitions off PR events**: an opened, still-draft PR that closes an issue
+   transitions the issue to `status/in-progress`; a non-draft PR (opened directly as
+   non-draft, or a draft PR marked ready for review) transitions it to `status/in-review`.
+   Deterministic, never LLM-assessed — same family as T6's merge/release transitions.
+2. **needs-info idle auto-close**: modeled on `actions/stale`'s own defaults (60 days idle
+   before a warning comment, 7 further idle days before close), honoring exempt labels.
+   Off by default (`config.stale.enabled`).
+3. **Intake `kind/priority/area` suggestions**: the assessor prompt now surfaces the
+   configured axis vocabulary and asks for label suggestions on intake; a new **per-axis**
+   trust gate (`config.label_auto_approve`) — distinct from `auto_approve`/`auto_label` —
+   decides which axes may be auto-applied. Empty by default (HITL until trusted per class,
+   exactly as this task's spec requires).
+
+**Rationale:**
+- **Opened-vs-ready-for-review is resolved by the PR's draft flag, not by trying both
+  transitions and picking whichever "wins."** An earlier draft of this design checked
+  `applyPrOpenedTransition` first and fell through to `applyPrReadyForReviewTransition` only
+  if the first reported nothing applied — but `applied` on a guarded-off issue (already past
+  the target status) is ambiguous with `applied` on "nothing to do," so the fallthrough could
+  silently skip the ready-for-review transition for a non-draft PR whose linked issue happened
+  to already carry `status/in-progress` from an earlier poll. The two transitions are
+  restructured to be **mutually exclusive by construction**: `applyPrOpenedTransition` only
+  ever fires for a **draft** PR, `applyPrReadyForReviewTransition` only for a **non-draft,
+  unmerged** PR. This mirrors GitHub's own webhook pair — `ready_for_review` only fires when a
+  PR *transitions* out of draft, so a PR opened directly as non-draft must reach `in-review` via
+  its `opened` delivery instead, which the draft-flag split naturally provides. `src/cli.js`'s
+  `routeEvent` picks the single applicable transition via `event.metadata.draft`, no
+  try-both-and-check-applied logic.
+- **The poll path has no equivalent "opened"/"ready_for_review" edge signal — both transitions
+  are therefore idempotent and called unconditionally on every open, unmerged PR each poll
+  cycle**, exactly the same idempotent-poll design T6's merge/release transitions established
+  (`_applyStatusLabel`'s no-op-if-already-applied check). A new poll-path listing,
+  `list_open_prs` (mirroring `list_merged_prs`'s shape: `state=open` vs `state=closed` +
+  `merged_at` filter), feeds `list_lifecycle_events`'s new `openPrs` bucket so the CLI's
+  lifecycle poll cycle (already the single dispatch point for merge/release, T6) picks these up
+  without a second poll loop or a second `routeEvent`-adjacent call site.
+- **Both transitions refuse to regress an issue past a later status.** `_applyLinkedIssueStatus`
+  (the shared implementation both `applyPrOpenedTransition`/`applyPrReadyForReviewTransition`
+  delegate to) fetches the target issue's live labels and skips the label-apply if a "later"
+  status (`in-review`/`awaiting-release`/`released` for the in-progress transition;
+  `awaiting-release`/`released` for the in-review transition) is already present. Without this
+  guard, a poll cycle re-observing a PR that has already advanced past review (e.g. re-opened
+  after being merged and reverted) could regress the issue's status backward — a correctness
+  bug the merge/release transitions do not have to worry about because they only ever move
+  forward along the lifecycle's terminal end.
+- **needs-info idle time is derived from GitHub's own `updated_at`, not a comment-count
+  heuristic or a parallel timestamp store.** `actions/stale` itself treats any update
+  (comment, label change, edit) as activity that resets the idle clock; `updated_at` is the
+  field GitHub already maintains for exactly that purpose. A parallel "last seen" store would
+  drift the same way a parallel lifecycle-state store would (T7's rationale, DD-015) — this task
+  reuses that same principle rather than reintroducing the anti-pattern DD-015 explicitly
+  rejected.
+- **The stale-close sweep is issue-only, needs its own adapter listing method
+  (`list_issues_by_label`), and deliberately bypasses `list_events`'s bot/actor/cap
+  filtering.** A deterministic idle-close decision must see every open `status/needs-info`
+  issue regardless of who commented on it last — the bot filter (DD-005) and actor-association
+  filter (DD-008) exist to keep noisy/low-trust actors out of *LLM assessment*, not to hide an
+  issue from a fact-based idle-time sweep the operator explicitly opted into.
+- **The warning comment's idempotency uses the same "scan live state for a marker" pattern
+  DD-013's release-notify path established**, rather than a parallel "have I warned this issue"
+  store: a hidden HTML comment marker (`<!-- clagentic-triage:stale-warning -->`) is appended to
+  the warning body; a repeat sweep checks `list_comments` for the marker before posting again.
+  This means an issue that receives new activity after the warning (moving its `updated_at`
+  forward, dropping it back below `needs_info_days`) naturally "resets" — the next sweep simply
+  will not re-warn or close it, with no explicit reset logic needed.
+- **A dedicated `label_auto_approve` config key, not overloading `auto_label`.** `auto_label`
+  (pre-existing) is a blanket boolean gating *whether any* suggested label applies to a queued
+  item — it does not distinguish `status/*` (already tightly governed by
+  `auto_approve`/the lifecycle transitions) from the orthogonal `kind/priority/area` axes this
+  task's spec calls out by name ("HITL until trusted per class"). Reusing `auto_label` for
+  per-axis trust would conflate two different trust decisions behind one flag: an operator who
+  trusts the LLM's `kind` classification (low blast radius — cosmetic if wrong) but not its
+  `priority` classification (can affect on-call routing) has no way to express that with a
+  single boolean. `label_auto_approve` is an explicit array of axis names, validated at config
+  load against `labels.axes` (rejects unknown axes and rejects the status namespace itself,
+  which is not a "class" this key governs). Empty by default — no axis is auto-applied until the
+  operator opts in, matching DD-001's posture and the task's explicit instruction not to
+  auto-apply until trust is configured.
+- **`_filterTrustedAxisLabels` runs in `_applyLabels` for BOTH the dispatched and
+  `auto_label`-gated-queued paths, not just one.** An untrusted axis must never auto-apply
+  regardless of whether the item's *action class* happened to be trusted — a verdict naming
+  `['dispatch']` with `auto_approve: ['dispatch']` should still hold back an untrusted `area/*`
+  suggestion even though the dispatch itself proceeds immediately. The full, unfiltered
+  suggestion list remains on the assessment record in the queue for a human to apply manually.
+- **The assessor prompt surfaces the operator's actual configured axis values
+  (`config.labels.axes`), not a generic "suggest a label" instruction.** `src/labels.js`'s
+  `normalizeLabels` already rejects any label outside the configured vocabulary — asking the LLM
+  to freehand label values it cannot know are valid would produce suggestions that are silently
+  rejected downstream. Listing the exact `kind/*`/`priority/*`/`area/*` values in the prompt
+  (skipping any axis with no configured values, e.g. a default-empty `area`) lets the LLM choose
+  from the real vocabulary and gives it an explicit instruction to omit an axis rather than guess
+  when uncertain.
+
+**What is explicitly out of scope for this task (see tome #670):** none of the three
+components is deferred — all three ship in this PR. The one named residual limitation is that
+`stale.close_after_days`'s warning-then-close cadence checks on each `run`/`watch` poll cycle,
+not on a wall-clock schedule independent of polling frequency — an operator running `watch` with
+a very long `poll_interval_seconds` will see coarser-grained stale-close timing. This is the same
+poll-cadence coupling every other poll-path check in this codebase already has (T6's merge/
+release poll, T10's own open-PR poll) and is not a new trade-off introduced by this task.
+
+**Config keys:**
+```json
+{
+  "label_auto_approve": [],
+  "stale": {
+    "enabled": false,
+    "needs_info_days": 60,
+    "close_after_days": 7,
+    "exempt_labels": [],
+    "stale_comment_template": "This issue has had no activity for {days} days while marked needs-info. It will be closed in {close_after_days} days if no update is provided.",
+    "close_comment_template": "Closing due to inactivity — no update was provided after the needs-info notice."
+  }
+}
+```
+
+**Env vars:** `CLAGENTIC_TRIAGE_LABEL_AUTO_APPROVE` (comma-separated axis names),
+`CLAGENTIC_TRIAGE_STALE_ENABLED`, `CLAGENTIC_TRIAGE_STALE_NEEDS_INFO_DAYS`,
+`CLAGENTIC_TRIAGE_STALE_CLOSE_AFTER_DAYS`, `CLAGENTIC_TRIAGE_STALE_EXEMPT_LABELS`.
+
+**Implementation:**
+- `src/lifecycle.js` — `applyPrOpenedTransition`/`applyPrReadyForReviewTransition`, sharing
+  `_applyLinkedIssueStatus` (the "resolve closing issues, guard against regression, apply via
+  the existing `_applyStatusLabel` single-status-invariant helper" logic factored out once for
+  both transitions).
+- `src/adapters/github.js` — `_normalize` gained a `webhookAction` parameter (carried as
+  `metadata.webhook_action`, populated by `normalize_webhook`'s `pull_request` branch from
+  `payload.action`) and an `updated_at` metadata field (from `raw.updated_at`, used by the stale
+  sweep). New poll methods: `list_open_prs(config, repo)` (mirrors `list_merged_prs`'s shape) and
+  `list_issues_by_label(config, label)` (issue-only, filters out PRs sharing the label).
+  `list_lifecycle_events` aggregates a new `openPrs` bucket alongside the existing `mergedPrs`/
+  `releases`.
+- `src/cli.js` — `routeEvent` branches on `event.metadata.draft` to pick exactly one of
+  `applyPrOpenedTransition`/`applyPrReadyForReviewTransition` for a PR event that is not a
+  default-branch merge. `cmdWatch`'s tick and `cmdRun` both fold `openPrs` into the existing
+  lifecycle-poll loop and call the new `checkStaleNeedsInfo` (`src/stale.js`) once per cycle.
+- `src/stale.js` — new module: `checkStaleNeedsInfo(config, adapter)`, the idle-sweep described
+  above. No-op when `config.stale.enabled` is false.
+- `src/pipeline.js` — `_applyLabels` gained `_filterTrustedAxisLabels`/`_axisOf`: non-status
+  labels are filtered to axes present in `config.label_auto_approve` before being passed through
+  `enforceSingleStatus`/applied, on both the dispatched and `auto_label`-gated-queued paths.
+- `src/assessor.js` — `_buildPrompt` surfaces `config.labels.axes` as an explicit intake-labeling
+  instruction in the `<rules>` block, listing the real configured values per axis.
+- `src/config/loader.js` — new `label_auto_approve` (default `[]`) and `stale` (defaults above)
+  top-level config keys, with load-time validation (`label_auto_approve` entries must be known,
+  non-status axes; `stale.needs_info_days`/`close_after_days` must be positive integers).
+- `docs/CONFIG.md`, `docs/ADAPTERS.md` — document the new config keys, env vars, and adapter
+  methods.
