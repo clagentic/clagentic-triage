@@ -802,3 +802,54 @@ describe('_applyLabels — label_auto_approve per-axis trust', () => {
     assert.equal(labelsFetched, false, 'should short-circuit before fetching live labels');
   });
 });
+
+// ---------------------------------------------------------------------------
+// _applyLabels — malformed multi-status incoming labels (lr-cf26)
+// ---------------------------------------------------------------------------
+
+describe('_applyLabels — malformed multi-status incoming labels (RangeError handling)', () => {
+  it('resolves (does not throw) and applies/removes nothing when incoming labels carry two status/* values', async () => {
+    let unlabelCalled = false;
+    let labelCalled = false;
+    const adapter = makeAdapter({
+      get_item_labels: async () => ['status/needs-triage'],
+      unlabel_item: async () => { unlabelCalled = true; },
+      label_item: async () => { labelCalled = true; },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: {
+        classes: ['respond'],
+        body: null,
+        dispatch_target: null,
+        labels: ['status/accepted', 'status/in-progress'],
+      },
+    });
+
+    // Must not throw — enforceSingleStatus's RangeError is caught explicitly
+    // at the _applyLabels call site, not left to propagate.
+    await assert.doesNotReject(
+      () => _applyLabels({}, event, assessment, adapter, 'dispatched'),
+    );
+
+    assert.equal(unlabelCalled, false, 'fail-safe: no label removal on malformed incoming labels');
+    assert.equal(labelCalled, false, 'fail-safe: no label application on malformed incoming labels');
+  });
+
+  it('still propagates a non-RangeError thrown while enforcing single-status', async () => {
+    const adapter = makeAdapter({
+      get_item_labels: async () => { throw new Error('adapter fetch exploded'); },
+    });
+
+    const event = makeEvent();
+    const assessment = makeAssessment({
+      suggested_action: { classes: ['respond'], body: null, dispatch_target: null, labels: ['status/accepted'] },
+    });
+
+    await assert.rejects(
+      () => _applyLabels({}, event, assessment, adapter, 'dispatched'),
+      /adapter fetch exploded/,
+    );
+  });
+});
