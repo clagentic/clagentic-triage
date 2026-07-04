@@ -33,7 +33,9 @@ export function buildPrompt(event, assessment) {
   const confidence = typeof assessment.confidence === 'number'
     ? assessment.confidence.toFixed(2)
     : '?';
-  const suggestedAction = assessment.suggested_action?.class ?? assessment.suggested_action ?? 'escalate';
+  const suggestedAction = Array.isArray(assessment.suggested_action?.classes)
+    ? assessment.suggested_action.classes.join('+')
+    : assessment.suggested_action ?? 'escalate';
 
   return (
     `Triage escalation: ${repo}#${number} — "${title}". ` +

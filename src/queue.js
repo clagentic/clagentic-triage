@@ -12,6 +12,7 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { dirname } from 'path';
+import { resolveVocabulary, isStatusLabel } from './labels.js';
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -269,4 +270,42 @@ export async function resolveItem(config, id, { action, resolved_action_class = 
   await writeLines(filePath, items);
 
   return updated;
+}
+
+// ---------------------------------------------------------------------------
+// Per-issue lifecycle state (T7, lr-f0f2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Derive an item's current lifecycle state from its live label set.
+ *
+ * Per this task's spec: prefer deriving state from live GitHub labels over a
+ * parallel local store. A parallel store (e.g. a JSON side-index keyed by
+ * repo#number) would drift the moment a human relabels an issue directly on
+ * GitHub, in a GitHub Action, or via any path other than triage itself —
+ * exactly the failure mode a "single source of truth" state machine exists to
+ * avoid. The adapter's get_item_labels (T2, lr-a192) already fetches fresh
+ * labels for the single-status invariant helper in src/labels.js; this
+ * function reuses that same call and the same vocabulary resolution rather
+ * than introducing a second labels-reading path.
+ *
+ * Returns `status: null` (not an error) when the item carries no status/*
+ * label — an untouched or newly-opened issue has no lifecycle state yet,
+ * which is a valid, expected condition, not a fault.
+ *
+ * @param {object} config
+ * @param {object} adapter - source adapter (must implement get_item_labels)
+ * @param {object} event   - Normalized Event (or the { repo, number } subset)
+ * @returns {Promise<{ status: string|null, labels: string[] }>}
+ *   status is the bare status/* value (e.g. "in-progress"), without the
+ *   namespace prefix; labels is the item's full current label set.
+ */
+export async function getLifecycleState(config, adapter, event) {
+  const labels = await adapter.get_item_labels(config, event);
+  const vocabulary = resolveVocabulary(config);
+
+  const statusLabel = labels.find((label) => isStatusLabel(label, vocabulary));
+  const status = statusLabel ? statusLabel.slice(vocabulary.status_namespace.length + 1) : null;
+
+  return { status, labels };
 }

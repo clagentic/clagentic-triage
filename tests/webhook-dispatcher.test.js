@@ -42,7 +42,7 @@ function makeAssessment(overrides = {}) {
     verdict: 'accept',
     confidence: 0.95,
     reasoning: 'Looks like a valid bug report.',
-    suggested_action: { class: 'dispatch', body: 'opening a ticket' },
+    suggested_action: { classes: ['dispatch'], body: 'opening a ticket' },
     ...overrides,
   };
 }
@@ -149,7 +149,7 @@ describe('webhook dispatcher', () => {
       assert.equal(body.confidence, assessment.confidence);
       assert.equal(body.reasoning, assessment.reasoning);
       assert.deepEqual(body.suggested_action, {
-        class: assessment.suggested_action.class,
+        classes: assessment.suggested_action.classes,
         body: assessment.suggested_action.body,
       });
       assert.ok(body.dispatched_at, 'dispatched_at should be present');

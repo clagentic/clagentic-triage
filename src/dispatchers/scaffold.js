@@ -100,8 +100,11 @@ function resolveConfig(config) {
  *   assessment.verdict          — 'accept' | 'needs_changes' | 'reject' | 'escalate' | 'defer'
  *   assessment.confidence       — float 0.0–1.0
  *   assessment.reasoning        — string, LLM's explanation
- *   assessment.suggested_action.class  — 'approve' | 'respond' | 'request_changes'
- *                                         | 'close' | 'dispatch' | 'escalate'
+ *   assessment.suggested_action.classes — string[], one or more of 'approve' |
+ *                                         'respond' | 'request_changes' | 'close'
+ *                                         | 'dispatch' | 'escalate' (T7, lr-f0f2 —
+ *                                         a single verdict may name more than one
+ *                                         class, e.g. respond + dispatch)
  *   assessment.suggested_action.body   — string|null, comment text if applicable
  *   assessment.suggested_action.labels — string[], labels to apply
  *   assessment.model_used       — string, which model produced this assessment
@@ -123,7 +126,7 @@ export async function create_task(config, event, assessment) {
     verdict: assessment.verdict,
     confidence: assessment.confidence,
     reasoning: assessment.reasoning,
-    action: assessment.suggested_action?.class,
+    actions: assessment.suggested_action?.classes,
     repo: event.repo,
   };
 

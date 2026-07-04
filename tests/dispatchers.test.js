@@ -48,7 +48,7 @@ function makeAssessment(overrides = {}) {
   return {
     verdict: 'accept',
     confidence: 0.9,
-    suggested_action: { class: 'dispatch', body: null, labels: [] },
+    suggested_action: { classes: ['dispatch'], body: null, labels: [] },
     ...overrides,
   };
 }

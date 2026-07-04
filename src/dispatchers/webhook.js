@@ -65,7 +65,9 @@ function buildPayload(event, assessment) {
     confidence: assessment?.confidence ?? null,
     reasoning: assessment?.reasoning ?? null,
     suggested_action: {
-      class: assessment?.suggested_action?.class ?? null,
+      classes: Array.isArray(assessment?.suggested_action?.classes)
+        ? assessment.suggested_action.classes
+        : [],
       body: assessment?.suggested_action?.body ?? null,
     },
     dispatched_at: new Date().toISOString(),

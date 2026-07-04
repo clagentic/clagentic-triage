@@ -213,7 +213,7 @@ export function noiseAssessment(enrichedEvent, preFilterResult) {
     confidence: preFilterResult.confidence,
     reasoning: `Pre-filter classified as noise: ${preFilterResult.reason}`,
     suggested_action: {
-      class: 'close',
+      classes: ['close'],
       body: null,
       dispatch_target: null,
       labels: [],

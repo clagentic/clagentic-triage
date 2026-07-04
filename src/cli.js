@@ -10,7 +10,7 @@
 import { argv } from 'node:process';
 import { fileURLToPath } from 'node:url';
 import { loadConfig, ConfigError } from './config/loader.js';
-import { listItems, readAll, resolveItem, QueueError } from './queue.js';
+import { listItems, readAll, resolveItem, getLifecycleState, QueueError } from './queue.js';
 import { runPipeline, processEvent } from './pipeline.js';
 import { startWebhookServer } from './webhooks/server.js';
 import { startStatusHookServer } from './status_hook.js';
@@ -380,6 +380,37 @@ async function cmdReview(flags) {
   }
 }
 
+/**
+ * Report an issue's current lifecycle state, derived live from its GitHub
+ * labels (T7, lr-f0f2) rather than any local/parallel store — see
+ * src/queue.js's getLifecycleState for the rationale.
+ *
+ * @param {string[]} args  - [repo, number], e.g. ["owner/repo", "42"]
+ * @param {Map<string,string|boolean>} flags
+ */
+async function cmdState(args, flags) {
+  const repo = args[0];
+  const numberArg = args[1];
+  const number = Number.parseInt(numberArg, 10);
+
+  if (!repo || !numberArg || Number.isNaN(number)) {
+    err('Usage: clagentic-triage state <owner/repo> <number> [--config <path>]');
+    process.exit(1);
+  }
+
+  const config = await getConfig(flags);
+  const adapter = await loadAdapter(config);
+
+  const { status, labels } = await getLifecycleState(config, adapter, { repo, number });
+
+  if (status === null) {
+    out(`${repo}#${number}: no status/* label present (labels: ${labels.join(', ') || '(none)'})`);
+    return;
+  }
+
+  out(`${repo}#${number}: status=${status} (labels: ${labels.join(', ')})`);
+}
+
 async function cmdApprove(args, flags) {
   const id = args[0];
   if (!id) {
@@ -399,36 +430,47 @@ async function cmdApprove(args, flags) {
   }
 
   const adapter = await loadAdapter(config);
-  const actionClass = item.assessment?.suggested_action?.class;
-  const body = item.assessment?.suggested_action?.body ?? '';
+  const suggestedAction = item.assessment?.suggested_action ?? {};
+  // T7 (lr-f0f2): a held item may name more than one action class — execute
+  // every one of them in order, same as the auto-approve path in pipeline.js.
+  // suggested_action.class (legacy singular) is still accepted for items that
+  // were queued before this migration and never re-assessed.
+  const actionClasses = Array.isArray(suggestedAction.classes)
+    ? suggestedAction.classes
+    : typeof suggestedAction.class === 'string'
+      ? [suggestedAction.class]
+      : [];
+  const body = suggestedAction.body ?? '';
   let dispatchResults = null;
 
-  // Execute the adapter action that was held for human approval.
-  switch (actionClass) {
-    case 'respond':
-      await adapter.post_comment(config, item.event, body);
-      break;
-    case 'request_changes':
-      await adapter.request_changes(config, item.event, body);
-      break;
-    case 'approve':
-      await adapter.approve_pr(config, item.event);
-      break;
-    case 'close':
-      await adapter.close_item(config, item.event);
-      break;
-    case 'dispatch':
-      // Fire all configured dispatchers.
-      dispatchResults = await dispatch(config, item.event, item.assessment);
-      break;
-    case 'escalate':
-    default:
-      // Nothing to execute — approval just records the human decision.
-      break;
+  // Execute the adapter action(s) that were held for human approval.
+  for (const actionClass of actionClasses) {
+    switch (actionClass) {
+      case 'respond':
+        await adapter.post_comment(config, item.event, body);
+        break;
+      case 'request_changes':
+        await adapter.request_changes(config, item.event, body);
+        break;
+      case 'approve':
+        await adapter.approve_pr(config, item.event);
+        break;
+      case 'close':
+        await adapter.close_item(config, item.event);
+        break;
+      case 'dispatch':
+        // Fire all configured dispatchers.
+        dispatchResults = await dispatch(config, item.event, item.assessment);
+        break;
+      case 'escalate':
+      default:
+        // Nothing to execute — approval just records the human decision.
+        break;
+    }
   }
 
   const updated = await resolveItem(config, id, { action: 'approved', dispatch_results: dispatchResults });
-  out(`Approved and dispatched: ${updated.id} (action=${actionClass})`);
+  out(`Approved and dispatched: ${updated.id} (actions=${actionClasses.join(',') || '(none)'})`);
 }
 
 async function cmdOverride(args, flags) {
@@ -500,6 +542,10 @@ Usage:
   clagentic-triage reject <id> [--config <path>]
     Reject a pending item.
 
+  clagentic-triage state <owner/repo> <number> [--config <path>]
+    Report an issue's current lifecycle state, derived live from its
+    status/* GitHub label (not a local store).
+
   clagentic-triage help
     Print this usage message.
 
@@ -552,6 +598,10 @@ async function main() {
 
       case 'reject':
         await cmdReject(args, flags);
+        break;
+
+      case 'state':
+        await cmdState(args, flags);
         break;
 
       case 'help':

@@ -29,7 +29,8 @@ export const name = 'noop';
 export async function create_task(config, event, assessment) {
   const eventId = event?.id ?? '(unknown)';
   const verdict = assessment?.verdict ?? '(no verdict)';
-  const action = assessment?.suggested_action?.class ?? '(no action)';
+  const classes = assessment?.suggested_action?.classes;
+  const action = Array.isArray(classes) && classes.length > 0 ? classes.join('+') : '(no action)';
 
   console.log(`[noop] create_task event=${eventId} verdict=${verdict} action=${action}`);
 

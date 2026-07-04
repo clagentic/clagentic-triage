@@ -530,12 +530,41 @@ function _validatePayload(payload) {
     );
   }
 
-  if (!VALID_ACTION_CLASSES.includes(payload.suggested_action.class)) {
+  // T7 (lr-f0f2): suggested_action.classes[] is the current shape — a single
+  // verdict may name more than one action class (e.g. respond + dispatch) so
+  // a comment, a status transition, and a link can be applied atomically.
+  // suggested_action.class (singular string) is still accepted from older
+  // LLM prompts/runners and normalized to a one-element classes[] array —
+  // named trade-off: the schema block in assessor.js only asks for classes[]
+  // going forward, but validation stays backward-compatible here so a runner
+  // that has not been updated (e.g. a stale clagentic-router deployment)
+  // degrades to "the one class it named" rather than a hard failure.
+  const rawClasses = Array.isArray(payload.suggested_action.classes)
+    ? payload.suggested_action.classes
+    : typeof payload.suggested_action.class === 'string'
+      ? [payload.suggested_action.class]
+      : null;
+
+  if (rawClasses === null || rawClasses.length === 0) {
     throw new LlmError(
-      `LLM response suggested_action.class "${payload.suggested_action.class}" is not valid. Expected one of: ${VALID_ACTION_CLASSES.join(', ')}`,
+      'LLM response suggested_action.classes must be a non-empty array (or suggested_action.class a string)',
       'bad_response',
     );
   }
+
+  for (const cls of rawClasses) {
+    if (!VALID_ACTION_CLASSES.includes(cls)) {
+      throw new LlmError(
+        `LLM response suggested_action.classes contains "${cls}", which is not valid. Expected one of: ${VALID_ACTION_CLASSES.join(', ')}`,
+        'bad_response',
+      );
+    }
+  }
+
+  // Normalize onto the payload so every caller downstream (assessor.js) can
+  // rely on suggested_action.classes being present and validated, regardless
+  // of which shape the runner actually returned.
+  payload.suggested_action.classes = rawClasses;
 
   return payload;
 }
