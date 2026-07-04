@@ -5,3 +5,9 @@ node_modules/
 
 # Agent worktrees (clagentic harness)
 .claude/
+
+# Scratch/working files that accumulate during agent sessions (lr-cf26)
+*.tap
+.scratch-*
+pr-body-*.txt
+test-out.txt

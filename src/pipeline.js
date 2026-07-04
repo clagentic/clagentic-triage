@@ -254,6 +254,16 @@ function _filterTrustedAxisLabels(config, labels) {
  * pass through unaffected; enforceSingleStatus (src/labels.js) never touches
  * them.
  *
+ * enforceSingleStatus throws RangeError if the incoming label set itself
+ * already contains more than one status/* value — an assessment-construction
+ * programmer error, not an adapter/network failure (lr-cf26). That case is
+ * caught explicitly, right at the call site, rather than left to propagate to
+ * processEvent's generic per-call-site `catch (labelErr)` handling: no labels
+ * are applied or removed (fail-safe — the item is never mislabeled), and a
+ * distinct warning identifies the single-status-invariant violation so it is
+ * not indistinguishable in logs from a transient adapter error. Any other
+ * error from this function still propagates unchanged.
+ *
  * @param {object} config
  * @param {object} event
  * @param {object} assessment
@@ -278,7 +288,23 @@ export async function _applyLabels(config, event, assessment, adapter, resultSta
   }
 
   const currentLabels = await adapter.get_item_labels(config, event);
-  const { toRemove, toApply } = enforceSingleStatus(config, currentLabels, labels);
+
+  let toRemove;
+  let toApply;
+  try {
+    ({ toRemove, toApply } = enforceSingleStatus(config, currentLabels, labels));
+  } catch (err) {
+    if (err instanceof RangeError) {
+      // Malformed incoming labels (multiple status/* values at once) — fail
+      // safe: apply/remove nothing rather than guess which status wins.
+      console.warn(
+        `[pipeline] _applyLabels: single-status invariant violated for event ` +
+        `${event?.id ?? '(unknown)'}: ${err.message}`,
+      );
+      return;
+    }
+    throw err;
+  }
 
   for (const label of toRemove) {
     await adapter.unlabel_item(config, event, label);
