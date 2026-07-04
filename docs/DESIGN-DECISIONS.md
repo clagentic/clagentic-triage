@@ -560,3 +560,103 @@ new App, gatekeeper, or "releaser" role. Issue bookkeeping remains triage's own 
   across any ticketing backend.
 - Wiring `enforceSingleStatus` into every other label-applying pipeline path (still T7,
   per DD-012's scope note) — this DD only wires it into the new release-notify path.
+
+---
+
+## DD-014: PR-merge and release/tag events are deterministic lifecycle transitions, routed outside the LLM-assessment pipeline
+
+**Decision:** Triage ingests two new GitHub event classes — `pull_request` merged to the
+default branch, and `release` publish — but neither ever reaches `enrich`/`assess`
+(`src/pipeline.js`'s `processEvent`). A new module, `src/lifecycle.js`, applies the two
+transitions directly against the adapter: a merge-to-default applies `status/awaiting-release`
+to every issue the PR's `closingIssuesReferences` resolves (T5, lr-6857); a published release
+applies the terminal `released` label (+ closes the issue with `state_reason: 'completed'`,
+distinct from the LLM `close` action class's `not_planned`) to every issue its release notes
+reference via a closing keyword. `awaiting-release != released` is enforced structurally: the
+merge path can only ever call `applyMergeTransition` (which only ever applies
+`awaiting-release`), and the release path can only ever call `applyReleaseTransition` (which
+only ever applies `released`) — there is no code path that lets a merge apply `released`.
+
+**Rationale:**
+- A merged PR or a published release is a fact, not a judgment call. Routing it through the
+  LLM assessor (which exists to interpret ambiguous human-authored issue/PR content) would be
+  both wasteful and a category error — there is nothing to triage. `src/lifecycle.js`'s module
+  docblock states this explicitly and the routing decision lives in exactly one place
+  (`routeEvent` in `src/cli.js`) so both the webhook and poll ingress paths share it.
+- **Merge-issue resolution reuses T5, never commit-message parsing.** `applyMergeTransition`
+  calls `adapter.get_pr_closing_issues` (the GraphQL `closingIssuesReferences` read) — the
+  same reliability guarantee T5 established: squash/merge strategies make commit messages an
+  unreliable carrier of the original PR body's closing keywords, so this task does not
+  reintroduce that class of bug.
+- **Release-issue resolution is release-body closing-keyword parsing — a named trade-off, not
+  an invented mechanism.** GitHub's `release` webhook payload carries no PR or commit list,
+  only `tag_name`/`target_commitish`/`body`. Resolving the *true* PR range for a release
+  requires a generic v*-tag detector with commit-range-to-PR association, which the plan
+  (tome #670) explicitly defers to **T8** (crew-manifest, private module) as a v2-cut-line
+  follow-on. `applyReleaseTransition` instead reuses T5's already-reviewed
+  `parse_closing_keyword_refs` against the release body — this covers the common case
+  (GitHub-generated and most changelog-tool release notes already carry `Closes #NN`-shaped
+  entries per PR) without inventing new GraphQL surface area out of this task's scope.
+  **Residual gap:** a release whose notes do not repeat each PR's closing keyword will not
+  transition its issues to `released` via this path; T8's generic detector is the intended
+  long-term fix. Tracked as a known limitation, not a silent gap — see `src/lifecycle.js`'s
+  `applyReleaseTransition` docblock.
+- **`close_item_completed` is a new adapter method, not a `close_item` reuse.** `close_item`
+  hardcodes `state_reason: 'not_planned'`, correct for the LLM-assessed `close` action class
+  (reject/decline), but semantically wrong for "this shipped." Overloading `close_item` with a
+  flag would mean every existing caller silently changes behavior unless updated; a distinct,
+  additive method (mirroring the `label_item`/`unlabel_item` precedent, DD-012) keeps the two
+  close semantics — and their very different meaning to a repo's contributors — clearly
+  separated at the interface level. Idempotent on an already-closed issue, same guarantee as
+  `close_item`.
+- **Default-branch detection needs the repo's actual default branch, not a guess.** The webhook
+  path gets `default_branch` for free from `payload.repository.default_branch` — carried into
+  `event.metadata.default_branch` by `normalize_webhook`. The poll path's PR-list endpoint does
+  not include repo-level fields, so `list_merged_prs` resolves it once per repo via the new
+  `get_default_branch` method. `isMergedToDefaultBranch` compares `metadata.base_ref` against
+  `metadata.default_branch` and fails closed (returns `false`, not "assume main") when the
+  default branch could not be resolved — an unresolved default branch is "not actionable," not
+  "probably main."
+
+**Implementation:**
+- `src/lifecycle.js` — `isMergedToDefaultBranch(event)` (pure predicate), `applyMergeTransition`,
+  `applyReleaseTransition`. Both transition functions share `_applyStatusLabel`, a small
+  private helper wrapping `enforceSingleStatus` (DD-012) + `get_item_labels`/`label_item`/
+  `unlabel_item`, so both paths get the single-status invariant and idempotent no-op behavior
+  (skip relabeling if the target label is already applied) for free.
+- `src/adapters/github.js`:
+  - `_normalize` gained an optional `defaultBranch` parameter, stored as
+    `metadata.default_branch`. `normalize_webhook`'s `pull_request` branch passes
+    `payload.repository.default_branch` through.
+  - `metadata.merged` detection now also checks `raw.merged_at` directly (the shape the real
+    `pulls` REST list endpoint uses), in addition to the existing
+    `raw.pull_request?.merged_at` (issues-list endpoint shape) and `raw.merged` (boolean) checks.
+  - `normalize_webhook` gained a `release` branch: only `payload.action === 'published'`
+    normalizes (drafts, edits, deletions, and un-publishes return `null` — `published` is the
+    one unambiguous "this is now live" signal, and also fires for prereleases). Releases
+    normalize to a distinct `type: 'release'` Event shape (`_normalizeRelease`) — not an
+    issue/PR — carrying `tag_name`, `target_commitish`, `draft`, `prerelease`, `published_at`.
+  - New poll-path methods: `get_default_branch(config, repo)`, `list_merged_prs(config, repo,
+    since)` (closed PRs with a non-null `merged_at`), `list_releases(config, repo)` (non-draft
+    releases), and `list_lifecycle_events(config, since)` (aggregates both across every repo
+    `config.source` resolves to — the repo-resolution logic itself was extracted from
+    `list_events` into a shared `_resolveRepos` helper so both call sites share one
+    implementation of the org-wildcard-vs-explicit-list contract).
+  - New `close_item_completed(config, event)` — additive alongside `close_item`.
+- `src/cli.js` — `routeEvent(config, event, adapter)`: the single dispatch point. `type ===
+  'release'` -> `applyReleaseTransition`; `type === 'pr'` and `isMergedToDefaultBranch(event)`
+  -> `applyMergeTransition`; everything else -> the existing `processEvent` LLM pipeline. Both
+  `cmdWatch`'s webhook `onEvent` and poll `tick`, and `cmdRun`'s single pass, call `routeEvent`
+  for webhook deliveries and use `adapter.list_lifecycle_events` (guarded by a
+  `typeof === 'function'` check, since the interface addition is optional for adapters that
+  have not implemented it yet) to source lifecycle events on the poll path.
+- `docs/ADAPTERS.md` — documents the four new/changed adapter methods and the `release` webhook
+  event type.
+
+**What is explicitly out of scope for this task (see tome #670):**
+- **T7** (multi-action verdicts, per-issue lifecycle state derived live from labels) — this
+  task's transitions are single-purpose (one label + optional close), not a general
+  multi-action verdict engine.
+- **T8** (generic v*-tag release detector with true commit-range-to-PR association) — the
+  release-body closing-keyword parse here is the interim, named-trade-off mechanism; T8 is the
+  long-term fix for releases whose notes do not repeat each PR's closing keyword.

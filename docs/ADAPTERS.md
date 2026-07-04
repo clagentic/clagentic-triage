@@ -22,12 +22,16 @@ export const name = 'myadapter'
 export async function list_events(config, since) { }              // returns Event[]
 export async function post_comment(config, event, body) { }
 export async function close_item(config, event) { }
+export async function close_item_completed(config, event) { }       // close with state_reason='completed'
 export async function request_changes(config, event, body) { }
 export async function approve_pr(config, event) { }
 export async function label_item(config, event, labels) { }         // add labels
 export async function unlabel_item(config, event, label) { }        // remove a single label
 export async function get_item_labels(config, event) { }            // returns string[] — current labels
 export async function list_comments(config, event) { }               // returns raw comment objects
+export async function get_default_branch(config, repo) { }           // returns string|null
+export async function list_merged_prs(config, repo, since) { }        // returns merged PR Event[]
+export async function list_releases(config, repo) { }                 // returns published release Event[]
 
 // --- Webhook interface (required for inbound webhook server) ---
 export function verify_webhook(rawBody, headers, secret) { }      // returns boolean
@@ -39,6 +43,14 @@ export function is_bot_sender(payload, allowList) { }             // returns boo
 `since` is an ISO timestamp string. Return only events newer than `since`.
 
 The adapter must not throw on auth failure from `list_events` — return an empty array and log a warning.
+
+**`close_item_completed(config, event) -> void`**
+
+Close an issue with `state_reason: 'completed'` — distinct from `close_item`'s hardcoded
+`not_planned` reason. Used by the release lifecycle transition (`src/lifecycle.js`, T6/
+lr-d557): a shipped issue closes as genuinely resolved, not as rejected/declined (the meaning
+`close_item` carries for the LLM-assessed `close` action class). Idempotent: PATCHing
+`state=closed` on an already-closed issue is a no-op on GitHub's side.
 
 **`unlabel_item(config, event, label) -> void`**
 
@@ -60,6 +72,27 @@ List all comments on an item as raw provider objects. Used by idempotency checks
 that need to scan for a prior marker before posting a duplicate comment. Not part of the
 poll/webhook ingress path — new comments are already delivered as `issue_comment` events on
 the GitHub webhook path.
+
+**`get_default_branch(config, repo) -> string|null`**
+
+Fetch the repo's default branch name. Used by the lifecycle layer (`src/lifecycle.js`, T6/
+lr-d557) to decide whether a merged PR's base branch is the default branch — the trigger for
+the `status/awaiting-release` transition. The webhook path gets this for free from the
+`pull_request` payload's `repository.default_branch` field (carried into
+`event.metadata.default_branch` by `normalize_webhook`); the poll path (`list_merged_prs`)
+calls this method once per repo since the REST PR-list endpoint does not include it.
+
+**`list_merged_prs(config, repo, since) -> Event[]`**
+
+Poll-path equivalent of the `pull_request` webhook's merged signal: lists closed PRs with a
+non-null `merged_at`, normalized the same way as the webhook path (`type: 'pr'`,
+`metadata.merged: true`, `metadata.default_branch` populated).
+
+**`list_releases(config, repo) -> Event[]`**
+
+Poll-path equivalent of the `release` webhook's `published` action: lists non-draft releases,
+normalized to `type: 'release'` Events (distinct from issue/PR Events — see
+`docs/ARCHITECTURE.md`).
 
 ### Webhook interface
 
@@ -94,6 +127,13 @@ Map a provider's raw webhook payload to the standard Event schema. The adapter r
 provider-specific headers (such as an event-type header) from `headers` internally.
 Return `null` for event types the adapter does not support — the server will acknowledge
 the delivery with a 200 and log it as unsupported.
+
+Supported GitHub event types: `issues`, `pull_request`, `issue_comment`,
+`pull_request_review`, `release` (T6, lr-d557 — only `action: 'published'` release
+deliveries normalize to an Event; other release actions return `null`). A `release` Event
+uses `type: 'release'` — distinct from the issue/PR Event shape — and must never be routed
+into the LLM-assessment pipeline (`enrich`/`assess` assume issue/PR content). Callers branch
+on `event.type` before dispatch; see `docs/ARCHITECTURE.md`.
 
 This method should share normalization logic with the poll path (`list_events` / `_normalize`)
 so the Event shape is identical regardless of ingress path.

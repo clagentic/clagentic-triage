@@ -13,6 +13,7 @@ import {
   post_comment,
   list_comments,
   close_item,
+  close_item_completed,
   request_changes,
   approve_pr,
   label_item,
@@ -20,6 +21,10 @@ import {
   get_item_labels,
   get_pr_closing_issues,
   parse_closing_keyword_refs,
+  get_default_branch,
+  list_merged_prs,
+  list_releases,
+  list_lifecycle_events,
   AdapterError,
 } from '../src/adapters/github.js';
 
@@ -573,6 +578,44 @@ describe('close_item', () => {
 });
 
 // ---------------------------------------------------------------------------
+// close_item_completed (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+describe('close_item_completed', () => {
+  it('closes an issue with state=closed and state_reason=completed', async () => {
+    let capturedUrl;
+    let capturedBody;
+    let capturedMethod;
+
+    globalThis.fetch = async (url, opts) => {
+      capturedUrl = url;
+      capturedBody = JSON.parse(opts.body);
+      capturedMethod = opts.method;
+      return mockResponse(200, {});
+    };
+
+    const config = makeConfig();
+    const event = { repo: 'example/repo', number: 42 };
+
+    await close_item_completed(config, event);
+
+    assert.equal(capturedMethod, 'PATCH');
+    assert.equal(capturedUrl, 'https://api.github.com/repos/example/repo/issues/42');
+    assert.equal(capturedBody.state, 'closed');
+    assert.equal(capturedBody.state_reason, 'completed');
+  });
+
+  it('throws AdapterError on a non-2xx response', async () => {
+    globalThis.fetch = async () => mockResponse(500, { message: 'boom' });
+
+    const config = makeConfig();
+    const event = { repo: 'example/repo', number: 42 };
+
+    await assert.rejects(() => close_item_completed(config, event), AdapterError);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Test 9: request_changes on issue throws AdapterError
 // ---------------------------------------------------------------------------
 
@@ -1018,6 +1061,167 @@ describe('get_pr_closing_issues', () => {
       (err) => {
         assert.ok(err instanceof AdapterError);
         assert.equal(err.code, 'auth_failure');
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// get_default_branch (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+describe('get_default_branch', () => {
+  it('returns the repo default_branch field', async () => {
+    let capturedUrl;
+    globalThis.fetch = async (url) => {
+      capturedUrl = url;
+      return mockResponse(200, { default_branch: 'main' });
+    };
+
+    const config = makeConfig();
+    const result = await get_default_branch(config, 'example/repo');
+
+    assert.equal(capturedUrl, 'https://api.github.com/repos/example/repo');
+    assert.equal(result, 'main');
+  });
+
+  it('returns null on a non-2xx response (does not throw)', async () => {
+    globalThis.fetch = async () => mockResponse(404, { message: 'Not Found' });
+
+    const config = makeConfig();
+    const result = await get_default_branch(config, 'example/repo');
+
+    assert.equal(result, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// list_merged_prs (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+describe('list_merged_prs', () => {
+  it('returns only merged PRs, normalized with default_branch populated', async () => {
+    const mergedPr = makeRawPr({
+      number: 7,
+      merged_at: '2026-07-04T00:00:00Z',
+      pull_request: { merged_at: '2026-07-04T00:00:00Z' },
+      base: { ref: 'main' },
+    });
+    const unmergedClosedPr = makeRawPr({
+      number: 8,
+      merged_at: null,
+      pull_request: { merged_at: null },
+    });
+
+    globalThis.fetch = async (url) => {
+      if (url.includes('/repos/example/repo/pulls')) {
+        return mockResponse(200, [mergedPr, unmergedClosedPr]);
+      }
+      // get_default_branch call
+      return mockResponse(200, { default_branch: 'main' });
+    };
+
+    const config = makeConfig();
+    const events = await list_merged_prs(config, 'example/repo');
+
+    assert.equal(events.length, 1);
+    assert.equal(events[0].number, 7);
+    assert.equal(events[0].type, 'pr');
+    assert.equal(events[0].metadata.merged, true);
+    assert.equal(events[0].metadata.base_ref, 'main');
+    assert.equal(events[0].metadata.default_branch, 'main');
+  });
+
+  it('returns empty array when no token is configured', async () => {
+    const config = makeConfig({ _token: null });
+    const events = await list_merged_prs(config, 'example/repo');
+    assert.deepEqual(events, []);
+  });
+
+  it('returns empty array on auth failure (does not throw)', async () => {
+    globalThis.fetch = async () => mockResponse(401, { message: 'Bad credentials' });
+
+    const config = makeConfig();
+    const events = await list_merged_prs(config, 'example/repo');
+    assert.deepEqual(events, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// list_releases (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+describe('list_releases', () => {
+  it('returns published, non-draft releases normalized to type=release', async () => {
+    const published = { id: 1, tag_name: 'v1.0.0', draft: false, prerelease: false, body: 'Closes #1' };
+    const draft = { id: 2, tag_name: 'v1.1.0-draft', draft: true, prerelease: false, body: '' };
+
+    globalThis.fetch = async () => mockResponse(200, [published, draft]);
+
+    const config = makeConfig();
+    const events = await list_releases(config, 'example/repo');
+
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'release');
+    assert.equal(events[0].metadata.tag_name, 'v1.0.0');
+  });
+
+  it('returns empty array when no token is configured', async () => {
+    const config = makeConfig({ _token: null });
+    const events = await list_releases(config, 'example/repo');
+    assert.deepEqual(events, []);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// list_lifecycle_events (T6, lr-d557)
+// ---------------------------------------------------------------------------
+
+describe('list_lifecycle_events', () => {
+  it('aggregates merged PRs and releases across resolved repos', async () => {
+    const mergedPr = makeRawPr({
+      number: 7,
+      merged_at: '2026-07-04T00:00:00Z',
+      pull_request: { merged_at: '2026-07-04T00:00:00Z' },
+      base: { ref: 'main' },
+    });
+    const release = { id: 1, tag_name: 'v1.0.0', draft: false, body: 'Closes #1' };
+
+    globalThis.fetch = async (url) => {
+      if (url.includes('/pulls')) {
+        return mockResponse(200, [mergedPr]);
+      }
+      if (url.includes('/releases')) {
+        return mockResponse(200, [release]);
+      }
+      // get_default_branch
+      return mockResponse(200, { default_branch: 'main' });
+    };
+
+    const config = makeConfig({ source: { adapter: 'github', org: null, repos: ['example/repo'], allow_bot_logins: [] } });
+    const { mergedPrs, releases } = await list_lifecycle_events(config);
+
+    assert.equal(mergedPrs.length, 1);
+    assert.equal(mergedPrs[0].number, 7);
+    assert.equal(releases.length, 1);
+    assert.equal(releases[0].metadata.tag_name, 'v1.0.0');
+  });
+
+  it('returns empty lists when no token is configured', async () => {
+    const config = makeConfig({ _token: null });
+    const result = await list_lifecycle_events(config);
+    assert.deepEqual(result, { mergedPrs: [], releases: [] });
+  });
+
+  it("throws AdapterError when repos=['*'] and no org is set", async () => {
+    const config = makeConfig({ source: { repos: ['*'], org: null, allow_bot_logins: [] } });
+
+    await assert.rejects(
+      () => list_lifecycle_events(config),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        assert.ok(err.message.includes('org'));
         return true;
       },
     );
