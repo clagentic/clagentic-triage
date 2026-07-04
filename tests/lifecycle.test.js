@@ -19,6 +19,13 @@ import {
 
 function makeConfig(overrides = {}) {
   return {
+    // Watch scope defaults to exactly the fixtures' own repo ("owner/repo") so
+    // same-repo release-transition tests pass the scope check by default.
+    // Cross-repo scope tests below override `source` explicitly.
+    source: {
+      repos: ['owner/repo'],
+      org: null,
+    },
     labels: {
       status_namespace: 'status',
       status_values: ['needs-triage', 'in-review', 'awaiting-release', 'released'],
@@ -242,8 +249,8 @@ describe('applyReleaseTransition', () => {
     assert.equal(state.closeCalls.length, 1);
   });
 
-  it('honors cross-repo owner/repo#N references in the release body', async () => {
-    const config = makeConfig();
+  it('honors an in-scope cross-repo owner/repo#N reference in the release body', async () => {
+    const config = makeConfig({ source: { repos: ['owner/repo', 'other-org/other-repo'], org: null } });
     const { adapter, state } = makeFakeAdapter();
 
     const event = makeReleaseEvent({ body: 'Fixes other-org/other-repo#99' });
@@ -251,6 +258,62 @@ describe('applyReleaseTransition', () => {
 
     assert.deepEqual(result.issues, [{ repo: 'other-org/other-repo', number: 99, labeled: true, closed: true }]);
     assert.deepEqual(state.labels['other-org/other-repo#99'], ['status/released']);
+  });
+
+  it('drops an out-of-scope cross-repo reference — confused-deputy guard (BOBBIE review 4629660561)', async () => {
+    // Default makeConfig() watch scope is exactly "owner/repo"; a release body
+    // for that repo referencing a DIFFERENT, unconfigured repo must not drive
+    // any label/close call against it — the release body is publisher-
+    // controlled, not operator-controlled trust input.
+    const config = makeConfig();
+    const { adapter, state } = makeFakeAdapter();
+
+    const event = makeReleaseEvent({ body: 'Fixes some-other-org/some-other-repo#1' });
+    const result = await applyReleaseTransition(config, adapter, event);
+
+    assert.equal(result.applied, false);
+    assert.deepEqual(result.issues, []);
+    assert.equal(state.labelCalls.length, 0);
+    assert.equal(state.closeCalls.length, 0);
+    assert.equal(state.labels['some-other-org/some-other-repo#1'], undefined);
+  });
+
+  it('drops an out-of-scope SAME-repo-shaped ref when the watch scope is narrower still', async () => {
+    // Even a same-repo bare #N ref must respect the watch scope: if the
+    // operator's config does not include the release's own repo, nothing
+    // should be actioned (defense in depth against a misconfigured scope).
+    const config = makeConfig({ source: { repos: ['some-other/repo'], org: null } });
+    const { adapter, state } = makeFakeAdapter();
+
+    const result = await applyReleaseTransition(config, adapter, makeReleaseEvent());
+
+    assert.equal(result.applied, false);
+    assert.deepEqual(result.issues, []);
+    assert.equal(state.labelCalls.length, 0);
+    assert.equal(state.closeCalls.length, 0);
+  });
+
+  it('honors cross-repo refs under an org wildcard scope when the ref owner matches the org', async () => {
+    const config = makeConfig({ source: { repos: ['*'], org: 'owner' } });
+    const { adapter, state } = makeFakeAdapter();
+
+    const event = makeReleaseEvent({ body: 'Fixes owner/another-repo#5' });
+    const result = await applyReleaseTransition(config, adapter, event);
+
+    assert.deepEqual(result.issues, [{ repo: 'owner/another-repo', number: 5, labeled: true, closed: true }]);
+    assert.deepEqual(state.labels['owner/another-repo#5'], ['status/released']);
+  });
+
+  it('drops cross-repo refs under an org wildcard scope when the ref owner does not match the org', async () => {
+    const config = makeConfig({ source: { repos: ['*'], org: 'owner' } });
+    const { adapter, state } = makeFakeAdapter();
+
+    const event = makeReleaseEvent({ body: 'Fixes attacker-org/evil-repo#1' });
+    const result = await applyReleaseTransition(config, adapter, event);
+
+    assert.equal(result.applied, false);
+    assert.deepEqual(result.issues, []);
+    assert.equal(state.labelCalls.length, 0);
   });
 
   it('is a no-op for an event that is not type=release', async () => {

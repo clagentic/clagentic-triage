@@ -21,6 +21,7 @@ import {
   get_item_labels,
   get_pr_closing_issues,
   parse_closing_keyword_refs,
+  is_repo_in_watch_scope,
   get_default_branch,
   list_merged_prs,
   list_releases,
@@ -924,6 +925,48 @@ describe('parse_closing_keyword_refs', () => {
       sameRepoRefs: [],
       crossRepoRefs: [],
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// is_repo_in_watch_scope (lr-d557 BOBBIE remediation, review 4629660561)
+// ---------------------------------------------------------------------------
+
+describe('is_repo_in_watch_scope', () => {
+  it('returns true for a repo in an explicit repos list', () => {
+    const config = { source: { repos: ['example/repo', 'other-org/other-repo'], org: null } };
+    assert.equal(is_repo_in_watch_scope(config, 'other-org/other-repo'), true);
+  });
+
+  it('returns false for a repo NOT in an explicit repos list', () => {
+    const config = { source: { repos: ['example/repo'], org: null } };
+    assert.equal(is_repo_in_watch_scope(config, 'attacker-org/evil-repo'), false);
+  });
+
+  it('qualifies unqualified explicit repo entries with source.org, mirroring _resolveRepos', () => {
+    const config = { source: { repos: ['repo'], org: 'example' } };
+    assert.equal(is_repo_in_watch_scope(config, 'example/repo'), true);
+    assert.equal(is_repo_in_watch_scope(config, 'other-org/repo'), false);
+  });
+
+  it('returns true for any repo owned by source.org under the repos=["*"] wildcard', () => {
+    const config = { source: { repos: ['*'], org: 'example' } };
+    assert.equal(is_repo_in_watch_scope(config, 'example/repo'), true);
+    assert.equal(is_repo_in_watch_scope(config, 'example/another-repo'), true);
+  });
+
+  it('returns false for a different owner under the repos=["*"] wildcard', () => {
+    const config = { source: { repos: ['*'], org: 'example' } };
+    assert.equal(is_repo_in_watch_scope(config, 'attacker-org/evil-repo'), false);
+  });
+
+  it('fails closed (returns false) when repos=["*"] and no org is configured', () => {
+    const config = { source: { repos: ['*'], org: null } };
+    assert.equal(is_repo_in_watch_scope(config, 'anything/anything'), false);
+  });
+
+  it('defaults to the fail-closed wildcard behavior when source is entirely absent', () => {
+    assert.equal(is_repo_in_watch_scope({}, 'anything/anything'), false);
   });
 });
 

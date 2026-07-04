@@ -601,6 +601,26 @@ only ever applies `released`) — there is no code path that lets a merge apply 
   transition its issues to `released` via this path; T8's generic detector is the intended
   long-term fix. Tracked as a known limitation, not a silent gap — see `src/lifecycle.js`'s
   `applyReleaseTransition` docblock.
+- **Every parsed ref — same-repo AND cross-repo — is validated against the configured watch
+  scope before it drives any adapter call (BOBBIE pre-merge review 4629660561).** The release
+  body is publisher/attacker-controlled text, not operator-controlled configuration: honoring
+  cross-repo refs (rationale above) without a scope check let a malicious or careless release
+  note (e.g. `Fixes some-other-org/some-other-repo#1`) drive triage's own token/App installation
+  to label/close an issue in a repo the operator never configured triage to watch — a
+  confused-deputy write. This is a structural regression class relative to
+  `applyMergeTransition`, which only ever acts on the GraphQL-resolved same-repo
+  `closingIssuesReferences` set and already discards cross-repo refs; the release path's wider
+  trust surface (cross-repo refs are meaningful here, unlike the merge path) requires an
+  explicit, matching guard rather than an implicit "same repo" boundary. `applyReleaseTransition`
+  filters `[...sameRepoRefs, ...crossRepoRefs]` through `is_repo_in_watch_scope(config,
+  "owner/repo")` (`src/adapters/github.js`) before building any target event; out-of-scope refs
+  are dropped silently (not acted on, not an error — a release author does not get an error
+  channel into triage's watch-scope decisions). `is_repo_in_watch_scope` is the same
+  `config.source.repos`/`config.source.org` contract `_resolveRepos` already enforces for
+  polling, expressed as a pure per-repo membership check (no network call) so a single
+  candidate repo can be validated without listing every repo the config resolves to. It fails
+  closed: `repos: ['*']` with no `source.org` configured is out of scope for every repo, exactly
+  matching `_resolveRepos`'s existing refusal to expand a wildcard without an org.
 - **`close_item_completed` is a new adapter method, not a `close_item` reuse.** `close_item`
   hardcodes `state_reason: 'not_planned'`, correct for the LLM-assessed `close` action class
   (reject/decline), but semantically wrong for "this shipped." Overloading `close_item` with a
@@ -643,6 +663,10 @@ only ever applies `released`) — there is no code path that lets a merge apply 
     `list_events` into a shared `_resolveRepos` helper so both call sites share one
     implementation of the org-wildcard-vs-explicit-list contract).
   - New `close_item_completed(config, event)` — additive alongside `close_item`.
+  - New `is_repo_in_watch_scope(config, repo)` — pure, network-free membership check against
+    `config.source.repos`/`config.source.org`, factored out of (and matching) `_resolveRepos`'s
+    existing scoping contract. Used by `applyReleaseTransition` to drop out-of-scope refs before
+    they can drive any label/close call (see rationale above).
 - `src/cli.js` — `routeEvent(config, event, adapter)`: the single dispatch point. `type ===
   'release'` -> `applyReleaseTransition`; `type === 'pr'` and `isMergedToDefaultBranch(event)`
   -> `applyMergeTransition`; everything else -> the existing `processEvent` LLM pipeline. Both

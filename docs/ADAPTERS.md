@@ -32,6 +32,7 @@ export async function list_comments(config, event) { }               // returns 
 export async function get_default_branch(config, repo) { }           // returns string|null
 export async function list_merged_prs(config, repo, since) { }        // returns merged PR Event[]
 export async function list_releases(config, repo) { }                 // returns published release Event[]
+export function is_repo_in_watch_scope(config, repo) { }               // returns boolean (no network call)
 
 // --- Webhook interface (required for inbound webhook server) ---
 export function verify_webhook(rawBody, headers, secret) { }      // returns boolean
@@ -93,6 +94,17 @@ non-null `merged_at`, normalized the same way as the webhook path (`type: 'pr'`,
 Poll-path equivalent of the `release` webhook's `published` action: lists non-draft releases,
 normalized to `type: 'release'` Events (distinct from issue/PR Events — see
 `docs/ARCHITECTURE.md`).
+
+**`is_repo_in_watch_scope(config, repo) -> boolean`**
+
+Pure, network-free membership check: does `repo` ("owner/repo") fall within the operator's
+configured watch scope (`config.source.repos` / `config.source.org`)? Mirrors the same
+scoping contract `_resolveRepos` uses internally for polling, factored out as a single-repo
+check for callers that only have one candidate repo to validate — notably
+`applyReleaseTransition` (`src/lifecycle.js`, DD-014), which must validate every
+`owner/repo#N` ref parsed out of publisher-controlled release-note text before acting on it,
+since that text is not operator-controlled configuration. Fails closed: `repos: ['*']` with
+no `source.org` set is out of scope for every repo.
 
 ### Webhook interface
 

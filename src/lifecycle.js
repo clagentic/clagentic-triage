@@ -23,7 +23,7 @@
  */
 
 import { enforceSingleStatus } from './labels.js';
-import { parse_closing_keyword_refs } from './adapters/github.js';
+import { parse_closing_keyword_refs, is_repo_in_watch_scope } from './adapters/github.js';
 
 /** The status/* value applied when a PR merges to the default branch. */
 const AWAITING_RELEASE_STATUS_VALUE = 'awaiting-release';
@@ -165,6 +165,15 @@ export async function applyMergeTransition(config, adapter, prEvent) {
  * same-repo only); it only needs "this release's notes say issue N shipped,"
  * which is a statement the release author can make about any repo.
  *
+ * Release-body text is publisher-controlled, not operator-controlled — a
+ * malicious or careless release note (e.g. `Fixes some-other-org/some-repo#1`)
+ * must not let triage act against a repo the operator never configured it to
+ * watch. Every ref (same-repo AND cross-repo) is therefore validated against
+ * the configured watch scope (`is_repo_in_watch_scope`, the same
+ * `config.source.repos`/`config.source.org` contract `_resolveRepos` enforces
+ * elsewhere in the adapter) before any label/close call is made; out-of-scope
+ * refs are dropped, never acted on. See docs/DESIGN-DECISIONS.md DD-014.
+ *
  * Idempotent per issue: skips relabeling if `released` is already applied,
  * and skips closing if the issue is already closed.
  *
@@ -189,7 +198,9 @@ export async function applyReleaseTransition(config, adapter, releaseEvent) {
     releaseEvent.body,
     releaseEvent.repo,
   );
-  const refs = [...sameRepoRefs, ...crossRepoRefs];
+  const refs = [...sameRepoRefs, ...crossRepoRefs].filter((ref) =>
+    is_repo_in_watch_scope(config, `${ref.owner}/${ref.repo}`),
+  );
 
   const statusLabel = _statusLabel(config, RELEASED_STATUS_VALUE);
   const issues = [];

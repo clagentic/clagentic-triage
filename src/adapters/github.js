@@ -449,6 +449,45 @@ function _filterAndNormalize(raw, repo, config, allowBotLogins, capEnabled, auth
 }
 
 /**
+ * Return true if `repo` ("owner/repo") falls within the operator's configured
+ * watch scope (`config.source.repos` / `config.source.org`), without making
+ * any network call.
+ *
+ * This is the same scoping contract `_resolveRepos` enforces for polling,
+ * expressed as a pure membership check so callers that only have a single
+ * candidate repo (e.g. a cross-repo ref parsed out of release-note text,
+ * T6/lr-d557's `applyReleaseTransition`) can validate it without listing
+ * every repo the config resolves to:
+ *
+ *   - `source.repos` is an explicit list (not `['*']`): `repo` must appear in
+ *     it verbatim, or as `org/name` once qualified with `source.org` for any
+ *     unqualified entries — mirroring `_resolveRepos`'s own qualification step.
+ *   - `source.repos` is `['*']` (the default): every repo is qualified by
+ *     `source.org`; a repo is in scope only if its owner matches `source.org`.
+ *     With no `source.org` set, nothing is in scope (fail closed — the operator
+ *     has not told triage which org it watches).
+ *
+ * @param {object} config
+ * @param {string} repo - "owner/repo" string to check
+ * @returns {boolean}
+ */
+export function is_repo_in_watch_scope(config, repo) {
+  const cfgRepos = config.source?.repos ?? ['*'];
+  const org = config.source?.org ?? null;
+
+  if (cfgRepos.includes('*')) {
+    if (!org) {
+      return false;
+    }
+    const [repoOwner] = repo.split('/');
+    return repoOwner === org;
+  }
+
+  const qualified = cfgRepos.map((r) => (org && !r.includes('/') ? `${org}/${r}` : r));
+  return qualified.includes(repo);
+}
+
+/**
  * Resolve the list of "owner/repo" strings to query, expanding the `['*']`
  * wildcard against `config.source.org` when needed.
  *
