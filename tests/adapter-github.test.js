@@ -18,6 +18,8 @@ import {
   label_item,
   unlabel_item,
   get_item_labels,
+  get_pr_closing_issues,
+  parse_closing_keyword_refs,
   AdapterError,
 } from '../src/adapters/github.js';
 
@@ -821,6 +823,201 @@ describe('get_item_labels', () => {
       () => get_item_labels(config, event),
       (err) => {
         assert.ok(err instanceof AdapterError);
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// parse_closing_keyword_refs (T5, lr-6857)
+// ---------------------------------------------------------------------------
+
+describe('parse_closing_keyword_refs', () => {
+  it('detects a cross-repo owner/repo#N closing-keyword reference', () => {
+    const body = 'This closes example/other-repo#99 once merged.';
+    const { sameRepoRefs, crossRepoRefs } = parse_closing_keyword_refs(body, 'example/repo');
+
+    assert.deepEqual(crossRepoRefs, [{ owner: 'example', repo: 'other-repo', number: 99 }]);
+    assert.deepEqual(sameRepoRefs, []);
+  });
+
+  it('detects a bare same-repo #N closing-keyword reference', () => {
+    const body = 'Fixes #12 and resolves #34.';
+    const { sameRepoRefs, crossRepoRefs } = parse_closing_keyword_refs(body, 'example/repo');
+
+    assert.deepEqual(sameRepoRefs, [
+      { owner: 'example', repo: 'repo', number: 12 },
+      { owner: 'example', repo: 'repo', number: 34 },
+    ]);
+    assert.deepEqual(crossRepoRefs, []);
+  });
+
+  it('separates same-repo and cross-repo refs when both appear in one body', () => {
+    const body = 'Fixed #5. Also fixes other-org/other-repo#7 and closed #8.';
+    const { sameRepoRefs, crossRepoRefs } = parse_closing_keyword_refs(body, 'example/repo');
+
+    assert.deepEqual(sameRepoRefs, [
+      { owner: 'example', repo: 'repo', number: 5 },
+      { owner: 'example', repo: 'repo', number: 8 },
+    ]);
+    assert.deepEqual(crossRepoRefs, [{ owner: 'other-org', repo: 'other-repo', number: 7 }]);
+  });
+
+  it('ignores non-keyword issue mentions (e.g. "see #5")', () => {
+    const body = 'See #5 for background; related to example/other#6.';
+    const { sameRepoRefs, crossRepoRefs } = parse_closing_keyword_refs(body, 'example/repo');
+
+    assert.deepEqual(sameRepoRefs, []);
+    assert.deepEqual(crossRepoRefs, []);
+  });
+
+  it('returns empty arrays for an empty or missing body', () => {
+    assert.deepEqual(parse_closing_keyword_refs('', 'example/repo'), {
+      sameRepoRefs: [],
+      crossRepoRefs: [],
+    });
+    assert.deepEqual(parse_closing_keyword_refs(undefined, 'example/repo'), {
+      sameRepoRefs: [],
+      crossRepoRefs: [],
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// get_pr_closing_issues (T5, lr-6857)
+// ---------------------------------------------------------------------------
+
+describe('get_pr_closing_issues', () => {
+  it('returns the same-repo closing set from GraphQL closingIssuesReferences', async () => {
+    let capturedUrl;
+    let capturedBody;
+
+    globalThis.fetch = async (url, opts) => {
+      capturedUrl = url;
+      capturedBody = JSON.parse(opts.body);
+      return mockResponse(200, {
+        data: {
+          repository: {
+            pullRequest: {
+              closingIssuesReferences: {
+                nodes: [
+                  {
+                    number: 42,
+                    title: 'Some bug',
+                    url: 'https://github.com/example/repo/issues/42',
+                    state: 'OPEN',
+                    repository: { owner: { login: 'example' }, name: 'repo' },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      });
+    };
+
+    const config = makeConfig();
+    const event = { type: 'pr', repo: 'example/repo', number: 7, body: 'Fixes #42.' };
+
+    const result = await get_pr_closing_issues(config, event);
+
+    assert.equal(capturedUrl, 'https://api.github.com/graphql');
+    assert.deepEqual(capturedBody.variables, { owner: 'example', name: 'repo', number: 7 });
+    assert.deepEqual(result.closingIssues, [
+      {
+        owner: 'example',
+        repo: 'repo',
+        number: 42,
+        title: 'Some bug',
+        url: 'https://github.com/example/repo/issues/42',
+        state: 'OPEN',
+      },
+    ]);
+    assert.deepEqual(result.crossRepoRefs, []);
+  });
+
+  it('surfaces cross-repo body-parse refs separately from the GraphQL same-repo set', async () => {
+    globalThis.fetch = async () =>
+      mockResponse(200, {
+        data: {
+          repository: {
+            pullRequest: {
+              closingIssuesReferences: {
+                nodes: [
+                  {
+                    number: 10,
+                    title: 'Same repo issue',
+                    url: 'https://github.com/example/repo/issues/10',
+                    state: 'OPEN',
+                    repository: { owner: { login: 'example' }, name: 'repo' },
+                  },
+                ],
+              },
+            },
+          },
+        },
+      });
+
+    const config = makeConfig();
+    const event = {
+      type: 'pr',
+      repo: 'example/repo',
+      number: 7,
+      body: 'Fixes #10. Also fixes example/other-repo#99 (link only, does not close).',
+    };
+
+    const result = await get_pr_closing_issues(config, event);
+
+    assert.equal(result.closingIssues.length, 1);
+    assert.equal(result.closingIssues[0].number, 10);
+    assert.deepEqual(result.crossRepoRefs, [{ owner: 'example', repo: 'other-repo', number: 99 }]);
+  });
+
+  it('throws AdapterError when called on an issue', async () => {
+    const config = makeConfig();
+    const event = { type: 'issue', repo: 'example/repo', number: 42, body: '' };
+
+    await assert.rejects(
+      () => get_pr_closing_issues(config, event),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        assert.ok(err.message.includes("type='issue'"));
+        return true;
+      },
+    );
+  });
+
+  it('throws AdapterError with code auth_failure on HTTP 401', async () => {
+    globalThis.fetch = async () => mockResponse(401, { message: 'Bad credentials' });
+
+    const config = makeConfig();
+    const event = { type: 'pr', repo: 'example/repo', number: 7, body: '' };
+
+    await assert.rejects(
+      () => get_pr_closing_issues(config, event),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        assert.equal(err.code, 'auth_failure');
+        return true;
+      },
+    );
+  });
+
+  it('throws AdapterError with code auth_failure on a GraphQL-level UNAUTHORIZED error', async () => {
+    globalThis.fetch = async () =>
+      mockResponse(200, {
+        errors: [{ type: 'UNAUTHORIZED', message: 'Bad credentials' }],
+      });
+
+    const config = makeConfig();
+    const event = { type: 'pr', repo: 'example/repo', number: 7, body: '' };
+
+    await assert.rejects(
+      () => get_pr_closing_issues(config, event),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        assert.equal(err.code, 'auth_failure');
         return true;
       },
     );
