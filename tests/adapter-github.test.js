@@ -8,6 +8,11 @@
 import { describe, it, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { writeFile, mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { generateKeyPairSync } from 'node:crypto';
+
 import {
   list_events,
   post_comment,
@@ -28,6 +33,8 @@ import {
   list_lifecycle_events,
   list_open_prs,
   list_issues_by_label,
+  _resolve_token,
+  _unescape_pem_newlines,
   AdapterError,
 } from '../src/adapters/github.js';
 
@@ -1363,6 +1370,165 @@ describe('list_lifecycle_events', () => {
       (err) => {
         assert.ok(err instanceof AdapterError);
         assert.ok(err.message.includes('org'));
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// _unescape_pem_newlines / _resolve_token GitHub App private key resolution
+// (lr-4f59b5 — systemd EnvironmentFile \n-escaping + file-path option)
+// ---------------------------------------------------------------------------
+
+describe('_unescape_pem_newlines', () => {
+  it('converts literal \\n sequences to real newlines when no real newline is present', () => {
+    const escaped = '-----BEGIN RSA PRIVATE KEY-----\\nabc123\\n-----END RSA PRIVATE KEY-----\\n';
+    const result = _unescape_pem_newlines(escaped);
+    assert.ok(result.includes('\n'), 'result should contain real newlines');
+    assert.ok(!result.includes('\\n'), 'result should not contain literal backslash-n');
+    assert.equal(
+      result,
+      '-----BEGIN RSA PRIVATE KEY-----\nabc123\n-----END RSA PRIVATE KEY-----\n',
+    );
+  });
+
+  it('leaves a PEM with real newlines unchanged', () => {
+    const real = '-----BEGIN RSA PRIVATE KEY-----\nabc123\n-----END RSA PRIVATE KEY-----\n';
+    assert.equal(_unescape_pem_newlines(real), real);
+  });
+
+  it('leaves a plain string with neither real nor escaped newlines unchanged', () => {
+    const plain = 'no-newlines-here';
+    assert.equal(_unescape_pem_newlines(plain), plain);
+  });
+});
+
+describe('_resolve_token — GitHub App private key precedence', () => {
+  const { privateKey } = generateKeyPairSync('rsa', { modulusLength: 2048 });
+  const REAL_PEM = privateKey.export({ type: 'pkcs8', format: 'pem' });
+  // Simulate the systemd EnvironmentFile failure mode: newlines flattened to
+  // the literal two-character sequence \n.
+  const ESCAPED_PEM = REAL_PEM.replace(/\n/g, '\\n');
+
+  let _tmpDir;
+  let _originalEnvKey;
+  let _originalEnvKeyFile;
+
+  beforeEach(async () => {
+    _tmpDir = await mkdtemp(join(tmpdir(), 'clagentic-triage-test-'));
+    _originalEnvKey = process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY;
+    _originalEnvKeyFile = process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE;
+    delete process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY;
+    delete process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE;
+  });
+
+  afterEach(async () => {
+    if (_originalEnvKey === undefined) {
+      delete process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY;
+    } else {
+      process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY = _originalEnvKey;
+    }
+    if (_originalEnvKeyFile === undefined) {
+      delete process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE;
+    } else {
+      process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE = _originalEnvKeyFile;
+    }
+    await rm(_tmpDir, { recursive: true, force: true });
+  });
+
+  function makeAppConfig(sourceOverrides = {}) {
+    return {
+      source: {
+        github_app_id: '999',
+        github_app_installation_id: '12345',
+        ...sourceOverrides,
+      },
+      github_token: () => null,
+    };
+  }
+
+  it('mints a token from an \\n-escaped inline env var (systemd EnvironmentFile path)', async () => {
+    process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY = ESCAPED_PEM;
+
+    globalThis.fetch = async () => mockResponse(201, { token: 'ghs_from_inline_escaped' });
+
+    const config = makeAppConfig();
+    const token = await _resolve_token(config);
+
+    assert.equal(token, 'ghs_from_inline_escaped');
+  });
+
+  it('mints a token by reading the PEM from a file when no inline env var is set', async () => {
+    const keyFilePath = join(_tmpDir, 'app-key.pem');
+    await writeFile(keyFilePath, REAL_PEM, 'utf8');
+
+    globalThis.fetch = async () => mockResponse(201, { token: 'ghs_from_file' });
+
+    const config = makeAppConfig({ github_app_private_key_path: keyFilePath });
+    const token = await _resolve_token(config);
+
+    assert.equal(token, 'ghs_from_file');
+  });
+
+  it('honors CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE when the config field is unset', async () => {
+    const keyFilePath = join(_tmpDir, 'app-key-env.pem');
+    await writeFile(keyFilePath, REAL_PEM, 'utf8');
+    process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE = keyFilePath;
+
+    globalThis.fetch = async () => mockResponse(201, { token: 'ghs_from_file_env' });
+
+    const config = makeAppConfig();
+    const token = await _resolve_token(config);
+
+    assert.equal(token, 'ghs_from_file_env');
+  });
+
+  it('prefers the inline env var over the file path when both are set', async () => {
+    const keyFilePath = join(_tmpDir, 'unused-key.pem');
+    await writeFile(keyFilePath, 'not-a-real-pem-should-never-be-read', 'utf8');
+    process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY = REAL_PEM;
+
+    globalThis.fetch = async () => mockResponse(201, { token: 'ghs_inline_wins' });
+
+    const config = makeAppConfig({ github_app_private_key_path: keyFilePath });
+    const token = await _resolve_token(config);
+
+    assert.equal(token, 'ghs_inline_wins');
+  });
+
+  it('throws an actionable AdapterError naming both options when neither is configured', async () => {
+    const config = makeAppConfig();
+
+    await assert.rejects(
+      () => _resolve_token(config),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        assert.equal(err.code, 'auth_failure');
+        assert.ok(
+          err.message.includes('CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY'),
+          'error should name the inline env var',
+        );
+        assert.ok(
+          err.message.includes('github_app_private_key_path') &&
+            err.message.includes('CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE'),
+          'error should name the file-path option',
+        );
+        return true;
+      },
+    );
+  });
+
+  it('throws an actionable AdapterError when the configured file path cannot be read', async () => {
+    const missingPath = join(_tmpDir, 'does-not-exist.pem');
+    const config = makeAppConfig({ github_app_private_key_path: missingPath });
+
+    await assert.rejects(
+      () => _resolve_token(config),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        assert.equal(err.code, 'auth_failure');
+        assert.ok(err.message.includes(missingPath));
         return true;
       },
     );

@@ -198,6 +198,16 @@ test('7. github_token() reads from env at call time — not stored in config obj
   assert.equal(cfgNoToken.github_token(), null);
 });
 
+test('7b. github_app_private_key_path defaults to null and is settable via CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE (lr-4f59b5)', async () => {
+  const cfgDefault = await load();
+  assert.equal(cfgDefault.source.github_app_private_key_path, null);
+
+  const cfg = await load({
+    env: { CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE: '/etc/clagentic-triage/app-key.pem' },
+  });
+  assert.equal(cfg.source.github_app_private_key_path, '/etc/clagentic-triage/app-key.pem');
+});
+
 test('8. config file is merged — env vars win over file values', async () => {
   const dir = await makeTempDir({
     source: { adapter: 'forgejo', org: 'file-org' },

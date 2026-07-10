@@ -21,6 +21,7 @@ User=@@RUN_USER@@
 Group=@@RUN_GROUP@@
 WorkingDirectory=@@INSTALL_DIR@@
 EnvironmentFile=-@@ENV_FILE@@
+@@GITHUB_APP_PRIVATE_KEY_FILE_ENV_LINE@@
 ExecStart=@@RUN_WRAPPER_PATH@@
 Restart=on-failure
 RestartSec=5

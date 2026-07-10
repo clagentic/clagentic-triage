@@ -88,15 +88,87 @@ function _invalidate_cache(repo) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Unescape a PEM string whose newlines were flattened to the two-character
+ * sequence `\n` (backslash + n) rather than real newline bytes.
+ *
+ * A systemd `EnvironmentFile` cannot hold a literal multi-line value — an
+ * operator following docs/GITHUB_APP.md's documented "newlines as \n"
+ * convention ends up with the literal two-character sequence in the env var,
+ * not an actual newline. Node's `crypto` PEM parser requires real newlines,
+ * so without this step the documented env-var path silently produces an
+ * unusable key and every mint attempt fails.
+ *
+ * Detection is conservative: only unescape when the string contains the
+ * literal `\n` sequence AND no real newline already exists. A PEM supplied
+ * with real newlines (e.g. via a multi-line config file value, or a shell
+ * `export` with embedded newlines) is passed through unchanged.
+ *
+ * @param {string} pem
+ * @returns {string}
+ */
+export function _unescape_pem_newlines(pem) {
+  if (pem.includes('\n')) {
+    return pem;
+  }
+  if (pem.includes('\\n')) {
+    return pem.replace(/\\n/g, '\n');
+  }
+  return pem;
+}
+
+/**
+ * Resolve the GitHub App private key PEM from config/env, per the documented
+ * precedence: inline env var wins, else the file-path option, else an
+ * actionable error naming both.
+ *
+ * @param {object} src - config.source
+ * @returns {Promise<string>} PEM contents (newlines real, inline values unescaped)
+ * @throws {AdapterError} when neither source is configured/readable
+ */
+async function _resolve_private_key_pem(src) {
+  const key_env = src.github_app_private_key_env ?? 'CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY';
+  const inline_pem = process.env[key_env];
+  if (inline_pem) {
+    return _unescape_pem_newlines(inline_pem);
+  }
+
+  const key_file_path =
+    src.github_app_private_key_path ?? process.env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE;
+  if (key_file_path) {
+    let contents;
+    try {
+      contents = await readFile(key_file_path, 'utf8');
+    } catch (err) {
+      throw new AdapterError(
+        `GitHub App auth configured with source.github_app_private_key_path/` +
+        `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE="${key_file_path}" but the file could not be read: ${err.message}`,
+        'auth_failure',
+      );
+    }
+    return _unescape_pem_newlines(contents.trim());
+  }
+
+  throw new AdapterError(
+    `GitHub App auth configured but no private key was found. Set env var "${key_env}" ` +
+    `to the PEM contents, or set source.github_app_private_key_path / ` +
+    `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE to a file containing the PEM.`,
+    'auth_failure',
+  );
+}
+
+/**
  * Resolve the GitHub API token for a given config.
  *
  * If GitHub App credentials are present (`source.github_app_id`), a fresh
  * installation token is minted via the App's private key. Otherwise falls back
  * to the PAT from `config.github_token()`.
  *
- * The PEM is read from the env var named by `source.github_app_private_key_env`
- * (default: `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY`) so it is never stored on
- * the config object.
+ * The private key PEM is resolved via `_resolve_private_key_pem`: an inline
+ * env var (named by `source.github_app_private_key_env`, default
+ * `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY`) takes precedence; otherwise a
+ * file path (`source.github_app_private_key_path` or
+ * `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE`) is read. The PEM itself is
+ * never stored on the config object — only the env var name / file path are.
  *
  * @param {object} config - Loaded triage config
  * @returns {Promise<string|null>} Token string, or null if no credentials are configured
@@ -104,14 +176,7 @@ function _invalidate_cache(repo) {
 export async function _resolve_token(config) {
   const src = config.source ?? {};
   if (src.github_app_id) {
-    const key_env = src.github_app_private_key_env ?? 'CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY';
-    const private_key_pem = process.env[key_env];
-    if (!private_key_pem) {
-      throw new AdapterError(
-        `GitHub App auth configured but env var "${key_env}" is not set or empty`,
-        'auth_failure',
-      );
-    }
+    const private_key_pem = await _resolve_private_key_pem(src);
     return mint_installation_token({
       app_id: src.github_app_id,
       private_key_pem,
