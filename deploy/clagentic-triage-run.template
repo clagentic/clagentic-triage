@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# clagentic-triage-run — run-wrapper TEMPLATE
+#
+# Rendered by deploy/install.sh into ${RUN_WRAPPER_PATH} (default:
+# ${INSTALL_DIR}/deploy/clagentic-triage-run) with @@PLACEHOLDER@@ tokens
+# substituted from env-driven install config. This file in the repo is a
+# template only — never commit a rendered copy with operator-specific paths.
+#
+# Invoked by the systemd unit's ExecStart. Kept as a thin wrapper (rather
+# than inlining the command in the unit file) so the watch subcommand and
+# any future startup flags can change without re-rendering the unit.
+
+set -euo pipefail
+
+cd "@@INSTALL_DIR@@"
+exec "@@NODE_BIN@@" src/cli.js watch
