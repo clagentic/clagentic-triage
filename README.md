@@ -51,7 +51,10 @@ GitHub Issues, a webhook endpoint, or any custom dispatcher).
 - **Pluggable dispatch backends.** Dispatchers push verdicts into backend systems.
   Any backend — including private or internal tools — plugs in by module path. The
   core ships generic reference dispatchers (`webhook`, `noop`); concrete backends are
-  external packages.
+  external packages. Any HTTP-addressable task API (LORE, or your own) does not
+  need a dedicated dispatcher at all — the generic `webhook` dispatcher's
+  config-driven field mapping and bearer/HMAC auth point it at any such API
+  directly; see the [worked example](docs/DISPATCHERS.md#worked-example-dispatching-accepted-issues-into-lore).
 - **Post-verdict hooks.** Hooks fire after assessment, before the queue. The bundled
   `clagentic-console` hook opens a clagentic:console conversation on `escalate`
   verdicts. Additional hooks load by module path.
@@ -173,6 +176,7 @@ behind each security decision (DD-001 through DD-011).
 | [docs/ADAPTERS.md](docs/ADAPTERS.md) | Source adapter interface (poll + webhook), how to write one |
 | [docs/ACTION_CLASSES.md](docs/ACTION_CLASSES.md) | Action-class × event-type matrix — which classes apply to issues vs PRs |
 | [docs/DISPATCHERS.md](docs/DISPATCHERS.md) | Dispatch backend interface, reference dispatchers, third-party plugins |
+| [docs/DISPATCHERS.md § worked example](docs/DISPATCHERS.md#worked-example-dispatching-accepted-issues-into-lore) | **"How do I make triage create tasks in my tracker?"** — routing accepted-issue verdicts into an external HTTP task API via the generic `webhook` dispatcher, worked end to end against LORE |
 | [docs/SECURITY.md](docs/SECURITY.md) | Token security, input validation, PII and data residency |
 | [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) | DD-001..DD-011 rationale and security decisions |
 | [docs/INTENT_AUTHORING.md](docs/INTENT_AUTHORING.md) | How to write a `.github/triage-intent.yml` file for your repo |

@@ -90,7 +90,15 @@ first-class once you point config at its module.
 
 ### webhook dispatcher
 
-POSTs a structured JSON payload to a configured URL on each dispatch event.
+POSTs a JSON payload to a configured URL on each dispatch event. The webhook
+dispatcher is the generic vehicle for routing triage verdicts into *any*
+HTTP-addressable task/ticket system — see
+["Worked example: dispatching accepted issues into LORE"](#worked-example-dispatching-accepted-issues-into-lore)
+below for a full end-to-end config. No backend-specific dispatcher should be
+written for a system reachable over HTTP; point a `webhook` config entry at
+its API instead (this generic-dispatcher-over-backend-specific-code stance is
+the same one behind `dispatch` being the only backend-facing action class —
+see `docs/ACTION_CLASSES.md`).
 
 ```json
 {
@@ -106,15 +114,121 @@ POSTs a structured JSON payload to a configured URL on each dispatch event.
 ```
 
 - `url` — required. POST target.
-- `secret` — optional. If set, adds `X-Clagentic-Signature: sha256=<HMAC-SHA256 hex>` to the request so the receiver can verify authenticity.
+- `secret` — optional. If set, adds `X-Clagentic-Signature: sha256=<HMAC-SHA256 hex>` to the request so the receiver can verify authenticity. Mutually exclusive with `auth`.
+- `auth` — optional. Alternative to `secret` for backends that expect bearer-token auth instead of request signing:
+  ```json
+  { "auth": { "type": "bearer", "token_env": "INGEST_TOKEN" } }
+  ```
+  `token_env` names an environment variable holding the token (defaults to
+  `INGEST_TOKEN` if omitted); the dispatcher reads it at dispatch time and
+  sends `Authorization: Bearer <token>`. The token is never written to config
+  or logs. If `auth.type` is `"bearer"` and the named env var is unset or
+  empty, `create_task` throws before any network call.
+- `payload` — optional. A field-mapping object that replaces the default fixed
+  payload shape with your target system's body shape (see below). Omit it to
+  keep the current fixed payload (`event_id`, `repo`, `type`, `author`, `url`,
+  `verdict`, `confidence`, `reasoning`, `suggested_action`, `dispatched_at`) —
+  this is the default and existing configs need no changes.
 - `timeout_ms` — optional, default `5000`. Request is aborted after this many milliseconds.
 
+#### Field mapping (`payload`)
+
+Each key in `payload` names a key in the outbound JSON body; each value is a
+template string resolved against the triage `event` and `assessment` objects
+(the same shapes documented in `src/dispatchers/scaffold.js`):
+
+```json
+{
+  "payload": {
+    "title": "{{event.title}}",
+    "project": "my-project",
+    "description": "{{assessment.reasoning}}\n\n{{event.body}}",
+    "source_url": "{{event.url}}"
+  }
+}
+```
+
+- `"{{path}}"` — a dot-separated path into `event` or `assessment`
+  (`event.title`, `assessment.suggested_action.body`, ...). A value that is
+  *exactly* one placeholder resolves to the field's native type (string,
+  number, array) rather than a stringified version.
+- A value with **no** `{{...}}` placeholder is sent as a literal
+  (`"project": "my-project"` above).
+- A value with a placeholder plus surrounding text, or more than one
+  placeholder, is resolved as string interpolation
+  (`"description"` above concatenates the assessment reasoning with the raw
+  event body).
+- An unresolvable path renders as `null` for a whole-string placeholder, or as
+  `""` inside interpolated text.
+
+By default the fixed payload never forwards `event.body` — it is untrusted
+user content (see [Security model](../README.md#security-model)). A `payload`
+mapping is an explicit, per-field, operator-configured opt-in: if you map
+`event.body` into a target field (as the LORE example above does, folding it
+into `description`), you are choosing to forward it to that specific
+backend. Nothing else in the pipeline forwards it implicitly.
+
 The payload includes structured verdict fields only — raw issue/PR body and
-context blocks are never sent.
+context blocks are never sent — *unless* a `payload` mapping explicitly opts
+a field into `event.body`, as above.
 
 Common ticketing backends (Jira, Linear, GitHub Issues, etc.) are implemented
 as dispatchers using the same interface; see each integration's own
 documentation.
+
+#### Worked example: dispatching accepted issues into LORE
+
+This is the concrete, end-to-end path from an accepted issue to a LORE task,
+using nothing but the generic `webhook` dispatcher — no LORE-specific
+dispatcher exists or should be written (locked decision: core triage knows no
+backend; see `docs/ACTION_CLASSES.md`'s `dispatch` row).
+
+1. **Assessment.** The assessor evaluates an inbound issue against repo
+   intent and returns a verdict. For an issue it wants tracked as a task, the
+   suggested action includes the `dispatch` class — the only class an
+   *issue* dispatches through; `approve`/`request_changes` are PR-only (see
+   `docs/ACTION_CLASSES.md`'s matrix and its "recurring confusion" note).
+2. **Dispatch class fires dispatchers.** Once the verdict is approved (or
+   auto-approved for `dispatch`), the pipeline runs every configured entry in
+   `dispatchers` via `src/dispatchers/index.js`'s `dispatch()`.
+3. **The `webhook` dispatcher runs**, mapping the event and assessment onto
+   the exact body shape LORE's Archivist HTTP task API expects
+   (`POST /api/tasks`, body `{project, title, description, priority, tags,
+   assigned_to, created_by}`, `Authorization: Bearer <INGEST_TOKEN>`):
+
+   ```json
+   {
+     "dispatchers": [
+       {
+         "name": "webhook",
+         "url": "http://<archivist-host>:7490/api/tasks",
+         "auth": { "type": "bearer", "token_env": "INGEST_TOKEN" },
+         "payload": {
+           "project": "clagentic-triage",
+           "title": "{{event.title}}",
+           "description": "{{assessment.reasoning}}\n\nSource: {{event.url}}\n\n{{event.body}}",
+           "created_by": "clagentic-triage"
+         }
+       }
+     ]
+   }
+   ```
+
+   `<archivist-host>` is whatever host/port the operator's LORE Archivist
+   instance is reachable at — this repo hardcodes no LORE-specific value
+   anywhere; the URL and token env var are both operator config.
+4. **Result.** LORE creates the task and returns its own `{id, url}`-shaped
+   response body; the dispatcher stores `{ id: event.id, url }` on the pending
+   queue entry (the `url` here is the *webhook target URL*, not a URL parsed
+   out of LORE's response — see `create_task`'s return contract above if your
+   backend's response needs a task URL echoed back instead).
+
+The same pattern — one `webhook` entry, a `payload` mapping tailored to the
+target's body shape, and either `auth` or `secret` for the target's auth
+scheme — is how you route triage verdicts into *any* HTTP-addressable task
+system, not just LORE. See ["How do I make triage create tasks in my
+tracker?"](../README.md#documentation) in the README for the pointer back
+here.
 
 ## Third-party / private dispatchers
 

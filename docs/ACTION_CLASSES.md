@@ -24,7 +24,7 @@ constrains the model, and the execution boundary (`clagentic-triage approve`/
 | `respond` | ✓ | ✓ | Posts a comment (`suggested_action.body`) on the issue or PR. |
 | `request_changes` | ✗ | ✓ | Submits a GitHub PR review requesting changes, with `suggested_action.body` as the review comment. PR-only, same reason as `approve`. |
 | `close` | ✓ | ✓ | Closes the item. Issues close with `state_reason: 'not_planned'`; PRs close without merging. |
-| `dispatch` | ✓ | ✓ | Routes the item to every configured backend dispatcher (Jira, Linear, GitHub Issues, webhook, custom). The correct class for an **accepted issue** that should become a tracked task. |
+| `dispatch` | ✓ | ✓ | Routes the item to every configured backend dispatcher (Jira, Linear, GitHub Issues, webhook, custom). The correct class for an **accepted issue** that should become a tracked task. See `docs/DISPATCHERS.md`'s [worked example](DISPATCHERS.md#worked-example-dispatching-accepted-issues-into-lore) for the full assess → `dispatch` → webhook dispatcher → external task path. |
 | `escalate` | ✓ | ✓ | No adapter action — records the item in the pending queue for human review. Used when the assessor is uncertain or the LLM output failed validation (degraded assessment). |
 
 ## Multi-action verdicts
