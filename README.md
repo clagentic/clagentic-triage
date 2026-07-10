@@ -120,7 +120,9 @@ clagentic-triage reject <id>
 
 `override` approves the item but substitutes a different action class
 (`respond`, `request_changes`, `close`, `dispatch`, `escalate`, `approve`)
-in place of the one the LLM suggested.
+in place of the one the LLM suggested. Not every class is valid for every
+event type — `approve` and `request_changes` are PR-only. See
+[docs/ACTION_CLASSES.md](docs/ACTION_CLASSES.md) for the full matrix.
 
 ## Configuration
 
@@ -169,6 +171,7 @@ behind each security decision (DD-001 through DD-011).
 | [docs/CONFIG.md](docs/CONFIG.md) | Full config schema and environment variable reference |
 | [docs/GITHUB_APP.md](docs/GITHUB_APP.md) | GitHub integration: PAT vs GitHub App, setup, webhook ingress, reverse proxy |
 | [docs/ADAPTERS.md](docs/ADAPTERS.md) | Source adapter interface (poll + webhook), how to write one |
+| [docs/ACTION_CLASSES.md](docs/ACTION_CLASSES.md) | Action-class × event-type matrix — which classes apply to issues vs PRs |
 | [docs/DISPATCHERS.md](docs/DISPATCHERS.md) | Dispatch backend interface, reference dispatchers, third-party plugins |
 | [docs/SECURITY.md](docs/SECURITY.md) | Token security, input validation, PII and data residency |
 | [docs/DESIGN-DECISIONS.md](docs/DESIGN-DECISIONS.md) | DD-001..DD-011 rationale and security decisions |
