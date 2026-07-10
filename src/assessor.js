@@ -10,6 +10,7 @@
  */
 
 import { callLlm, LlmError } from './llm.js';
+import { isActionClassValidForType } from './action_classes.js';
 
 // ---------------------------------------------------------------------------
 // Error class
@@ -358,6 +359,42 @@ export async function assess(config, enrichedEvent) {
     : typeof suggestedAction.class === 'string'
       ? [suggestedAction.class]
       : ['escalate'];
+
+  // lr-757a69: the assessor prompt instructs the model that 'approve'/
+  // 'request_changes' are PR-only (lr-4717), but a model can still violate
+  // that constraint (observed on console#314/#315). Detect a class/type
+  // mismatch here — before this Assessment ever reaches the router/pipeline —
+  // and re-route to 'escalate' rather than let the invalid class either
+  // silently queue un-approvable (cmdApprove's pre-flight would reject it,
+  // leaving the operator stuck with no valid action to take) or, if
+  // auto-approved, reach the adapter and throw a raw AdapterError. Every
+  // invalid class is dropped from the list; any class that was already valid
+  // for this type survives untouched.
+  const eventType = enrichedEvent.type;
+  const invalidClasses = classes.filter((cls) => !isActionClassValidForType(cls, eventType));
+  const isTypeMismatch = invalidClasses.length > 0;
+  const validatedClasses = isTypeMismatch
+    ? classes.filter((cls) => isActionClassValidForType(cls, eventType))
+    : classes;
+
+  if (isTypeMismatch) {
+    return {
+      verdict: 'escalate',
+      confidence: 0,
+      reasoning:
+        `Assessor emitted action class(es) invalid for event type "${eventType}": ` +
+        `${invalidClasses.join(', ')}. Original reasoning: ${llmResponse.reasoning}`,
+      suggested_action: {
+        classes: validatedClasses.length > 0 ? validatedClasses : ['escalate'],
+        body: suggestedAction.body ?? null,
+        dispatch_target: suggestedAction.dispatch_target ?? null,
+        labels: Array.isArray(suggestedAction.labels) ? suggestedAction.labels : [],
+      },
+      model_used: llmResponse.model_used ?? resolvedModel,
+      assessed_at: new Date().toISOString(),
+      event_id: eventId,
+    };
+  }
 
   return {
     verdict: llmResponse.verdict,

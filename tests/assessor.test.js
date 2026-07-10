@@ -96,6 +96,13 @@ function makeSpawn(childOpts) {
 
 /**
  * A valid Assessment JSON payload as the LLM would produce it.
+ *
+ * Default class is 'respond', not 'approve' (lr-757a69): 'approve' is
+ * PR-only (see src/action_classes.js), but makeEvent()'s default type is
+ * 'issue' — 'respond' is valid for both event types, so this default payload
+ * pairs with makeEvent()'s default without tripping the assessor's
+ * class/type mismatch re-route guard. Tests that specifically exercise
+ * 'approve' override both suggested_action and the event's type to 'pr'.
  */
 function validLlmPayload(overrides = {}) {
   return {
@@ -103,7 +110,7 @@ function validLlmPayload(overrides = {}) {
     confidence: 0.9,
     reasoning: 'Clear bug report with reproduction steps.',
     suggested_action: {
-      classes: ['approve'],
+      classes: ['respond'],
       body: null,
       dispatch_target: null,
       labels: ['bug'],
@@ -257,7 +264,7 @@ describe('assess() — success', () => {
     assert.equal(result.confidence, 0.9);
     assert.ok(typeof result.reasoning === 'string', 'reasoning should be string');
     assert.ok(result.suggested_action, 'suggested_action should exist');
-    assert.deepEqual(result.suggested_action.classes, ['approve']);
+    assert.deepEqual(result.suggested_action.classes, ['respond']);
     assert.deepEqual(result.suggested_action.labels, ['bug']);
     assert.ok(typeof result.model_used === 'string', 'model_used should be string');
     assert.ok(typeof result.assessed_at === 'string', 'assessed_at should be string');
@@ -417,6 +424,87 @@ describe('assess() — degraded paths', () => {
 });
 
 // ---------------------------------------------------------------------------
+// assess() — action-class/event-type re-route guard (lr-757a69)
+// ---------------------------------------------------------------------------
+
+describe('assess() — action-class/event-type re-route guard', () => {
+  it('re-routes to escalate when the model emits "approve" for an issue event', async () => {
+    const payload = validLlmPayload({
+      suggested_action: { classes: ['approve'], body: null, dispatch_target: null, labels: [] },
+    });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(payload), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent({ type: 'issue' }));
+
+    assert.equal(result.verdict, 'escalate', 'invalid class for type → escalate, not the model verdict');
+    assert.equal(result.confidence, 0);
+    assert.ok(
+      result.reasoning.includes('approve') && result.reasoning.includes('issue'),
+      `reasoning should name the invalid class and the event type; got: ${result.reasoning}`,
+    );
+    // No valid class survives (the only class named was invalid) — falls back to escalate.
+    assert.deepEqual(result.suggested_action.classes, ['escalate']);
+  });
+
+  it('re-routes to escalate when the model emits "request_changes" for an issue event', async () => {
+    const payload = validLlmPayload({
+      suggested_action: { classes: ['request_changes'], body: 'please fix', dispatch_target: null, labels: [] },
+    });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(payload), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent({ type: 'issue' }));
+
+    assert.equal(result.verdict, 'escalate');
+    assert.deepEqual(result.suggested_action.classes, ['escalate']);
+  });
+
+  it('drops only the invalid class from a multi-action verdict, keeping the valid ones', async () => {
+    const payload = validLlmPayload({
+      suggested_action: {
+        classes: ['respond', 'approve'],
+        body: 'Thanks!',
+        dispatch_target: null,
+        labels: [],
+      },
+    });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(payload), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent({ type: 'issue' }));
+
+    assert.equal(result.verdict, 'escalate', 'any invalid class in the array re-routes the whole verdict');
+    assert.deepEqual(
+      result.suggested_action.classes,
+      ['respond'],
+      'the still-valid class (respond) survives; only approve is dropped',
+    );
+  });
+
+  it('does not re-route a valid class for a pr event', async () => {
+    const payload = validLlmPayload({
+      suggested_action: { classes: ['approve'], body: null, dispatch_target: null, labels: [] },
+    });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(payload), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent({ type: 'pr' }));
+
+    assert.equal(result.verdict, 'accept', 'approve is valid for a pr event — no re-route');
+    assert.deepEqual(result.suggested_action.classes, ['approve']);
+  });
+
+  it('does not re-route dispatch for an issue event (the correct class for an accepted issue)', async () => {
+    const payload = validLlmPayload({
+      suggested_action: { classes: ['dispatch'], body: null, dispatch_target: 'backend', labels: [] },
+    });
+    _setSpawnFn(makeSpawn({ stdout: cliEnvelope(payload), code: 0 }));
+
+    const result = await assess(makeConfig(), makeEvent({ type: 'issue' }));
+
+    assert.equal(result.verdict, 'accept');
+    assert.deepEqual(result.suggested_action.classes, ['dispatch']);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // assess() — multi-action verdicts (T7, lr-f0f2)
 // ---------------------------------------------------------------------------
 
@@ -444,7 +532,10 @@ describe('assess() — multi-action verdicts (classes[])', () => {
     });
     _setSpawnFn(makeSpawn({ stdout: cliEnvelope(payload), code: 0 }));
 
-    const result = await assess(makeConfig(), makeEvent());
+    // 'approve' is PR-only (lr-757a69) — use a PR event so this normalization
+    // test exercises the singular-to-array migration in isolation, without
+    // also tripping the assessor's class/type mismatch re-route guard.
+    const result = await assess(makeConfig(), makeEvent({ type: 'pr' }));
 
     assert.deepEqual(result.suggested_action.classes, ['approve']);
   });
