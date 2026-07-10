@@ -348,6 +348,20 @@ describe('webhook dispatcher', () => {
         /missing a valid "url"/,
       );
     });
+
+    it('throws when both "secret" (HMAC) and "auth" (bearer) are configured', async () => {
+      fetchMock = mockFetch();
+      const config = makeConfig({
+        secret: 'my-webhook-secret',
+        auth: { type: 'bearer', token_env: 'INGEST_TOKEN' },
+      });
+
+      await assert.rejects(
+        () => webhook.create_task(config, makeEvent(), makeAssessment()),
+        /mutually exclusive/,
+      );
+      assert.equal(fetchMock.calls.length, 0, 'must not POST when auth config is ambiguous');
+    });
   });
 
   // -------------------------------------------------------------------------

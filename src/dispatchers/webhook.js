@@ -35,9 +35,11 @@
  * "assessment.suggested_action.body"); a value with no "{{...}}" placeholder
  * is sent as a literal. Multiple placeholders and surrounding text in one
  * string are supported (e.g. "{{assessment.reasoning}}\n\n{{event.body}}").
- * An unresolvable path renders as "". Unlike the default fixed payload,
- * "payload" mappings may reference event.body — this is an explicit,
- * operator-configured opt-in per target field, not the default behavior.
+ * An unresolvable path renders as null for a whole-string placeholder, or as
+ * "" inside interpolated text (see renderTemplate below). Unlike the default
+ * fixed payload, "payload" mappings may reference event.body — this is an
+ * explicit, operator-configured opt-in per target field, not the default
+ * behavior.
  */
 
 import { createHmac } from 'node:crypto';
@@ -62,6 +64,12 @@ function resolveDispatcherConfig(config) {
   }
   if (!entry.url || typeof entry.url !== 'string') {
     throw new Error('[webhook] dispatcher config entry is missing a valid "url"');
+  }
+  if (entry.secret && entry.auth) {
+    throw new Error(
+      '[webhook] dispatcher config sets both "secret" (HMAC) and "auth" (bearer) — '
+      + 'these are mutually exclusive; configure one auth mode, not both',
+    );
   }
   return entry;
 }
