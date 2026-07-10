@@ -23,3 +23,17 @@ merge_allowed: true
 merge_requirements:
   tests_pass: true
   ci_pass: true
+
+# post_merge_steps — run in the target repo root after a successful merge
+# (crew_merge.py:run_post_merge_steps, lr-96cc). Deploys merged main to
+# docker-dev: fast-forward pull + service restart. No build step (pure
+# Node, deps already installed).
+#
+# on_failure: warn — a deploy hiccup (e.g. docker-dev transiently
+# unreachable, or a --ff-only divergence if the checkout was manually
+# modified) must not fail an otherwise-good merge. NAOMI logs the warning
+# and reports it; the merge itself already succeeded via the platform API.
+post_merge_steps:
+  - cmd: "ssh docker-dev 'cd /opt/clagentic-triage/clagentic-triage && git pull --ff-only origin main && systemctl restart clagentic-triage'"
+    description: "Deploy merged main to docker-dev and restart the triage watch service"
+    on_failure: warn
