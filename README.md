@@ -74,6 +74,15 @@ node src/cli.js run
 
 The binary is `clagentic-triage`.
 
+### Running as a service
+
+To run `clagentic-triage watch` as a long-lived systemd service with
+idempotent install/update, see [docs/DEPLOY.md](docs/DEPLOY.md). The
+`deploy/` directory ships an installer (`deploy/install.sh`) plus
+parameterized systemd unit and run-wrapper templates — no operator-specific
+values are hardcoded; everything is env-driven (see
+[`deploy/.env.example`](deploy/.env.example)).
+
 ## Quickstart
 
 Create a minimal config file at `~/.config/clagentic/triage/config.json`:
@@ -173,6 +182,7 @@ behind each security decision (DD-001 through DD-011).
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Pipeline stages, module layout, interfaces |
 | [docs/CONFIG.md](docs/CONFIG.md) | Full config schema and environment variable reference |
 | [docs/GITHUB_APP.md](docs/GITHUB_APP.md) | GitHub integration: PAT vs GitHub App, setup, webhook ingress, reverse proxy |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | Install/update as a systemd service — idempotent installer, unit + run-wrapper templates |
 | [docs/ADAPTERS.md](docs/ADAPTERS.md) | Source adapter interface (poll + webhook), how to write one |
 | [docs/ACTION_CLASSES.md](docs/ACTION_CLASSES.md) | Action-class × event-type matrix — which classes apply to issues vs PRs |
 | [docs/DISPATCHERS.md](docs/DISPATCHERS.md) | Dispatch backend interface, reference dispatchers, third-party plugins |
