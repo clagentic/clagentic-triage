@@ -47,15 +47,28 @@ env vars (see `deploy/.env.example` for the full list and defaults).
    sudo -E bash deploy/install.sh
    ```
 
-Every run first registers `CLAGENTIC_TRIAGE_INSTALL_DIR` as a git
-`safe.directory` for the invoking user (`git config --global --add
-safe.directory ...`) before touching the checkout with git. This matters
-because install.sh hands ownership of the checkout to
+Every git command install.sh runs against `CLAGENTIC_TRIAGE_INSTALL_DIR`
+passes `-c safe.directory=<dir>` on its own command line before touching the
+checkout. This matters because install.sh hands ownership of the checkout to
 `CLAGENTIC_TRIAGE_RUN_USER` at the end of every run, but a later run may be
 invoked by a different account (root, or an automation user) — without this,
 git >= 2.35.2 refuses to operate on the checkout with "detected dubious
-ownership". The registration is idempotent and scoped to the invoking user's
-own gitconfig; it does not relax trust for any other account on the host.
+ownership". The trust is scoped to that single invocation only — install.sh
+never reads or writes a global gitconfig, so this works identically whether
+`HOME` is set, unset, or points anywhere at all, and it never widens trust
+for any other account or any other invocation on the host.
+
+`HOME` itself is guaranteed to be set before any subtool runs: if the
+invoking environment doesn't have `HOME` at all (the shape of NAOMI's
+post_merge automation — no PAM session, no interactive login), install.sh
+sets it to a throwaway per-run temp directory before doing anything else.
+Nothing meaningful is read from or written to that path — it exists purely
+so no subtool (e.g. anything resolving a `~`-relative path) can abort on a
+missing `HOME`. `npm ci`'s own cache location is pinned explicitly via
+`npm_config_cache` (default `${CLAGENTIC_TRIAGE_INSTALL_DIR}/.npm-cache`,
+override with `CLAGENTIC_TRIAGE_NPM_CACHE_DIR`) rather than left to resolve
+against whatever `HOME` happens to be, so cache location stays deterministic
+across runs.
 
 The first run clones the repo to `CLAGENTIC_TRIAGE_INSTALL_DIR`, idempotently
 creates the `CLAGENTIC_TRIAGE_RUN_USER`/`CLAGENTIC_TRIAGE_RUN_GROUP` system

@@ -11,6 +11,14 @@
  * registered as `safe.directory` — every git-sync invocation failed with
  * exit 128, "fatal: detected dubious ownership in repository at ...".
  *
+ * lr-f580b9 hardened the fix to be stateless: instead of writing
+ * `safe.directory` into the invoking user's global gitconfig (which
+ * requires a writable HOME — itself a headless-automation failure mode,
+ * see install-headless-no-home.test.js), install.sh now passes
+ * `-c safe.directory=<dir>` on every git invocation's own command line.
+ * These tests assert the cross-owner sync still succeeds under that
+ * stateless form and that no global gitconfig file is touched at all.
+ *
  * Unlike install-user-provision.test.js (lr-7de17d), this suite does NOT
  * stub `git` — the dubious-ownership check is real git C code triggered by
  * real uid mismatches, so a stub would not exercise the bug at all. It
@@ -176,19 +184,19 @@ describe('deploy/install.sh — cross-owner git sync (lr-d2644c)', { skip: !CAN_
     assert.doesNotMatch(result.stderr, /dubious ownership/i, 'git-sync must not hit the dubious-ownership error');
     assert.doesNotMatch(result.stdout, /dubious ownership/i);
 
-    // The safe.directory entry must have actually been registered for the
-    // invoking user (root, via isolatedHome) — proves install.sh's own
-    // `git config --global --add safe.directory` ran, not that the repo
-    // happened to already be trusted.
-    const safeDirs = execSync('git config --global --get-all safe.directory', {
-      env: { ...process.env, HOME: isolatedHome },
-      encoding: 'utf8',
-    });
-    assert.match(safeDirs, new RegExp(installDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    // The stateless fix (lr-f580b9) trusts INSTALL_DIR via a per-command
+    // `-c safe.directory=...` flag, not a global gitconfig write — assert
+    // the invoking user's global config was never touched at all, proving
+    // the fix does not depend on (or mutate) HOME-resident state.
+    const globalConfigPath = join(isolatedHome, '.gitconfig');
+    assert.ok(!existsSync(globalConfigPath), 'install.sh must not write a global .gitconfig under the stateless fix');
 
     // Confirm the sync actually progressed (real HEAD resolved from the
-    // real clone), not just that the script didn't crash.
-    const repoSha = execSync(`git -C "${installDir}" rev-parse HEAD`, {
+    // real clone), not just that the script didn't crash. This verification
+    // call is the test's own git invocation (not install.sh's), so it must
+    // pass its own -c safe.directory — install.sh's stateless fix does not
+    // (and must not) leave any trust behind for other invocations to ride on.
+    const repoSha = execSync(`git -c safe.directory="${installDir}" -C "${installDir}" rev-parse HEAD`, {
       env: { ...process.env, HOME: isolatedHome },
       encoding: 'utf8',
     }).trim();
@@ -197,7 +205,7 @@ describe('deploy/install.sh — cross-owner git sync (lr-d2644c)', { skip: !CAN_
     assert.equal(readFileSync(join(installDir, '.installed-sha'), 'utf8').trim(), repoSha);
   });
 
-  it('re-running install.sh a second time (idempotent safe.directory registration) still succeeds', () => {
+  it('re-running install.sh a second time (stateless per-invocation safe.directory) still succeeds', () => {
     const caseDir = join(workDir, 'install-sh-cross-owner-repeat');
     const installDir = join(caseDir, 'opt', 'clagentic-triage');
     const unitDir = join(caseDir, 'systemd');
@@ -235,14 +243,11 @@ describe('deploy/install.sh — cross-owner git sync (lr-d2644c)', { skip: !CAN_
     assert.equal(second.status, 0, `second run failed: ${second.stderr}\n${second.stdout}`);
     assert.doesNotMatch(second.stderr, /dubious ownership/i);
 
-    const safeDirs = execSync('git config --global --get-all safe.directory', {
-      env: { ...process.env, HOME: isolatedHome },
-      encoding: 'utf8',
-    });
-    // Deduped, not doubled — confirms `--add` idempotency and that this
-    // register step won't grow the invoking user's gitconfig unbounded
-    // across many redeploys.
-    const occurrences = safeDirs.split('\n').filter((l) => l.trim() === installDir).length;
-    assert.equal(occurrences, 1, `expected exactly one safe.directory entry for ${installDir}, got:\n${safeDirs}`);
+    // Per-invocation `-c safe.directory=...` has nothing to dedup — no
+    // global gitconfig entry ever accumulates, across any number of runs.
+    assert.ok(
+      !existsSync(join(isolatedHome, '.gitconfig')),
+      'stateless fix must never write a global .gitconfig, even across repeated runs',
+    );
   });
 });
