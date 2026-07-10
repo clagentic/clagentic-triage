@@ -34,6 +34,26 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
+# HOME safety guard (lr-f580b9) — headless automation contexts (NAOMI
+# post_merge_steps, systemd with no PAM session, minimal CI) invoke this
+# script with HOME unset entirely, not just empty. Every subtool that
+# resolves a per-user config/cache path under `~` (git's global config,
+# npm's cache/config resolution) aborts with "$HOME not set" the moment it
+# tries to expand `~` with no HOME in the environment — verified live on
+# PR #27's post-merge install, exit 128 from `git config --global`.
+#
+# Fix the class: guarantee HOME is always set to *something* before any
+# subtool runs, so no subtool ever trips on a missing HOME. The value only
+# needs to be a writable directory a throwaway HOME can point at — nothing
+# reads meaningful state from it, so a deterministic per-run temp directory
+# is sufficient and avoids depending on any pre-existing path on the host.
+# ---------------------------------------------------------------------------
+if [ -z "${HOME:-}" ]; then
+    HOME="$(mktemp -d "${TMPDIR:-/tmp}/clagentic-triage-install-home.XXXXXX")"
+    export HOME
+fi
+
+# ---------------------------------------------------------------------------
 # Config — all paths via env or well-known generic defaults; no hardcoded
 # operator values (CLAUDE.md rule 11 / task lr-47370c hard constraint).
 # ---------------------------------------------------------------------------
@@ -140,37 +160,44 @@ echo $$ > "${_LOCK_FILE}"
 # Step 1 — git sync (clone on first run, fetch+checkout thereafter). Always
 # idempotent regardless of prior state.
 #
-# Cross-owner safe.directory (lr-d2644c): install.sh hands INSTALL_DIR's
-# ownership to RUN_USER at the end of every install run (see the chown
-# below), but the invoking user for a given run (e.g. NAOMI's post-merge
-# automation, or a manual operator run) may be root or a different account.
-# Git >= 2.35.2 refuses to operate on a repo owned by a different user
-# ("detected dubious ownership") unless that path is explicitly trusted via
-# `safe.directory`. Register INSTALL_DIR as safe for the invoking user
-# before any git command touches it. `git config --add` is NOT itself
-# idempotent (it appends a duplicate entry on every call), so guard it with
-# a `--get-all` membership check first — scoped to the invoking user's own
-# gitconfig, so it never widens trust for any other account on the host.
+# Cross-owner safe.directory (lr-d2644c, hardened stateless in lr-f580b9):
+# install.sh hands INSTALL_DIR's ownership to RUN_USER at the end of every
+# install run (see the chown below), but the invoking user for a given run
+# (e.g. NAOMI's post-merge automation, or a manual operator run) may be
+# root or a different account. Git >= 2.35.2 refuses to operate on a repo
+# owned by a different user ("detected dubious ownership") unless that path
+# is explicitly trusted via `safe.directory`.
+#
+# The original fix registered safe.directory in the invoking user's global
+# gitconfig (`git config --global --add`), which requires a writable HOME —
+# exactly what a headless automation context (NAOMI post_merge_steps, no
+# PAM session, no interactive login) does not reliably have, causing
+# "fatal: $HOME not set" (verified live on PR #27's post-merge install,
+# exit 128). Replaced with the stateless per-invocation form: every git
+# command that touches INSTALL_DIR passes `-c safe.directory="${INSTALL_DIR}"`
+# on its own command line. This trusts the path for that one invocation
+# only — no global config file is read or written, so there is no HOME
+# dependency and no membership-guard/dedup logic needed at all.
 # ---------------------------------------------------------------------------
-if ! git config --global --get-all safe.directory 2>/dev/null | grep -qxF "${INSTALL_DIR}"; then
-    git config --global --add safe.directory "${INSTALL_DIR}"
-fi
+_git() {
+    git -c safe.directory="${INSTALL_DIR}" "$@"
+}
 
 if [ ! -d "${INSTALL_DIR}/.git" ]; then
     _log "no checkout found at ${INSTALL_DIR}; cloning ${GIT_REMOTE}"
     mkdir -p "$(dirname "${INSTALL_DIR}")"
-    git clone "${GIT_REMOTE}" "${INSTALL_DIR}"
+    _git clone "${GIT_REMOTE}" "${INSTALL_DIR}"
 fi
 
 _log "syncing git: ${INSTALL_DIR} (ref=${GIT_REF})"
-git -C "${INSTALL_DIR}" fetch origin "${GIT_REF}"
+_git -C "${INSTALL_DIR}" fetch origin "${GIT_REF}"
 # reset --hard tolerates a dirty working tree (e.g. files staged in for
 # bootstrapping). Safe because this is a pure deploy checkout — no
 # intentional local work lives here.
-git -C "${INSTALL_DIR}" checkout "${GIT_REF}"
-git -C "${INSTALL_DIR}" reset --hard "origin/${GIT_REF}"
+_git -C "${INSTALL_DIR}" checkout "${GIT_REF}"
+_git -C "${INSTALL_DIR}" reset --hard "origin/${GIT_REF}"
 
-REPO_SHA="$(git -C "${INSTALL_DIR}" rev-parse HEAD)"
+REPO_SHA="$(_git -C "${INSTALL_DIR}" rev-parse HEAD)"
 _log "repo HEAD: ${REPO_SHA}"
 
 # ---------------------------------------------------------------------------
@@ -224,7 +251,13 @@ if [ "${SKIP_NPM_CI}" = "1" ]; then
     _log "skipping npm ci (CLAGENTIC_TRIAGE_SKIP_NPM_CI=1)"
 else
     _log "installing dependencies (npm ci --omit=dev)..."
-    (cd "${INSTALL_DIR}" && npm ci --omit=dev)
+    # npm resolves its cache directory under $HOME/.npm by default. The
+    # HOME guard above ensures HOME is always set, but that value is a
+    # throwaway per-run temp dir — pin npm's cache explicitly rather than
+    # relying on HOME's incidental value, so cache location stays
+    # deterministic and doesn't shift with whatever HOME happens to be.
+    NPM_CACHE_DIR="${CLAGENTIC_TRIAGE_NPM_CACHE_DIR:-${INSTALL_DIR}/.npm-cache}"
+    (cd "${INSTALL_DIR}" && npm_config_cache="${NPM_CACHE_DIR}" npm ci --omit=dev)
 fi
 
 if [ "${SKIP_SYSTEMD}" != "1" ]; then
