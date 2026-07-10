@@ -26,24 +26,19 @@ env vars (see `deploy/.env.example` for the full list and defaults).
 
 ## First install
 
-1. Provision a system user for the service (the installer does not create
-   one):
-   ```
-   useradd --system --no-create-home clagentic-triage
-   ```
-2. Create the runtime env file referenced by `CLAGENTIC_TRIAGE_ENV_FILE`
+1. Create the runtime env file referenced by `CLAGENTIC_TRIAGE_ENV_FILE`
    (default `/etc/clagentic-triage/triage.env`) containing the app's own
    config — `CLAGENTIC_TRIAGE_GITHUB_TOKEN`, `CLAGENTIC_TRIAGE_ORG`, runner
    settings, etc. See the root [`.env.example`](../.env.example) and
    [docs/CONFIG.md](CONFIG.md) for the full app config reference. This is a
    separate concern from the installer knobs below — the installer only
    wires the systemd unit to read this file, it never creates or edits it.
-3. Set installer env vars as needed (see `deploy/.env.example`) — at minimum
+2. Set installer env vars as needed (see `deploy/.env.example`) — at minimum
    you'll usually override `CLAGENTIC_TRIAGE_INSTALL_DIR` and
    `CLAGENTIC_TRIAGE_GIT_REMOTE`/`CLAGENTIC_TRIAGE_GIT_REF` if not using the
    defaults.
-4. Run the installer (needs root or sudo for `/etc/systemd/system` and the
-   default `/opt` install dir):
+3. Run the installer (needs root or sudo for `/etc/systemd/system`, the
+   default `/opt` install dir, and to create the service user — see below):
    ```
    curl -fsSL https://raw.githubusercontent.com/clagentic/clagentic-triage/main/deploy/install.sh | sudo -E bash
    ```
@@ -52,10 +47,42 @@ env vars (see `deploy/.env.example` for the full list and defaults).
    sudo -E bash deploy/install.sh
    ```
 
-The first run clones the repo to `CLAGENTIC_TRIAGE_INSTALL_DIR`, runs
-`npm ci --omit=dev`, renders the unit and run-wrapper templates, and enables
-+ starts the `clagentic-triage` systemd unit (service name configurable via
-`CLAGENTIC_TRIAGE_SERVICE_NAME`).
+The first run clones the repo to `CLAGENTIC_TRIAGE_INSTALL_DIR`, idempotently
+creates the `CLAGENTIC_TRIAGE_RUN_USER`/`CLAGENTIC_TRIAGE_RUN_GROUP` system
+account if it does not already exist (`useradd --system --no-create-home
+--shell /usr/sbin/nologin`), runs `npm ci --omit=dev`, hands ownership of
+`CLAGENTIC_TRIAGE_INSTALL_DIR` to that account, renders the unit and
+run-wrapper templates, and enables + starts the `clagentic-triage` systemd
+unit (service name configurable via `CLAGENTIC_TRIAGE_SERVICE_NAME`).
+
+### Service user provisioning
+
+The rendered systemd unit sets `User=`/`Group=` to
+`CLAGENTIC_TRIAGE_RUN_USER`/`CLAGENTIC_TRIAGE_RUN_GROUP`. A unit referencing
+an account that does not exist fails every start with systemd
+`status=217/USER` and auto-restarts forever — install.sh prevents this by
+provisioning the account itself, before ever rendering the unit:
+
+- If the account already exists (e.g. you provisioned it separately, or set
+  `CLAGENTIC_TRIAGE_RUN_USER`/`_GROUP` to an existing service account),
+  install.sh detects this and does not touch it — safe to run repeatedly.
+- If it is missing and `useradd`/`groupadd` are available (the installer is
+  running as root), install.sh creates it: `groupadd --system
+  ${RUN_GROUP}` then `useradd --system --no-create-home --shell
+  /usr/sbin/nologin --gid ${RUN_GROUP} ${RUN_USER}`.
+- If it is missing and creation is not permitted (not running as root, or
+  `useradd`/`groupadd` unavailable), install.sh **fails loudly** with an
+  actionable message rather than rendering a unit that can never start.
+- Set `CLAGENTIC_TRIAGE_SKIP_USER_PROVISION=1` to make install.sh only
+  preflight-verify the account exists (same loud failure if it's missing)
+  instead of creating it — use this if account provisioning is handled by a
+  separate config-management tool.
+
+After provisioning (or verifying) the account, install.sh runs `chown -R
+${RUN_USER}:${RUN_GROUP}` on `CLAGENTIC_TRIAGE_INSTALL_DIR` so the service
+can read its own checkout and write its own runtime state (e.g.
+`.triage/*.jsonl`, written relative to the unit's `WorkingDirectory`) without
+relaxing the unit's `ProtectHome`/`ProtectSystem` hardening.
 
 ## Update
 
@@ -104,7 +131,10 @@ runs in.
 
 - `CLAGENTIC_TRIAGE_SKIP_NPM_CI=1` — skip `npm ci` (e.g. deps pre-vendored).
 - `CLAGENTIC_TRIAGE_SKIP_SYSTEMD=1` — skip rendering/enabling/starting the
-  systemd unit; useful to only sync source + deps, or on a host where
+  systemd unit (and skip service-user provisioning, since no unit will
+  reference it); useful to only sync source + deps, or on a host where
   systemd is managed out-of-band.
+- `CLAGENTIC_TRIAGE_SKIP_USER_PROVISION=1` — skip creating the service user;
+  only preflight-verify it exists (see "Service user provisioning" above).
 
 See `deploy/.env.example` for the complete list of installer env vars.

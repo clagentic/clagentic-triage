@@ -49,12 +49,73 @@ NODE_BIN="${CLAGENTIC_TRIAGE_NODE_BIN:-/usr/bin/node}"
 FORCE="${CLAGENTIC_TRIAGE_FORCE_UPDATE:-0}"
 SKIP_NPM_CI="${CLAGENTIC_TRIAGE_SKIP_NPM_CI:-0}"
 SKIP_SYSTEMD="${CLAGENTIC_TRIAGE_SKIP_SYSTEMD:-0}"
+SKIP_USER_PROVISION="${CLAGENTIC_TRIAGE_SKIP_USER_PROVISION:-0}"
 
 RUN_WRAPPER_PATH="${INSTALL_DIR}/deploy/clagentic-triage-run"
 UNIT_PATH="${SYSTEMD_UNIT_DIR}/${SERVICE_NAME}.service"
 
 _log() {
     echo "[clagentic-triage-install] $*"
+}
+
+# ---------------------------------------------------------------------------
+# _provision_run_identity — idempotently ensure RUN_GROUP/RUN_USER exist
+# before the rendered unit ever references them as User=/Group=. Without
+# this, a fresh host renders a unit pointing at a nonexistent account and
+# systemd fails every start with status=217/USER (lr-7de17d).
+#
+# Skips silently when SKIP_SYSTEMD=1 (no unit is rendered, so there is
+# nothing to provision for) or when SKIP_USER_PROVISION=1 (operator manages
+# the service account out-of-band and wants install.sh to only verify it).
+# On any host where creation is not permitted (non-root, useradd/groupadd
+# unavailable), fails loudly with an actionable message instead of writing
+# a unit that can never start — never a silent no-op.
+# ---------------------------------------------------------------------------
+_provision_run_identity() {
+    if [ "${SKIP_USER_PROVISION}" = "1" ]; then
+        _log "skipping run-identity provisioning (CLAGENTIC_TRIAGE_SKIP_USER_PROVISION=1)"
+        if ! id -u "${RUN_USER}" >/dev/null 2>&1; then
+            _log "FATAL: RUN_USER=${RUN_USER} does not exist and provisioning was skipped."
+            _log "Create it before running install.sh, e.g.:"
+            _log "  useradd --system --no-create-home --shell /usr/sbin/nologin ${RUN_USER}"
+            _log "or set CLAGENTIC_TRIAGE_RUN_USER to an existing service account."
+            exit 1
+        fi
+        return 0
+    fi
+
+    if ! getent group "${RUN_GROUP}" >/dev/null 2>&1; then
+        if command -v groupadd >/dev/null 2>&1; then
+            _log "creating group ${RUN_GROUP} (system group)"
+            groupadd --system "${RUN_GROUP}"
+        else
+            _log "FATAL: group ${RUN_GROUP} does not exist and 'groupadd' is not available."
+            _log "Create it manually, e.g.: groupadd --system ${RUN_GROUP}"
+            _log "or set CLAGENTIC_TRIAGE_RUN_GROUP to an existing group."
+            exit 1
+        fi
+    fi
+
+    if ! id -u "${RUN_USER}" >/dev/null 2>&1; then
+        if command -v useradd >/dev/null 2>&1; then
+            _log "creating system user ${RUN_USER} (group=${RUN_GROUP}, no home, nologin shell)"
+            if ! useradd --system --no-create-home --shell /usr/sbin/nologin \
+                --gid "${RUN_GROUP}" "${RUN_USER}"; then
+                _log "FATAL: 'useradd' failed for RUN_USER=${RUN_USER}."
+                _log "This usually means install.sh is not running as root/sudo."
+                _log "Create the user manually, e.g.:"
+                _log "  useradd --system --no-create-home --shell /usr/sbin/nologin --gid ${RUN_GROUP} ${RUN_USER}"
+                _log "or set CLAGENTIC_TRIAGE_RUN_USER to an existing service account."
+                exit 1
+            fi
+        else
+            _log "FATAL: user ${RUN_USER} does not exist and 'useradd' is not available."
+            _log "Create it manually or set CLAGENTIC_TRIAGE_RUN_USER=<existing-user>."
+            exit 1
+        fi
+    fi
+
+    _log "run identity verified: user=${RUN_USER} group=${RUN_GROUP}"
 }
 
 # ---------------------------------------------------------------------------
@@ -128,13 +189,32 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 3 — Install path: deps, template rendering, systemd (re)load+restart
+# Step 3 — Install path: run-identity, deps, template rendering, systemd
+# (re)load+restart
 # ---------------------------------------------------------------------------
+if [ "${SKIP_SYSTEMD}" = "1" ]; then
+    _log "skipping run-identity provisioning (CLAGENTIC_TRIAGE_SKIP_SYSTEMD=1; no unit will be rendered)"
+else
+    _provision_run_identity
+fi
+
 if [ "${SKIP_NPM_CI}" = "1" ]; then
     _log "skipping npm ci (CLAGENTIC_TRIAGE_SKIP_NPM_CI=1)"
 else
     _log "installing dependencies (npm ci --omit=dev)..."
     (cd "${INSTALL_DIR}" && npm ci --omit=dev)
+fi
+
+if [ "${SKIP_SYSTEMD}" != "1" ]; then
+    # WorkingDirectory in the rendered unit is INSTALL_DIR, and the service
+    # writes runtime state there (e.g. .triage/*.jsonl, cwd-relative — see
+    # src/queue.js, src/task_index.js). Hand ownership to the service
+    # identity (after git sync + npm ci, both done as the installer's own
+    # user/root, so root-owned node_modules are re-owned too) so it can
+    # read its own checkout and write its own state without relaxing
+    # systemd's ProtectHome/ProtectSystem hardening.
+    _log "setting ownership of ${INSTALL_DIR} to ${RUN_USER}:${RUN_GROUP}"
+    chown -R "${RUN_USER}:${RUN_GROUP}" "${INSTALL_DIR}"
 fi
 
 _render_template() {
@@ -155,6 +235,12 @@ _render_template() {
 
 _render_template "${INSTALL_DIR}/deploy/clagentic-triage-run.template" "${RUN_WRAPPER_PATH}"
 chmod +x "${RUN_WRAPPER_PATH}"
+if [ "${SKIP_SYSTEMD}" != "1" ]; then
+    # Rendered after the bulk chown above, so re-own this one file too —
+    # otherwise it is left root-owned even though the rest of INSTALL_DIR
+    # belongs to RUN_USER:RUN_GROUP.
+    chown "${RUN_USER}:${RUN_GROUP}" "${RUN_WRAPPER_PATH}"
+fi
 
 if [ "${SKIP_SYSTEMD}" = "1" ]; then
     _log "skipping systemd unit install (CLAGENTIC_TRIAGE_SKIP_SYSTEMD=1)"
