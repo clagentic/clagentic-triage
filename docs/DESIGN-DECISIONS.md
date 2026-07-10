@@ -951,3 +951,67 @@ release poll, T10's own open-PR poll) and is not a new trade-off introduced by t
   non-status axes; `stale.needs_info_days`/`close_after_days` must be positive integers).
 - `docs/CONFIG.md`, `docs/ADAPTERS.md` — document the new config keys, env vars, and adapter
   methods.
+
+---
+
+## DD-017: Action-class/event-type matrix is one shared module, enforced at every boundary (lr-757a69)
+
+**Decision:** `src/action_classes.js` is the single source of truth for which action classes
+(`approve`, `respond`, `request_changes`, `close`, `dispatch`, `escalate`) are valid for which
+event types (`issue`, `pr`). Every layer that reasons about this — the assessor prompt, the
+assessor's own re-route guard, and the CLI's execution-boundary check — reads from this one
+module instead of restating the rule.
+
+**Rationale:**
+- The rule already existed exactly once, informally: the assessor prompt (lr-4717) instructs
+  the model that `approve`/`request_changes` are PR-only. But that was the *only* place the
+  constraint lived. A human operator running `clagentic-triage override <id> --action approve`
+  against an issue, or a model that violated the prompt constraint (observed on console#314/
+  #315), both reached `adapter.approve_pr`/`adapter.request_changes` and got a raw `AdapterError`
+  thrown deep in `src/adapters/github.js` — accurate, but not discoverable ahead of time and not
+  actionable at the point of failure.
+- Docs (`docs/ACTION_CLASSES.md`), CLI help text, and the two enforcement points below all need
+  the same matrix. Hardcoding it four times invites exactly the kind of silent drift this task
+  exists to fix — the fix has to be the single place that answers "is class X valid for type Y,"
+  not another parallel restatement of the same six-by-two table.
+
+**Two enforcement points, one root cause each:**
+1. **Execution boundary (`src/cli.js`)** — `cmdApprove` and `cmdOverride` call
+   `isActionClassValidForType` before invoking any adapter method, for every class the queue item
+   carries (not just the first). A mismatch exits with a message naming the valid classes for
+   that event's type (`mismatchMessage`) instead of reaching `AdapterError`. This covers the
+   *human* path: an operator who overrides to the wrong class for the item's type, or approves a
+   held item whose LLM-suggested class only reaches the execution boundary now that a mismatch is
+   possible upstream (see below).
+2. **Assessor re-route guard (`src/assessor.js`'s `assess()`)** — after `callLlm` returns a
+   validated payload, every class in `suggested_action.classes` is checked against
+   `enrichedEvent.type`. If any class is invalid for the type (model non-compliance with the
+   prompt's PR-only instruction), the Assessment is downgraded to `verdict: 'escalate'`,
+   `confidence: 0`, with the invalid class(es) dropped from `suggested_action.classes` (any
+   still-valid class in the same multi-action verdict survives). This covers the *model* path:
+   the item is never queued with an action class its own event type makes un-approvable — it
+   escalates to a human with a reasoning string naming exactly which class(es) were rejected and
+   why, rather than surfacing only as an eventual `AdapterError` if auto-approved, or as a silent
+   dead end if a human later tries to approve an item that can never succeed.
+
+**What this does NOT change:** `src/llm.js`'s `_validatePayload` still validates that each class
+is one of the six known values (`VALID_ACTION_CLASSES`) — that check is orthogonal (is this a
+real class at all?) to this task's check (is this class valid for *this event's type*?). Both
+run; `_validatePayload`'s check happens first, inside `callLlm`, before `assess()` ever sees the
+payload.
+
+**Config keys:** none — this is validation logic, not operator-configurable policy.
+
+**Implementation:**
+- `src/action_classes.js` — new module: `ALL_ACTION_CLASSES`, `validTypesForClass`,
+  `validClassesForType`, `isActionClassValidForType`, `mismatchMessage`.
+- `src/cli.js` — `cmdApprove` validates every class in the held item's `suggested_action.classes`
+  against `item.event.type` before the execution loop; `cmdOverride` now unconditionally looks up
+  the item (previously only on `--action dispatch`) so the override's class can be validated
+  against the item's type; `cmdHelp`'s override usage text lists valid classes per type via
+  `validClassesForType` rather than a hand-maintained string.
+- `src/assessor.js` — `assess()` filters `suggested_action.classes` against
+  `enrichedEvent.type` after `callLlm` returns; a mismatch re-routes the Assessment to
+  `verdict: 'escalate'`.
+- `docs/ACTION_CLASSES.md` — new doc: the authoritative matrix, referenced from `README.md`'s
+  documentation table and its `override` usage blurb.

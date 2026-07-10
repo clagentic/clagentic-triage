@@ -57,6 +57,12 @@ Event schema (normalized):
 
 The assessor takes an enriched event and a config-defined intent specification and returns:
 
+`approve`/`request_changes` are valid only for `type: 'pr'` events — see
+[docs/ACTION_CLASSES.md](ACTION_CLASSES.md) for the full class × type matrix. If the LLM emits
+a class invalid for the event's type (model non-compliance with the prompt's constraint), the
+assessor re-routes the Assessment to `verdict: 'escalate'` before it ever reaches the router or
+queue (DD-017, `docs/DESIGN-DECISIONS.md`).
+
 ```js
 {
   verdict: 'accept' | 'needs_changes' | 'reject' | 'escalate' | 'defer',

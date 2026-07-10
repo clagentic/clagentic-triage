@@ -24,6 +24,7 @@ import {
   applyPrReadyForReviewTransition,
 } from './lifecycle.js';
 import { checkStaleNeedsInfo } from './stale.js';
+import { isActionClassValidForType, mismatchMessage, validClassesForType } from './action_classes.js';
 
 // NOTE(RT-009): the `hooks` config field is stored but not yet dynamically
 // imported. When hook module loading is implemented, apply _validate_module_path
@@ -494,6 +495,20 @@ async function cmdApprove(args, flags) {
   const body = suggestedAction.body ?? '';
   let dispatchResults = null;
 
+  // Execution-boundary validation (lr-757a69): reject an action-class/
+  // event-type mismatch before any adapter call, with a message naming the
+  // valid classes for this item's type. Without this, an invalid class (e.g.
+  // 'approve' on an issue — model non-compliance with the assessor's PR-only
+  // constraint, lr-4717) reaches adapter.approve_pr and fails there with a
+  // raw AdapterError instead of a legible, actionable CLI error.
+  const eventType = item.event?.type;
+  for (const actionClass of actionClasses) {
+    if (!isActionClassValidForType(actionClass, eventType)) {
+      err(`clagentic-triage approve: ${mismatchMessage(actionClass, eventType)}`);
+      process.exit(1);
+    }
+  }
+
   // Execute the adapter action(s) that were held for human approval.
   for (const actionClass of actionClasses) {
     switch (actionClass) {
@@ -533,22 +548,31 @@ async function cmdOverride(args, flags) {
     process.exit(1);
   }
   if (typeof actionClass !== 'string') {
-    err('--action <class> is required for override. Valid classes: respond, close, request_changes, dispatch, escalate, approve');
+    err('--action <class> is required for override. Valid classes: respond, close, request_changes, dispatch, escalate, approve (approve/request_changes are PR-only — see docs/ACTION_CLASSES.md)');
     process.exit(1);
   }
 
   const config = await getConfig(flags);
 
+  // Execution-boundary validation (lr-757a69): look up the item once so the
+  // override's action class can be checked against the item's event type
+  // before anything executes — same rationale as cmdApprove's pre-flight
+  // check. Fetching the item here (rather than only when actionClass ===
+  // 'dispatch', as before) means an override to 'approve' on an issue is
+  // rejected with a clear message instead of reaching adapter.approve_pr.
+  const all = await readAll(config);
+  const item = all.find((i) => i.id === id);
+  if (item && !isActionClassValidForType(actionClass, item.event?.type)) {
+    err(`clagentic-triage override: ${mismatchMessage(actionClass, item.event?.type)}`);
+    process.exit(1);
+  }
+
   // When the operator overrides to 'dispatch', run dispatchers before resolving
   // so the results are recorded on the queue entry.
   // dispatch() handles per-dispatcher errors internally — it never throws.
   let dispatchResults = null;
-  if (actionClass === 'dispatch') {
-    const all = await readAll(config);
-    const item = all.find((i) => i.id === id);
-    if (item) {
-      dispatchResults = await dispatch(config, item.event, item.assessment);
-    }
+  if (actionClass === 'dispatch' && item) {
+    dispatchResults = await dispatch(config, item.event, item.assessment);
   }
 
   const updated = await resolveItem(config, id, {
@@ -585,10 +609,15 @@ Usage:
     List pending queue items (default: pending).
 
   clagentic-triage approve <id> [--config <path>]
-    Approve a pending item.
+    Approve a pending item. Rejects if any of its action classes are invalid
+    for the item's event type (e.g. 'approve' on an issue) before taking any
+    action — see docs/ACTION_CLASSES.md.
 
   clagentic-triage override <id> --action <class> [--config <path>]
     Override the suggested action. <class>: respond, close, request_changes, dispatch, escalate, approve
+    Valid classes for issues: ${validClassesForType('issue').join(', ')}
+    Valid classes for PRs:    ${validClassesForType('pr').join(', ')}
+    ('approve' and 'request_changes' are PR-only — see docs/ACTION_CLASSES.md)
 
   clagentic-triage reject <id> [--config <path>]
     Reject a pending item.
