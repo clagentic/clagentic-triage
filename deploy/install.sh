@@ -139,7 +139,23 @@ echo $$ > "${_LOCK_FILE}"
 # ---------------------------------------------------------------------------
 # Step 1 — git sync (clone on first run, fetch+checkout thereafter). Always
 # idempotent regardless of prior state.
+#
+# Cross-owner safe.directory (lr-d2644c): install.sh hands INSTALL_DIR's
+# ownership to RUN_USER at the end of every install run (see the chown
+# below), but the invoking user for a given run (e.g. NAOMI's post-merge
+# automation, or a manual operator run) may be root or a different account.
+# Git >= 2.35.2 refuses to operate on a repo owned by a different user
+# ("detected dubious ownership") unless that path is explicitly trusted via
+# `safe.directory`. Register INSTALL_DIR as safe for the invoking user
+# before any git command touches it. `git config --add` is NOT itself
+# idempotent (it appends a duplicate entry on every call), so guard it with
+# a `--get-all` membership check first — scoped to the invoking user's own
+# gitconfig, so it never widens trust for any other account on the host.
 # ---------------------------------------------------------------------------
+if ! git config --global --get-all safe.directory 2>/dev/null | grep -qxF "${INSTALL_DIR}"; then
+    git config --global --add safe.directory "${INSTALL_DIR}"
+fi
+
 if [ ! -d "${INSTALL_DIR}/.git" ]; then
     _log "no checkout found at ${INSTALL_DIR}; cloning ${GIT_REMOTE}"
     mkdir -p "$(dirname "${INSTALL_DIR}")"
