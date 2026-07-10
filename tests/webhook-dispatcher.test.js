@@ -11,6 +11,10 @@
  *   - Non-2xx response throws with status code
  *   - update_task is a no-op (returns undefined, makes no calls)
  *   - Payload does NOT contain event.body or context fields
+ *   - Config-driven field mapping ("payload"): literals, single-placeholder
+ *     native-type passthrough, multi-placeholder string interpolation,
+ *     opt-in event.body forwarding, unresolved-path handling
+ *   - Bearer-token auth mode ("auth: { type: 'bearer', token_env }")
  */
 
 import { describe, it, beforeEach, afterEach } from 'node:test';
@@ -343,6 +347,201 @@ describe('webhook dispatcher', () => {
         () => webhook.create_task(config, makeEvent(), makeAssessment()),
         /missing a valid "url"/,
       );
+    });
+
+    it('throws when both "secret" (HMAC) and "auth" (bearer) are configured', async () => {
+      fetchMock = mockFetch();
+      const config = makeConfig({
+        secret: 'my-webhook-secret',
+        auth: { type: 'bearer', token_env: 'INGEST_TOKEN' },
+      });
+
+      await assert.rejects(
+        () => webhook.create_task(config, makeEvent(), makeAssessment()),
+        /mutually exclusive/,
+      );
+      assert.equal(fetchMock.calls.length, 0, 'must not POST when auth config is ambiguous');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Config-driven field mapping ("payload")
+  // -------------------------------------------------------------------------
+
+  describe('field mapping (config.payload)', () => {
+    it('uses the default fixed payload when no "payload" mapping is configured (back-compat)', async () => {
+      fetchMock = mockFetch();
+      const event = makeEvent();
+      const assessment = makeAssessment();
+
+      await webhook.create_task(makeConfig(), event, assessment);
+
+      const body = JSON.parse(fetchMock.calls[0].init.body);
+      assert.equal(body.event_id, event.id);
+      assert.equal(body.verdict, assessment.verdict);
+      assert.ok(!Object.prototype.hasOwnProperty.call(body, 'title'),
+        'default payload has no "title" key — mapped-payload-only field');
+    });
+
+    it('maps a single "{{event.field}}" placeholder to the target key, preserving native type', async () => {
+      fetchMock = mockFetch();
+      const event = makeEvent({ title: 'Something broke' });
+      const config = makeConfig({
+        payload: { title: '{{event.title}}' },
+      });
+
+      await webhook.create_task(config, event, makeAssessment());
+
+      const body = JSON.parse(fetchMock.calls[0].init.body);
+      assert.equal(body.title, 'Something broke');
+    });
+
+    it('maps a literal value (no placeholder) through unchanged', async () => {
+      fetchMock = mockFetch();
+      const config = makeConfig({
+        payload: { project: 'lore-archivist' },
+      });
+
+      await webhook.create_task(config, makeEvent(), makeAssessment());
+
+      const body = JSON.parse(fetchMock.calls[0].init.body);
+      assert.equal(body.project, 'lore-archivist');
+    });
+
+    it('interpolates multiple placeholders and literal text in one template', async () => {
+      fetchMock = mockFetch();
+      const event = makeEvent({ body: 'Steps to reproduce: click the button.' });
+      const assessment = makeAssessment({ reasoning: 'Valid bug report.' });
+      const config = makeConfig({
+        payload: { description: '{{assessment.reasoning}}\n\n{{event.body}}' },
+      });
+
+      await webhook.create_task(config, event, assessment);
+
+      const body = JSON.parse(fetchMock.calls[0].init.body);
+      assert.equal(body.description, 'Valid bug report.\n\nSteps to reproduce: click the button.');
+    });
+
+    it('supports opt-in forwarding of event.url as a back-link field', async () => {
+      fetchMock = mockFetch();
+      const event = makeEvent({ url: 'https://github.com/owner/repo/issues/42' });
+      const config = makeConfig({
+        payload: { source_url: '{{event.url}}' },
+      });
+
+      await webhook.create_task(config, event, makeAssessment());
+
+      const body = JSON.parse(fetchMock.calls[0].init.body);
+      assert.equal(body.source_url, 'https://github.com/owner/repo/issues/42');
+    });
+
+    it('renders an unresolvable path as null for a whole-string placeholder', async () => {
+      fetchMock = mockFetch();
+      const config = makeConfig({
+        payload: { assignee: '{{event.does_not_exist}}' },
+      });
+
+      await webhook.create_task(config, makeEvent(), makeAssessment());
+
+      const body = JSON.parse(fetchMock.calls[0].init.body);
+      assert.equal(body.assignee, null);
+    });
+
+    it('renders an unresolvable path as empty string within interpolated text', async () => {
+      fetchMock = mockFetch();
+      const config = makeConfig({
+        payload: { description: 'prefix-{{event.does_not_exist}}-suffix' },
+      });
+
+      await webhook.create_task(config, makeEvent(), makeAssessment());
+
+      const body = JSON.parse(fetchMock.calls[0].init.body);
+      assert.equal(body.description, 'prefix--suffix');
+    });
+
+    it('maps a nested assessment path (assessment.suggested_action.body)', async () => {
+      fetchMock = mockFetch();
+      const assessment = makeAssessment({
+        suggested_action: { classes: ['dispatch'], body: 'opening a ticket for this' },
+      });
+      const config = makeConfig({
+        payload: { notes: '{{assessment.suggested_action.body}}' },
+      });
+
+      await webhook.create_task(config, makeEvent(), assessment);
+
+      const body = JSON.parse(fetchMock.calls[0].init.body);
+      assert.equal(body.notes, 'opening a ticket for this');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Bearer-token auth
+  // -------------------------------------------------------------------------
+
+  describe('bearer auth (config.auth)', () => {
+    const ENV_VAR = 'CLAGENTIC_TRIAGE_TEST_INGEST_TOKEN';
+
+    afterEach(() => {
+      delete process.env[ENV_VAR];
+    });
+
+    it('adds an Authorization: Bearer header using the configured token_env', async () => {
+      process.env[ENV_VAR] = 'super-secret-token';
+      fetchMock = mockFetch();
+      const config = makeConfig({ auth: { type: 'bearer', token_env: ENV_VAR } });
+
+      await webhook.create_task(config, makeEvent(), makeAssessment());
+
+      const headers = fetchMock.calls[0].init.headers;
+      assert.equal(headers.Authorization, 'Bearer super-secret-token');
+    });
+
+    it('does not add X-Clagentic-Signature when bearer auth is configured', async () => {
+      process.env[ENV_VAR] = 'super-secret-token';
+      fetchMock = mockFetch();
+      const config = makeConfig({ auth: { type: 'bearer', token_env: ENV_VAR } });
+
+      await webhook.create_task(config, makeEvent(), makeAssessment());
+
+      const headers = fetchMock.calls[0].init.headers;
+      assert.ok(!Object.prototype.hasOwnProperty.call(headers, 'X-Clagentic-Signature'));
+    });
+
+    it('throws when auth.type is "bearer" and the named env var is unset', async () => {
+      fetchMock = mockFetch();
+      const config = makeConfig({ auth: { type: 'bearer', token_env: ENV_VAR } });
+
+      await assert.rejects(
+        () => webhook.create_task(config, makeEvent(), makeAssessment()),
+        /token_env.*unset|unset or empty/i,
+      );
+      assert.equal(fetchMock.calls.length, 0, 'must not POST when auth token is missing');
+    });
+
+    it('throws when auth.type is "bearer" and the named env var is empty', async () => {
+      process.env[ENV_VAR] = '';
+      fetchMock = mockFetch();
+      const config = makeConfig({ auth: { type: 'bearer', token_env: ENV_VAR } });
+
+      await assert.rejects(
+        () => webhook.create_task(config, makeEvent(), makeAssessment()),
+        /unset or empty/i,
+      );
+    });
+
+    it('defaults token_env to INGEST_TOKEN when not specified', async () => {
+      process.env.INGEST_TOKEN = 'default-env-token';
+      fetchMock = mockFetch();
+      const config = makeConfig({ auth: { type: 'bearer' } });
+
+      try {
+        await webhook.create_task(config, makeEvent(), makeAssessment());
+        const headers = fetchMock.calls[0].init.headers;
+        assert.equal(headers.Authorization, 'Bearer default-env-token');
+      } finally {
+        delete process.env.INGEST_TOKEN;
+      }
     });
   });
 });
