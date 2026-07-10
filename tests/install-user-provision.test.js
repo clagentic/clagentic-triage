@@ -285,6 +285,52 @@ describe('deploy/install.sh — run-identity provisioning (lr-7de17d)', () => {
     assert.ok(!existsSync(unitPath), 'unit must not be rendered when the run identity could not be provisioned');
   });
 
+  it('CLAGENTIC_TRIAGE_SKIP_USER_PROVISION=1 with a pre-existing user succeeds and renders the unit, without creating anything', () => {
+    const caseDir = join(workDir, 'skip-provision-present');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir, stateFile } = makeFakeSystem(caseDir);
+    // Pre-seed the account as already existing — SKIP_USER_PROVISION=1's
+    // preflight-verify branch should find it and return success without
+    // ever invoking useradd/groupadd.
+    writeFileSync(stateFile, JSON.stringify({ users: ['clagentic-triage-test'], groups: ['clagentic-triage-test'], chowned: [] }));
+    // Remove the useradd/groupadd stubs entirely — if the success path
+    // mistakenly tried to create the account, the run would fail loudly
+    // (command not found) rather than silently passing.
+    rmSync(join(binDir, 'useradd'));
+    rmSync(join(binDir, 'groupadd'));
+
+    const result = runInstall(
+      {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_SKIP_USER_PROVISION: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+      },
+      binDir,
+    );
+
+    assert.equal(result.status, 0, `install.sh should succeed when SKIP_USER_PROVISION=1 and the user already exists: ${result.stderr}\n${result.stdout}`);
+
+    const unitPath = join(unitDir, 'clagentic-triage.service');
+    assert.ok(existsSync(unitPath), 'unit should have been rendered — preflight-verify found the account present');
+    const unitContents = readFileSync(unitPath, 'utf8');
+    assert.match(unitContents, /User=clagentic-triage-test/);
+    assert.match(unitContents, /Group=clagentic-triage-test/);
+
+    const state = JSON.parse(readFileSync(stateFile, 'utf8'));
+    assert.equal(state.users.length, 1, 'useradd must not have been invoked');
+    assert.equal(state.groups.length, 1, 'groupadd must not have been invoked');
+  });
+
   it('CLAGENTIC_TRIAGE_SKIP_USER_PROVISION=1 with a missing user fails preflight with an actionable message', () => {
     const caseDir = join(workDir, 'skip-provision-missing');
     const installDir = join(caseDir, 'opt', 'clagentic-triage');
