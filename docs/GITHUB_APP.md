@@ -145,7 +145,7 @@ every poll cycle — no sidecar required.
 }
 ```
 
-**Corresponding env vars:**
+**Corresponding env vars — inline PEM:**
 
 ```
 CLAGENTIC_TRIAGE_GITHUB_APP_ID=123456
@@ -153,17 +153,56 @@ CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n...
 CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID=78901234
 ```
 
+**Corresponding env vars — key file (recommended for systemd/Docker/k8s):**
+
+```
+CLAGENTIC_TRIAGE_GITHUB_APP_ID=123456
+CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE=/path/to/app-private-key.pem
+CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID=78901234
+```
+
 | Config key | Env var | Description |
 |---|---|---|
 | `source.github_app_id` | `CLAGENTIC_TRIAGE_GITHUB_APP_ID` | Numeric App ID shown at the top of your App's settings page |
-| `source.github_app_private_key_env` | *(not mapped — see note)* | Name of the env var that holds the PEM. Default: `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY`. Change this if you store the key under a different name. |
+| `source.github_app_private_key_env` | *(not mapped — see note)* | Name of the env var that holds the PEM inline. Default: `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY`. Change this if you store the key under a different name. |
+| `source.github_app_private_key_path` | `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE` | Path to a file containing the PEM. Read at mint time; the path itself is stored on config (it is not a secret), but the PEM contents never are. |
 | `source.github_app_installation_id` | `CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID` | Numeric installation ID from the installation URL |
 
-> **Note on the private key:** the PEM is never stored on the config object. Only the
-> *name* of the env var is stored (`github_app_private_key_env`). The adapter reads the
-> PEM from `process.env[github_app_private_key_env]` at mint time. Set the env var
-> whose name is in `github_app_private_key_env` to the full PEM contents (newlines as
-> `\n` or literal, depending on your deployment method).
+> **Note on the private key — two input methods, one precedence order:**
+> the PEM contents are never stored on the config object; only the env var
+> name (`github_app_private_key_env`) or the file path
+> (`github_app_private_key_path`) are. At mint time the adapter
+> (`src/adapters/github.js`) resolves the PEM in this order:
+>
+> 1. **Inline env var** — `process.env[github_app_private_key_env]`
+>    (default name `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY`). If set and
+>    non-empty, this wins.
+> 2. **File path** — `source.github_app_private_key_path` or
+>    `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE`. Used only when the
+>    inline env var is unset/empty. Read as UTF-8 text at mint time.
+> 3. **Neither configured** — an `AdapterError` naming both the env var name
+>    and the file-path option, so the operator can tell immediately which
+>    input method to fix.
+>
+> **Newline handling (systemd `EnvironmentFile` compatibility):** a systemd
+> `EnvironmentFile` cannot hold a literal multi-line value, so the inline-PEM
+> path requires newlines encoded as the two-character sequence `\n`. Both the
+> inline-env and file-path inputs are passed through the same unescaping
+> step: if the value contains literal `\n` sequences and no real newline
+> already, they are converted to real newlines before the key is used. A PEM
+> with real newlines (e.g. pasted into a JSON config file, or a mounted key
+> file) is left unchanged. This means the documented `\n`-escaped inline
+> value actually works under systemd's `EnvironmentFile=`, and a mounted
+> `.pem` file works either escaped or literal.
+>
+> **Recommended for systemd/Docker/k8s deployments:** use the file-path
+> option. Secret managers, Docker secrets, Kubernetes mounts, and systemd's
+> own `LoadCredential` all deliver secrets as files — pointing
+> `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE` at that file avoids the
+> encode/decode step entirely and is what `deploy/install.sh` wires up by
+> default (see `deploy/.env.example` /
+> `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE` at the installer layer) — no
+> manual `ExecStart` override is needed.
 
 When `github_app_id` is set, the PAT (`CLAGENTIC_TRIAGE_GITHUB_TOKEN`) is ignored.
 Use one or the other — not both.

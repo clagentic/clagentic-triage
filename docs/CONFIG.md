@@ -74,7 +74,8 @@ Configuration is loaded from (in priority order):
 | `max_events_per_author_per_poll` | `20` | Maximum events passed downstream per author per poll window. Applied after the bot and actor-association filters; filtered events do not count. `0` or `null` disables the cap. Stateless — counts reset each poll call. Protects against a single noisy actor flooding the assessment queue. |
 | `max_events_per_repo_per_poll` | `200` | Maximum post-filter events accumulated per repo per poll. Pagination stops once this many events have passed all filters for a repo. This cap operates on the post-filter event count, so a high-volume author whose events are dropped by the per-author cap cannot consume the budget and starve legitimate contributors. `0` or `null` disables the cap. |
 | `github_app_id` | `null` | GitHub App numeric ID. When set, the adapter mints installation tokens instead of using `CLAGENTIC_TRIAGE_GITHUB_TOKEN`. Use App auth or PAT — not both. |
-| `github_app_private_key_env` | `"CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY"` | Name of the env var that holds the RS256 private key PEM. The PEM is never stored on the config object — only the env var name is. Override if you store the key under a different env var name. |
+| `github_app_private_key_env` | `"CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY"` | Name of the env var that holds the RS256 private key PEM inline. The PEM is never stored on the config object — only the env var name is. Override if you store the key under a different env var name. Takes precedence over `github_app_private_key_path` when both resolve to a value. |
+| `github_app_private_key_path` | `null` | Path to a file containing the RS256 private key PEM. Read at mint time; used only when the inline env var (above) is unset/empty. See `docs/GITHUB_APP.md` for the full precedence and newline-escaping rules — this is the recommended option for systemd/Docker/k8s deployments where the key arrives as a mounted file. |
 | `github_app_installation_id` | `null` | Installation numeric ID. Found in the installation URL on GitHub. Required when `github_app_id` is set. |
 
 The actor-association filter is orthogonal to the bot filter — both apply, and an
@@ -499,7 +500,8 @@ posting a second warning.
 | `CLAGENTIC_TRIAGE_RUNNER_API_KEY_ENV` | `runner_api_key_env` | Name of the env var holding the API key (never the key itself) |
 | `CLAGENTIC_TRIAGE_GITHUB_TOKEN` | *(token getter)* | Never stored in config object |
 | `CLAGENTIC_TRIAGE_GITHUB_APP_ID` | `source.github_app_id` | |
-| `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY` | *(PEM read at mint time)* | Never stored in config object; env var name stored via `github_app_private_key_env` |
+| `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY` | *(PEM read at mint time)* | Inline PEM. Never stored in config object; env var name stored via `github_app_private_key_env`. Wins over the file-path option when both are set. |
+| `CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE` | `source.github_app_private_key_path` | Path to a file containing the PEM. Used only when the inline env var above is unset/empty. See `docs/GITHUB_APP.md`. |
 | `CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID` | `source.github_app_installation_id` | |
 | `CLAGENTIC_TRIAGE_AUTO_APPROVE` | `auto_approve` | comma-separated |
 | `CLAGENTIC_TRIAGE_WEBHOOK_SECRET` | `webhooks.secret` | |

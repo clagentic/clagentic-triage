@@ -89,6 +89,14 @@ function defaults() {
       // Name of the env var that holds the PEM (not the PEM itself). Default:
       // CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY. The PEM is read at mint time.
       github_app_private_key_env: 'CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY',
+      // Path to a file containing the PEM (alternative to the inline env var —
+      // the natural shape for secret managers, Docker secrets, k8s mounts, and
+      // systemd LoadCredential). Also settable via
+      // CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE. Precedence in
+      // src/adapters/github.js: inline env var wins, else this file path, else
+      // an actionable error naming both. Never stored beyond the path itself —
+      // the PEM contents are read at mint time, not stored on config.
+      github_app_private_key_path: null,
       github_app_installation_id: null,
     },
     intent_file: '.github/triage-intent.yml',
@@ -321,6 +329,15 @@ function configFromEnv(env) {
   // read from process.env at mint time and never stored on the config object.
   // Operators who want to use a non-default env var name set
   // github_app_private_key_env in the config file.
+
+  // CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE mirrors that convention: the
+  // adapter reads the PEM from this path at mint time (src/adapters/github.js
+  // _resolve_private_key_pem), so it is safe to store the path itself on
+  // config — unlike the PEM contents, a file path is not a secret.
+  if (env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE !== undefined) {
+    out.source = out.source || {};
+    out.source.github_app_private_key_path = env.CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE;
+  }
 
   if (env.CLAGENTIC_TRIAGE_GITHUB_APP_INSTALLATION_ID !== undefined) {
     out.source = out.source || {};

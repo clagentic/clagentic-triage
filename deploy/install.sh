@@ -46,6 +46,12 @@ RUN_GROUP="${CLAGENTIC_TRIAGE_RUN_GROUP:-clagentic-triage}"
 SYSTEMD_UNIT_DIR="${CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
 ENV_FILE="${CLAGENTIC_TRIAGE_ENV_FILE:-/etc/clagentic-triage/triage.env}"
 NODE_BIN="${CLAGENTIC_TRIAGE_NODE_BIN:-/usr/bin/node}"
+# GitHub App private key file path (lr-4f59b5). Rendered into the unit's
+# EnvironmentFile-adjacent Environment= line so a fresh install supports
+# GitHub App auth via a mounted/deployed key file without a manual ExecStart
+# override. Configurable per-host; unset by default (PAT or inline-env PEM
+# auth continue to work unchanged if this is not set).
+GITHUB_APP_PRIVATE_KEY_FILE="${CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE:-}"
 FORCE="${CLAGENTIC_TRIAGE_FORCE_UPDATE:-0}"
 SKIP_NPM_CI="${CLAGENTIC_TRIAGE_SKIP_NPM_CI:-0}"
 SKIP_SYSTEMD="${CLAGENTIC_TRIAGE_SKIP_SYSTEMD:-0}"
@@ -217,12 +223,32 @@ if [ "${SKIP_SYSTEMD}" != "1" ]; then
     chown -R "${RUN_USER}:${RUN_GROUP}" "${INSTALL_DIR}"
 fi
 
+# Rendered as a full "Environment=..." line only when
+# CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE is set on the installer host;
+# otherwise the placeholder line is deleted outright (not just left blank) so
+# an unset value never ships a dangling Environment= line pointing at an
+# empty path.
+_github_app_key_file_env_line=""
+if [ -n "${GITHUB_APP_PRIVATE_KEY_FILE}" ]; then
+    _github_app_key_file_env_line="Environment=CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE=${GITHUB_APP_PRIVATE_KEY_FILE}"
+fi
+
 _render_template() {
     # $1 = template path, $2 = output path
     local _tmpl="$1"
     local _out="$2"
     _log "rendering $(basename "${_tmpl}") -> ${_out}"
     mkdir -p "$(dirname "${_out}")"
+    # Second stage: when no key-file path is configured, delete the
+    # placeholder line outright rather than substituting an empty value
+    # (which would leave a dangling blank line in the unit); otherwise
+    # substitute the resolved Environment= line.
+    local _key_file_stage
+    if [ -n "${_github_app_key_file_env_line}" ]; then
+        _key_file_stage="s#@@GITHUB_APP_PRIVATE_KEY_FILE_ENV_LINE@@#${_github_app_key_file_env_line}#g"
+    else
+        _key_file_stage="/@@GITHUB_APP_PRIVATE_KEY_FILE_ENV_LINE@@/d"
+    fi
     sed \
         -e "s#@@INSTALL_DIR@@#${INSTALL_DIR}#g" \
         -e "s#@@RUN_USER@@#${RUN_USER}#g" \
@@ -230,6 +256,7 @@ _render_template() {
         -e "s#@@ENV_FILE@@#${ENV_FILE}#g" \
         -e "s#@@RUN_WRAPPER_PATH@@#${RUN_WRAPPER_PATH}#g" \
         -e "s#@@NODE_BIN@@#${NODE_BIN}#g" \
+        -e "${_key_file_stage}" \
         "${_tmpl}" > "${_out}"
 }
 
