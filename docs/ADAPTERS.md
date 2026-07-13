@@ -181,3 +181,23 @@ filter (DD-008). The server calls this AFTER `normalize_webhook`, so the Event's
 server processes all (non-bot) events (no actor policy). The github adapter also
 applies the same decision on the poll path inside `list_events`, and exports the
 pure decision function `should_process_actor(config, { author, author_association })`.
+
+**`event_allowed(config, event) -> boolean`** (optional, lr-af2104)
+
+Combined DD-005 (bot) + DD-008 (actor-association) gate evaluated against a
+normalized Event alone, without the raw provider payload `is_bot_sender` needs.
+`src/cli.js`'s `routeEvent` calls this immediately before routing an event to the
+LLM-assessment pipeline (`processEvent`), as a defense-in-depth check for events
+that reached `routeEvent` via a path that does not pre-filter bots/internal
+actors at fetch time — specifically `list_open_prs`/`list_lifecycle_events`'s
+`openPrs` (T10, lr-9e35), which is deliberately unfiltered because its primary
+purpose is a deterministic lifecycle transition, not triage; a PR with no linked
+issue falls through to the LLM pipeline instead of a transition. Events sourced
+from `list_events` or a webhook delivery already passed the equivalent filters at
+ingress, so this check is a no-op for them. If an adapter does not export this
+method, `routeEvent` processes all events reaching this point unfiltered (matches
+pre-lr-af2104 behavior). The github adapter's implementation composes
+`is_bot_event(event, allowList)` (the Event-shape counterpart of `is_bot_sender`,
+using `metadata.author_type` — `_normalize`'s copy of the raw payload's
+`user.type`/`sender.type` — and the same `[bot]`-suffix login heuristic) with
+`actor_allowed`.

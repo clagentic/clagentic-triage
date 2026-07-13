@@ -1015,3 +1015,83 @@ payload.
   `verdict: 'escalate'`.
 - `docs/ACTION_CLASSES.md` — new doc: the authoritative matrix, referenced from `README.md`'s
   documentation table and its `override` usage blurb.
+
+---
+
+## DD-017: The bot/actor filter gap was a missing gate on one fallthrough path, not a filter-logic defect (lr-af2104)
+
+**Decision:** `src/cli.js`'s `routeEvent` now calls `adapter.event_allowed(config, event)` — a
+combined DD-005 (bot) + DD-008 (actor-association) check evaluated against a normalized Event —
+immediately before routing any event to the LLM-assessment pipeline (`processEvent`). No
+`watch_associations`/`allow_bot_logins` default changed; the existing filters were already
+correct, they were simply never invoked on one specific path.
+
+**Root cause (confirmed against the live incident — 43 stale pending-queue entries, 28 from
+`clagentic-builder[bot]`, 14 from the operator's own `akuehner` PRs):** `list_events` (poll) and
+the webhook server both already apply `_isBot`/`should_process_actor` before an Event reaches
+`processEvent` — that part of DD-005/DD-008 worked as designed. But `list_lifecycle_events`'s
+`openPrs` (sourced by `list_open_prs`, T10/lr-9e35) is *deliberately* fetched without those
+filters, because its primary purpose is a deterministic lifecycle transition
+(`applyPrOpenedTransition`/`applyPrReadyForReviewTransition`), not LLM-assessed triage — see
+`list_open_prs`'s own docblock ("without repurposing/duplicating list_events's own filtering...
+which has no bearing on a deterministic state transition"). That reasoning holds *only* while
+every such Event actually resolves to a transition. `routeEvent` (`src/cli.js`) falls through to
+`processEvent` for any PR event whose transition reports no linked issues (`result.issues.length
+=== 0`) — which includes every PR opened without a `Closes #NN`-style linked issue, e.g. routine
+crew-bot dependency/build PRs and the operator's own PRs. Those events reached the LLM pipeline,
+and from there the pending queue, having never passed a bot or actor-association check at all.
+
+**Why the fix is a gate at the fallthrough, not a change to `list_open_prs` or the default
+association/bot config:**
+- `list_open_prs`'s unfiltered fetch is correct for its actual purpose (every open PR, including
+  internal ones, needs its lifecycle status kept current — filtering it out at fetch time would
+  silently stop tracking an internal PR's in-progress/in-review transitions on its linked issue).
+  The bug is specifically that the *pipeline fallthrough* did not re-apply the filters that every
+  other pipeline-bound event already passes.
+- `watch_associations`/`allow_bot_logins` defaults (DD-005/DD-008) were already the conservative,
+  external-only, deny-bots-by-default posture the task's own audit expected. Widening or
+  re-designing them would not have fixed this incident — the deployed config's `ignore_logins`/
+  `allow_bot_logins` were irrelevant because the filter functions were never called on this path.
+- A raw-payload-only bot check (`_isBot`/`is_bot_sender`) cannot run at the `routeEvent`
+  fallthrough — only a normalized Event is available there, and `_normalize` did not previously
+  carry the raw payload's `user.type`/`sender.type` field forward. Fixing this required an
+  Event-shape equivalent, not a call to the existing raw-payload function.
+
+**Implementation:**
+- `src/adapters/github.js`:
+  - `_normalize` gained `metadata.author_type` (`raw.user?.type ?? ''`) — the same signal
+    `_isBot` reads from a raw payload's `user.type`/`sender.type`, now carried onto every
+    normalized Event regardless of ingress path.
+  - `is_bot_event(event, allowList)` — the Event-shape counterpart of `is_bot_sender`/`_isBot`:
+    same `[bot]`-suffix login heuristic plus `metadata.author_type === 'Bot'`, same
+    `allow_bot_logins` override semantics.
+  - `event_allowed(config, event)` — composes `is_bot_event` + `actor_allowed` (the existing
+    DD-008 Event-shape check) into the single combined gate `routeEvent` calls. An Event must
+    pass both, same "orthogonal, both apply" composition DD-008 already established for
+    `list_events`/the webhook server.
+- `src/cli.js` — `routeEvent` calls `adapter.event_allowed` (guarded by a `typeof === 'function'`
+  check, matching the existing optional-interface-method pattern for `list_lifecycle_events`)
+  immediately before the `processEvent` fallthrough. A filtered event returns
+  `{ kind: 'triage', status: 'ignored', reason: 'actor_or_bot' }` without ever calling
+  `processEvent` or writing a queue entry — no LLM call, no pending-queue noise. Events sourced
+  from `list_events` or a webhook delivery already passed the equivalent filters at ingress, so
+  this is a no-op re-check for them, not a behavior change.
+- `docs/ADAPTERS.md` — documents `event_allowed` as an optional adapter interface method,
+  alongside the existing `actor_allowed`/`is_bot_sender` entries.
+- `docs/CONFIG.md` — strengthened the `ignore_logins`/`allow_bot_logins` documentation with an
+  explicit operator warning: these fields default to empty, and an empty `ignore_logins` on a
+  repo where the operator or crew automation also opens PRs/issues means their own activity will
+  reach the pending queue. Operators must populate `ignore_logins` (their own username) before
+  deploying triage on such a repo — no code-level default can know an operator's own login or
+  which bot logins are "theirs."
+
+**What this does NOT change:**
+- No new config keys. `allow_bot_logins`/`ignore_logins`/`watch_associations`/`watch_logins`
+  keep their existing defaults and semantics (DD-005, DD-008) — this task adds a missing call
+  site for those exact same checks, not new policy.
+- Does not purge or touch any existing pending-queue entries — `.triage/pending.jsonl` is
+  runtime/deployment state, out of scope for a source-repo change (see lr-af2104).
+- Does not address `pull_request_synchronize` duplicate-entry accumulation (a PR re-queued once
+  per `synchronize` event because the queue has no upsert-by-event-id semantics) — noted as a
+  related but separately-scoped issue in lr-af2104; not fixed here to keep this change to the
+  actual security/noise boundary (the login/bot filter gap).
