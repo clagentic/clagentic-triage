@@ -21,6 +21,8 @@ import { tmpdir } from 'node:os';
 import {
   should_process_actor,
   actor_allowed,
+  is_bot_event,
+  event_allowed,
   normalize_webhook,
   list_events,
 } from '../src/adapters/github.js';
@@ -423,6 +425,74 @@ describe('webhook ingress — actor filter (DD-008)', () => {
     } finally {
       await closeServer(server);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// is_bot_event / event_allowed (lr-af2104) — Event-shape bot + actor gate
+// ---------------------------------------------------------------------------
+
+describe('is_bot_event — [bot]-suffixed login gets excluded by default (lr-af2104)', () => {
+  it('excludes a [bot]-suffixed login even with no author_type set', () => {
+    const event = { author: 'clagentic-builder[bot]', metadata: {} };
+    assert.equal(is_bot_event(event, []), true);
+  });
+
+  it('excludes an event whose metadata.author_type is "Bot"', () => {
+    const event = { author: 'some-service-account', metadata: { author_type: 'Bot' } };
+    assert.equal(is_bot_event(event, []), true);
+  });
+
+  it('does not exclude a plain human login', () => {
+    const event = { author: 'alice', metadata: { author_type: 'User' } };
+    assert.equal(is_bot_event(event, []), false);
+  });
+
+  it('allow_bot_logins overrides the [bot]-suffix default exclusion', () => {
+    const event = { author: 'trusted-reporter[bot]', metadata: {} };
+    assert.equal(is_bot_event(event, ['trusted-reporter[bot]']), false);
+  });
+});
+
+describe('event_allowed — combined bot + actor-association gate on a normalized Event (lr-af2104)', () => {
+  function config(overrides = {}) {
+    return { source: defaultSource(overrides) };
+  }
+
+  it('excludes a [bot]-suffixed author regardless of author_association', () => {
+    const event = {
+      author: 'clagentic-builder[bot]',
+      metadata: { author_type: 'Bot', author_association: 'CONTRIBUTOR' },
+    };
+    assert.equal(event_allowed(config(), event), false);
+  });
+
+  it('excludes an association-allowed login that is also in ignore_logins (regression: this is the exact incident shape — akuehner as MEMBER with an explicit ignore_logins entry)', () => {
+    const event = {
+      author: 'akuehner',
+      metadata: { author_type: 'User', author_association: 'MEMBER' },
+    };
+    // MEMBER is not in the default watch_associations bucket, but even if an
+    // operator widened watch_associations to include MEMBER (or the item had
+    // no association at all — fail-open), ignore_logins must still win.
+    const cfg = config({ ignore_logins: ['akuehner'], watch_associations: ['MEMBER'] });
+    assert.equal(event_allowed(cfg, event), false);
+  });
+
+  it('processes a non-bot, external CONTRIBUTOR', () => {
+    const event = {
+      author: 'outside-contributor',
+      metadata: { author_type: 'User', author_association: 'CONTRIBUTOR' },
+    };
+    assert.equal(event_allowed(config(), event), true);
+  });
+
+  it('CONTRIBUTOR association does not exempt a [bot]-suffixed login (a bot with write access is still a bot)', () => {
+    const event = {
+      author: 'clagentic-builder[bot]',
+      metadata: { author_type: 'Bot', author_association: 'CONTRIBUTOR' },
+    };
+    assert.equal(event_allowed(config(), event), false);
   });
 });
 

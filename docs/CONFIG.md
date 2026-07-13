@@ -67,9 +67,9 @@ Configuration is loaded from (in priority order):
 | `org` | `null` | GitHub org to watch. If set, all repos in the org are fetched unless `repos` is specified. |
 | `repos` | `["*"]` | Repos to watch in `owner/repo` format. `*` = all repos in `org`. |
 | `poll_interval_seconds` | `60` | How often to poll for new events (seconds). |
-| `allow_bot_logins` | `[]` | Bot logins exempted from the bot-event filter (DD-005). Use sparingly. |
-| `watch_associations` | `["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE", "MANNEQUIN"]` | Actor-association filter (DD-008). Only events whose GitHub `author_association` is in this list are triaged. Default = external contributors only. Valid values: `OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`, `MANNEQUIN`. Unknown values are rejected at load. |
-| `ignore_logins` | `[]` | Logins always skipped, regardless of association (deny). E.g. the operator's own username, or an automation account like `naomi`. Wins over everything. |
+| `allow_bot_logins` | `[]` | Bot logins **exempted** from the bot-event filter (DD-005) — i.e. bots that should still be triaged. Inverse of `ignore_logins`. Use sparingly. Do not confuse with `ignore_logins`: this list *lets bots through*, it does not add bots to the deny list. |
+| `watch_associations` | `["CONTRIBUTOR", "FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE", "MANNEQUIN"]` | Actor-association filter (DD-008). Only events whose GitHub `author_association` is in this list are triaged. Default = external contributors only (`OWNER`/`MEMBER`/`COLLABORATOR` excluded). **`CONTRIBUTOR` is included by default and does NOT imply "external" on every repo** — any account with write access (including a crew/build bot granted write access) can be assessed as `CONTRIBUTOR`, not just genuine outside contributors. If your deployment grants write access to automation, that automation's PRs will pass this bucket check unless its login is also in `ignore_logins` or it is caught by the bot filter (`[bot]`-suffixed logins / `type: "Bot"` senders are excluded regardless of association — DD-005). Valid values: `OWNER`, `MEMBER`, `COLLABORATOR`, `CONTRIBUTOR`, `FIRST_TIME_CONTRIBUTOR`, `FIRST_TIMER`, `NONE`, `MANNEQUIN`. Unknown values are rejected at load. |
+| `ignore_logins` | `[]` **— populate this before deploying (see warning below)** | Logins always skipped, regardless of association (deny). Must include: the operator's own username, and every crew/automation login that is not already `[bot]`-suffixed (a `[bot]`-suffixed login is already caught by the bot filter — DD-005 — but a plain-named service/CI account is not). Wins over everything. |
 | `watch_logins` | `[]` | Logins always processed, even if their association is not in `watch_associations` (allow). Lets you watch a specific internal person. |
 | `max_events_per_author_per_poll` | `20` | Maximum events passed downstream per author per poll window. Applied after the bot and actor-association filters; filtered events do not count. `0` or `null` disables the cap. Stateless — counts reset each poll call. Protects against a single noisy actor flooding the assessment queue. |
 | `max_events_per_repo_per_poll` | `200` | Maximum post-filter events accumulated per repo per poll. Pagination stops once this many events have passed all filters for a repo. This cap operates on the post-filter event count, so a high-volume author whose events are dropped by the per-author cap cannot consume the budget and starve legitimate contributors. `0` or `null` disables the cap. |
@@ -82,6 +82,26 @@ The actor-association filter is orthogonal to the bot filter — both apply, and
 event must pass both to be triaged. Precedence: `ignore_logins` (deny) → `watch_logins`
 (allow) → `watch_associations` bucket. An event with a missing/unknown association
 is treated as external and processed (fail-open). See DD-008 for the full rationale.
+
+> **`ignore_logins` defaults to `[]` — this is required-in-practice config, not
+> optional hardening (lr-af2104).** `watch_associations`'s default excludes
+> `OWNER`/`MEMBER`/`COLLABORATOR`, and `allow_bot_logins`'s default (`[]`) means
+> any `[bot]`-suffixed or `type: "Bot"` account is filtered out of the box — but
+> neither of those defaults can know **who the operator is** or **which bot
+> logins belong to the operator's own automation** (a build/crew bot with a
+> `[bot]`-suffixed login is already excluded by the bot filter; a bot-like
+> automation account that does *not* end in `[bot]`, or a CI/service account
+> with write access assessed as `CONTRIBUTOR`, is not). If you (the repo
+> owner/operator) or any automation you run also opens PRs or issues against a
+> repo triage watches, **you must add your own login and every such automation
+> login to `ignore_logins` before deploying** — an empty `ignore_logins` on a
+> repo where the operator or crew automation is active will let their own
+> activity reach the pending queue as if it were an external contributor
+> signal. This is not a hypothetical: a deployment with empty `ignore_logins`
+> against a repo where both the operator and a crew build bot were active
+> accumulated dozens of internal PRs in the pending queue before this was
+> caught (lr-af2104). `docs/DESIGN-DECISIONS.md` DD-017 has the full incident
+> writeup.
 
 ### `runner` / `model` / `runner_url` / `runner_api_key_env`
 

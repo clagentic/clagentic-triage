@@ -344,6 +344,40 @@ function _isBot(payload, allowList) {
   return senderType === 'Bot' || senderLogin.endsWith('[bot]');
 }
 
+/**
+ * Return true if a normalized Event represents a bot-authored item (DD-005),
+ * using the same rule `_isBot` applies to a raw payload.
+ *
+ * Needed because some ingress paths (e.g. `list_open_prs`/`list_lifecycle_events`,
+ * T10/lr-9e35) hand callers an already-normalized Event rather than the raw
+ * GitHub payload — those paths intentionally skip `_isBot`/`should_process_actor`
+ * at fetch time because their primary purpose is a deterministic lifecycle
+ * transition, not LLM-assessed triage (see `list_open_prs`'s docblock). When
+ * such an Event falls through to the LLM-assessment pipeline instead (no
+ * linked issue to transition), it must still pass the same bot/actor gate
+ * every other pipeline-bound event passes — this function lets that check run
+ * against the Event shape alone, without needing the original raw payload.
+ *
+ * `metadata.author_type` is `_normalize`'s copy of the raw payload's
+ * `user.type`/`sender.type` field (e.g. `'Bot'`); older/cached Events written
+ * before this field existed fall back to the `[bot]`-suffix login heuristic
+ * alone, same as `_isBot` does when `senderType` is absent.
+ *
+ * @param {object} event - Normalized Event
+ * @param {string[]} allowList - Logins allowed through even if they look like bots
+ * @returns {boolean}
+ */
+export function is_bot_event(event, allowList) {
+  const login = event?.author ?? '';
+  const authorType = event?.metadata?.author_type ?? '';
+
+  if (allowList.includes(login)) {
+    return false;
+  }
+
+  return authorType === 'Bot' || login.endsWith('[bot]');
+}
+
 // ---------------------------------------------------------------------------
 // Actor-association filtering (DD-008)
 // ---------------------------------------------------------------------------
@@ -455,6 +489,12 @@ function _normalize(raw, repo, forceType = null, defaultBranch = null, webhookAc
       node_id: raw.node_id ?? '',
       labels: (raw.labels ?? []).map((l) => (typeof l === 'string' ? l : l.name)),
       author_association: raw.author_association ?? null,
+      // DD-005 bot-detection signal, carried through so callers holding only a
+      // normalized Event (no raw payload) can still run the bot check — see
+      // is_bot_event's docblock for why this is needed (T10/lr-9e35 lifecycle
+      // ingress paths bypass filtering at fetch time and fall through to the
+      // LLM pipeline for unlinked PRs).
+      author_type: raw.user?.type ?? '',
       state: raw.state ?? '',
       updated_at: raw.updated_at ?? '',
       draft: isPr ? Boolean(raw.draft) : false,
@@ -1701,6 +1741,36 @@ export function actor_allowed(config, event) {
     author: event.author ?? '',
     author_association: event.metadata?.author_association ?? null,
   });
+}
+
+/**
+ * Combined DD-005 (bot) + DD-008 (actor-association) gate for a normalized
+ * Event, both evaluated against the Event shape alone (no raw payload
+ * required). An Event must pass both to be allowed — same "orthogonal, both
+ * apply" composition `list_events`/the webhook server already enforce.
+ *
+ * `list_events` and the webhook server apply `_isBot`/`should_process_actor`
+ * at fetch/ingress time, before an Event ever reaches the pipeline — this
+ * export exists for the one path that structurally cannot do that:
+ * `list_lifecycle_events`'s `openPrs` (T10, lr-9e35) is deliberately
+ * unfiltered at fetch time (its primary purpose is a deterministic lifecycle
+ * transition, not LLM-assessed triage — see `list_open_prs`'s docblock), but
+ * a PR with no linked issue falls through to the LLM-assessment pipeline
+ * (`src/cli.js`'s `routeEvent`) instead of a transition. Without this check
+ * at that fallthrough point, a bot's or an operator's own PR reaches the
+ * pending queue unfiltered even though the exact same PR would have been
+ * dropped had it arrived via `list_events` or a webhook delivery.
+ *
+ * @param {object} config
+ * @param {object} event - Normalized Event
+ * @returns {boolean} true if the event should be processed by the pipeline.
+ */
+export function event_allowed(config, event) {
+  const allowBotLogins = config.source?.allow_bot_logins ?? [];
+  if (is_bot_event(event, allowBotLogins)) {
+    return false;
+  }
+  return actor_allowed(config, event);
 }
 
 // ---------------------------------------------------------------------------

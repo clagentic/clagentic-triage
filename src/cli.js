@@ -232,6 +232,21 @@ export async function routeEvent(config, event, adapter) {
     }
   }
 
+  // lr-af2104: events reaching this point may have arrived via a path that
+  // does not pre-filter bot/internal actors — specifically
+  // `list_lifecycle_events`'s `openPrs` (T10, lr-9e35), which is deliberately
+  // unfiltered at fetch time because its primary purpose is the deterministic
+  // transition above, not LLM-assessed triage. A PR with no linked issue
+  // falls through to here instead of returning above, so without this check
+  // a crew-bot or the operator's own PR reaches the pending queue even though
+  // the exact same PR would have been dropped by `list_events`/the webhook
+  // server's own DD-005/DD-008 filters. Applying the same combined gate here
+  // is a no-op for events that already passed it (list_events, webhook) and
+  // closes the gap for events that did not.
+  if (typeof adapter.event_allowed === 'function' && !adapter.event_allowed(config, event)) {
+    return { kind: 'triage', event_id: event.id, status: 'ignored', reason: 'actor_or_bot' };
+  }
+
   const result = await processEvent(config, event, adapter);
   return { kind: 'triage', ...result };
 }
