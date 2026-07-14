@@ -28,28 +28,22 @@ merge_requirements:
   # merge.merge_requirements.ci_pass.
   ci_pass: false
 
-# post_merge_steps — run in the target repo root after a successful merge
-# (crew_merge.py:run_post_merge_steps, lr-96cc). Deploys merged main by
-# invoking the repo's own idempotent installer (deploy/install.sh, lr-47370c)
-# in update mode. This step is host-agnostic by design: it does not SSH to
-# any named machine. It assumes deploy/install.sh runs on whatever host is
-# executing post_merge_steps (e.g. a runner/agent with a shell already open
-# on the deploy target, or a scheduled job on the deploy host itself that
-# periodically re-invokes the installer). Deploy topology — which host,
-# which install dir, which git remote — is supplied entirely via
-# CLAGENTIC_TRIAGE_* env vars in the environment this step runs in; see
-# deploy/.env.example. No hostnames or install paths are hardcoded here.
+# post_merge_steps — SUPERSEDED / INERT (lr-882af5, 2026-07-14).
 #
-# The installer is idempotent (skips reinstall/restart when the target
-# revision is already installed and the service is healthy), so re-running
-# it on every merge is safe even if a given host's post-merge invocation is
-# a no-op because deploy already happened by another path.
+# This repo already cut over from crew_merge.py to loadout-merge as its live
+# merge path (confirmed: PRs #30, #31, #32 all merged by clagentic-merger[bot],
+# "Merged via clagentic-loadout v0.1.0"). crew_merge.py:run_post_merge_steps
+# no longer executes for this repo, so the post_merge_steps block below is
+# DEAD CONFIG — it reads as authoritative but nothing runs it.
 #
-# on_failure: warn — a deploy hiccup (e.g. the deploy host transiently
-# unreachable from wherever this step executes, or systemd not present on a
-# given target) must not fail an otherwise-good merge. NAOMI logs the
-# warning and reports it; the merge itself already succeeded via the
-# platform API.
+# The real source of truth for post-merge automation is now
+# .clagentic/loadout/config.yaml's merge.post_merge_steps, which loadout-merge
+# actually reads. That section wires the same deploy/install.sh step, but
+# with on_failure: fail (not warn — see that file's comment for why the
+# on_failure value was deliberately changed, not just carried over).
+#
+# Left in place rather than deleted pending confirmation that crew_merge.py
+# is fully retired for this repo (no other flow still depends on it).
 post_merge_steps:
   - cmd: "bash deploy/install.sh"
     description: "Run the idempotent installer/updater (deploy/install.sh) to sync merged main and restart the triage watch service, if deployed on this host"
