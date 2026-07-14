@@ -1117,6 +1117,86 @@ describe('get_pr_closing_issues', () => {
       },
     );
   });
+
+  // lr-b3a052: get_pr_closing_issues previously had zero rate-limit awareness
+  // — a GraphQL rate-limit rejection surfaced as a generic, undifferentiated
+  // AdapterError, indistinguishable from any other failure, so callers had no
+  // way to back off instead of retrying next cycle.
+  it('throws AdapterError with code rate_limited on a GraphQL-level RATE_LIMITED error, with a Retry-After hint', async () => {
+    globalThis.fetch = async () =>
+      mockResponse(
+        200,
+        { errors: [{ type: 'RATE_LIMITED', message: 'API rate limit exceeded for installation ID 139384088.' }] },
+        { 'Retry-After': '45' },
+      );
+
+    const config = makeConfig();
+    const event = { type: 'pr', repo: 'example/repo', number: 7, body: '' };
+
+    await assert.rejects(
+      () => get_pr_closing_issues(config, event),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        assert.equal(err.code, 'rate_limited');
+        assert.ok(err.message.includes('Retry-After: 45s'));
+        return true;
+      },
+    );
+  });
+
+  it('throws AdapterError with code rate_limited on a GraphQL error message containing "rate limit" without a RATE_LIMITED type', async () => {
+    globalThis.fetch = async () =>
+      mockResponse(200, {
+        errors: [{ message: 'API rate limit already exceeded for installation ID 139384088.' }],
+      });
+
+    const config = makeConfig();
+    const event = { type: 'pr', repo: 'example/repo', number: 7, body: '' };
+
+    await assert.rejects(
+      () => get_pr_closing_issues(config, event),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        assert.equal(err.code, 'rate_limited');
+        return true;
+      },
+    );
+  });
+
+  it('throws AdapterError with code rate_limited on an HTTP 403 with an X-RateLimit-Reset header', async () => {
+    const resetEpoch = Math.floor(Date.now() / 1000) + 120;
+    globalThis.fetch = async () =>
+      mockResponse(403, { message: 'API rate limit exceeded' }, { 'X-RateLimit-Reset': String(resetEpoch) });
+
+    const config = makeConfig();
+    const event = { type: 'pr', repo: 'example/repo', number: 7, body: '' };
+
+    await assert.rejects(
+      () => get_pr_closing_issues(config, event),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        assert.equal(err.code, 'rate_limited');
+        assert.ok(err.message.includes('resets in'));
+        return true;
+      },
+    );
+  });
+
+  it('throws AdapterError with code rate_limited on an HTTP 429', async () => {
+    globalThis.fetch = async () => mockResponse(429, { message: 'Too Many Requests' });
+
+    const config = makeConfig();
+    const event = { type: 'pr', repo: 'example/repo', number: 7, body: '' };
+
+    await assert.rejects(
+      () => get_pr_closing_issues(config, event),
+      (err) => {
+        assert.ok(err instanceof AdapterError);
+        assert.equal(err.code, 'rate_limited');
+        return true;
+      },
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
