@@ -93,6 +93,11 @@ function makeAdapter(spies = {}) {
     label_item: spies.label_item ?? (() => Promise.resolve()),
     unlabel_item: spies.unlabel_item ?? (() => Promise.resolve()),
     get_item_labels: spies.get_item_labels ?? (() => Promise.resolve([])),
+    // lr-910ca2: runPipeline's awaiting_info reply-scan calls list_comments
+    // only for items with queue_reason 'awaiting_info' — default to "no
+    // reply yet" so pre-existing tests that never populate an awaiting_info
+    // queue item are unaffected by this addition.
+    list_comments: spies.list_comments ?? (() => Promise.resolve([])),
   };
 }
 
@@ -851,5 +856,161 @@ describe('_applyLabels — malformed multi-status incoming labels (RangeError ha
       () => _applyLabels({}, event, assessment, adapter, 'dispatched'),
       /adapter fetch exploded/,
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runPipeline — awaiting_info skip/wake/dedup contract (lr-910ca2)
+//
+// Exercises the real runPipeline against a real, temp-file-backed queue (via
+// src/queue.js's enqueue/readAll) so the skipEventIds/awaiting_info branch
+// added by this task is covered end-to-end at the module boundary it
+// actually reads (the queue file), not just via the awaiting_info.js unit
+// tests. The `events` array passed to runPipeline is deliberately empty in
+// every case here — this suite covers the dedup/skip/reassess wiring, not a
+// fresh event's full enrich/assess/route path (already covered by the
+// processEvent shim tests above and by tests/awaiting_info.test.js's direct
+// coverage of reassessAwaitingInfoItem).
+// ---------------------------------------------------------------------------
+
+import { randomBytes as _randomBytes } from 'node:crypto';
+import { tmpdir as _tmpdir } from 'node:os';
+import { join as _join } from 'node:path';
+import { enqueue as _enqueue, readAll as _readAll } from '../src/queue.js';
+import { runPipeline } from '../src/pipeline.js';
+
+function _tmpQueuePath() {
+  return _join(_tmpdir(), `triage-pipeline-awaiting-info-${_randomBytes(6).toString('hex')}`, 'pending.jsonl');
+}
+
+describe('runPipeline — awaiting_info reply detection (lr-910ca2)', () => {
+  // Note: runPipeline wires the reply-scan to the REAL enrich()/assess()
+  // (src/enricher.js / src/assessor.js), not an injectable test double — see
+  // src/pipeline.js's import of processAwaitingInfoItems. Driving a full
+  // "reply found -> fresh verdict enqueued, old entry superseded" outcome
+  // through runPipeline itself would require a live GitHub token and LLM
+  // CLI, which this suite does not have. That full round trip (with
+  // injected enrich/assess deps) is covered directly by
+  // tests/awaiting_info.test.js's reassessAwaitingInfoItem/
+  // processAwaitingInfoItems suites. This test instead verifies runPipeline
+  // actually triggers the reply-scan and hands off to re-assessment (rather
+  // than never calling list_comments at all, or blowing up the whole poll
+  // cycle when assess() has nothing to work with in a test environment).
+  it('scans an awaiting_info item for a reply and attempts re-assessment without corrupting the queue on failure', async () => {
+    const config = makeConfig({ pending_queue: _tmpQueuePath() });
+    const parkedEvent = makeEvent({ id: 'owner/repo#328', number: 328 });
+    const parked = await _enqueue(config, {
+      event: parkedEvent,
+      assessment: makeAssessment({
+        suggested_action: { classes: ['respond', 'dispatch'], body: 'Which version?', dispatch_target: null, labels: [] },
+      }),
+      queue_reason: 'awaiting_info',
+    });
+
+    let listCommentsCalled = false;
+    const adapter = makeAdapter({
+      list_comments: async () => {
+        listCommentsCalled = true;
+        return [{ user: { login: 'bradorchard', type: 'User' }, body: 'v1.2.3', created_at: '2099-01-01T00:00:00Z' }];
+      },
+    });
+
+    // The real assess() has no LLM runner available in this test environment
+    // and will throw or degrade — either way, runPipeline's own top-level
+    // loop (which never touched this item — `events` is empty) must not
+    // throw, and processAwaitingInfoItems must not leave the queue file in a
+    // corrupt/duplicated state.
+    const { errors } = await runPipeline(config, [], adapter);
+
+    assert.equal(errors.length, 0, 'a re-assessment failure must not surface as a runPipeline-level error');
+    assert.ok(listCommentsCalled, 'runPipeline must have scanned the awaiting_info item for a reply');
+
+    const all = await _readAll(config);
+    assert.equal(all.length, 1, 'no duplicate/orphaned entry should exist regardless of re-assessment outcome');
+    assert.equal(all[0].id, parked.id);
+  });
+
+  it('leaves an awaiting_info item with no reply untouched (falls through to stale.js unchanged)', async () => {
+    const config = makeConfig({ pending_queue: _tmpQueuePath() });
+    const parkedEvent = makeEvent({ id: 'owner/repo#329', number: 329 });
+    const parked = await _enqueue(config, {
+      event: parkedEvent,
+      assessment: makeAssessment({
+        suggested_action: { classes: ['respond', 'dispatch'], body: 'Which version?', dispatch_target: null, labels: [] },
+      }),
+      queue_reason: 'awaiting_info',
+    });
+
+    let listCommentsCalled = false;
+    const adapter = makeAdapter({
+      list_comments: async () => { listCommentsCalled = true; return []; },
+    });
+
+    const { errors } = await runPipeline(config, [], adapter);
+
+    assert.equal(errors.length, 0);
+    assert.ok(listCommentsCalled, 'runPipeline must scope-check awaiting_info items for a reply');
+
+    const all = await _readAll(config);
+    assert.equal(all.length, 1, 'no new entry should be created when there is no qualifying reply');
+    assert.equal(all[0].id, parked.id);
+    assert.equal(all[0].status, 'pending', 'the item must remain pending — untouched by this path');
+  });
+
+  it('does not blanket-skip awaiting_info items the way plain pending/approved items are skipped', async () => {
+    // Regression guard for the exact bug this task fixes: an awaiting_info
+    // item must be scanned (list_comments called) even though it is
+    // 'pending' — unlike a generic 'awaiting_approval' pending item, which
+    // is still blanket-skipped and never triggers a list_comments call.
+    const config = makeConfig({ pending_queue: _tmpQueuePath() });
+    await _enqueue(config, {
+      event: makeEvent({ id: 'owner/repo#1', number: 1 }),
+      assessment: makeAssessment({ suggested_action: { classes: ['respond'], body: 'Thanks', dispatch_target: null, labels: [] } }),
+      queue_reason: 'awaiting_approval', // NOT awaiting_info
+    });
+    await _enqueue(config, {
+      event: makeEvent({ id: 'owner/repo#2', number: 2 }),
+      assessment: makeAssessment({
+        suggested_action: { classes: ['respond', 'dispatch'], body: 'Which version?', dispatch_target: null, labels: [] },
+      }),
+      queue_reason: 'awaiting_info',
+    });
+
+    const listCommentsCalls = [];
+    const adapter = makeAdapter({
+      list_comments: async (_c, event) => { listCommentsCalls.push(event.number); return []; },
+    });
+
+    await runPipeline(config, [], adapter);
+
+    assert.deepEqual(listCommentsCalls, [2], 'only the awaiting_info item (#2) should be scanned, not the awaiting_approval one (#1)');
+  });
+
+  it('falls back to skipping awaiting_info items when the adapter has no list_comments (no dedup gap)', async () => {
+    const config = makeConfig({ pending_queue: _tmpQueuePath() });
+    const parkedEvent = makeEvent({ id: 'owner/repo#328', number: 328 });
+    await _enqueue(config, {
+      event: parkedEvent,
+      assessment: makeAssessment({
+        suggested_action: { classes: ['respond', 'dispatch'], body: 'Which version?', dispatch_target: null, labels: [] },
+      }),
+      queue_reason: 'awaiting_info',
+    });
+
+    // Adapter without list_comments — same event re-appears in this poll's
+    // `events` list (e.g. its updated_at bumped from the reply). Without the
+    // fallback skip, this would re-enter processEvent and risk a duplicate
+    // queue entry for the same event id (lr-bfb0ac dedup).
+    const adapter = makeAdapter();
+    delete adapter.list_comments;
+
+    const { dispatched, queued, errors } = await runPipeline(config, [parkedEvent], adapter);
+
+    assert.equal(errors.length, 0);
+    assert.equal(dispatched.length, 0);
+    assert.equal(queued.length, 0, 'the event must be skipped, not re-processed, when reply-detection is unavailable');
+
+    const all = await _readAll(config);
+    assert.equal(all.length, 1, 'no duplicate entry should have been created');
   });
 });

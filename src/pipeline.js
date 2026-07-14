@@ -20,6 +20,7 @@ import { dispatch } from './dispatchers/index.js';
 import { runHooks } from './hooks/index.js';
 import { recordTask } from './task_index.js';
 import { enforceSingleStatus, resolveVocabulary, isStatusLabel } from './labels.js';
+import { resolveQueueReason, needsInfoLabel, processAwaitingInfoItems } from './awaiting_info.js';
 
 // ---------------------------------------------------------------------------
 // Single-action execution (T7, lr-f0f2: extracted so classes[] can loop it)
@@ -314,6 +315,37 @@ export async function _applyLabels(config, event, assessment, adapter, resultSta
   }
 }
 
+/**
+ * Apply the status/needs-info label to an item entering the `awaiting_info`
+ * queue state (lr-910ca2), independent of `config.auto_label` — unlike
+ * `_applyLabels`'s auto_label gate (which governs the assessor's own
+ * *suggested* labels), this is a deterministic lifecycle-state label the
+ * same way src/stale.js's own needs-info handling is: applying it is the
+ * mechanism, not an intake suggestion a human opts into surfacing.
+ *
+ * Enforces the same single-status invariant _applyLabels does (removes any
+ * other status/* label first) via the shared enforceSingleStatus helper —
+ * this must never leave an item carrying two status/* labels at once.
+ *
+ * @param {object} config
+ * @param {object} event
+ * @param {object} adapter
+ * @returns {Promise<void>}
+ */
+async function _applyNeedsInfoLabel(config, event, adapter) {
+  const label = needsInfoLabel(config);
+  const currentLabels = await adapter.get_item_labels(config, event);
+  if (currentLabels.includes(label)) {
+    return; // already applied — idempotent
+  }
+
+  const { toRemove, toApply } = enforceSingleStatus(config, currentLabels, [label]);
+  for (const toRemoveLabel of toRemove) {
+    await adapter.unlabel_item(config, event, toRemoveLabel);
+  }
+  await adapter.label_item(config, event, toApply);
+}
+
 // ---------------------------------------------------------------------------
 // Single-event processing
 // ---------------------------------------------------------------------------
@@ -365,13 +397,27 @@ export async function processEvent(config, event, adapter) {
     }
 
     // Stage 3: Route — apply HITL gate (DD-001)
-    const { should_dispatch, queue_reason } = route(config, assessment);
+    const { should_dispatch, queue_reason: defaultQueueReason } = route(config, assessment);
 
     if (!should_dispatch) {
+      // lr-910ca2: reclassify to 'awaiting_info' when the verdict itself is
+      // the parking reason (a clarifying-question 'respond' mixed with a
+      // class that didn't clear auto_approve, e.g. ['respond', 'dispatch']).
+      // Distinguishing this from the generic 'awaiting_approval' is what lets
+      // runPipeline wake the item back up on a reply instead of leaving it
+      // permanently skipped — see src/awaiting_info.js.
+      const queue_reason = resolveQueueReason(assessment, defaultQueueReason);
+
       // Queued for human review (or escalate/dispatch that always queue).
-      // Still apply labels if auto_label is enabled.
+      // Labels: normal auto_label-gated labels apply as before; the
+      // status/needs-info label additionally applies unconditionally for an
+      // awaiting_info item, consistent with src/stale.js's existing use of
+      // the same label for the same lifecycle state.
       try {
         await _applyLabels(config, event, assessment, adapter, 'queued');
+        if (queue_reason === 'awaiting_info') {
+          await _applyNeedsInfoLabel(config, event, adapter);
+        }
       } catch (labelErr) {
         // Label failure on a queued item is non-fatal; log and continue.
         console.warn(`[pipeline] label_item failed for event ${eventId}: ${labelErr.message}`);
@@ -501,16 +547,66 @@ export async function runPipeline(config, events, adapter) {
   //   - 'approved': action already executed (or queued for execution); don't re-queue.
   // Rejected and overridden items ARE re-assessed — the human explicitly declined,
   // so a re-opened or updated issue should be triaged fresh.
+  //
+  // lr-910ca2: 'pending' items with queue_reason 'awaiting_info' are the one
+  // exception — they are NOT added to skipEventIds. Blanket-skipping them
+  // was exactly the bug this task fixes (a clarifying-question reply never
+  // got looked at again). Instead they are scanned separately, below, for a
+  // qualifying reply — scoped to only awaiting_info items so this does not
+  // grow the per-poll adapter.list_comments call volume to the full
+  // open-issue set (rate-limit sensitive; see lr-b3a052).
   const skipEventIds = new Set();
+  const awaitingInfoItems = [];
   try {
     const existing = await readAll(config);
     for (const item of existing) {
-      if ((item.status === 'pending' || item.status === 'approved') && item.event?.id) {
+      if (item.status !== 'pending' && item.status !== 'approved') {
+        continue;
+      }
+      if (item.status === 'pending' && item.queue_reason === 'awaiting_info') {
+        if (item.event?.id) {
+          awaitingInfoItems.push(item);
+        }
+        continue;
+      }
+      if (item.event?.id) {
         skipEventIds.add(item.event.id);
       }
     }
   } catch {
     // readAll never throws, but guard defensively — dedup is best-effort.
+  }
+
+  // Reply-triggered re-assessment (lr-910ca2): re-assessed items resolve
+  // their stale entry and enqueue a fresh one via router.js's normal rules
+  // (src/awaiting_info.js). The fresh entry's event id must not be
+  // immediately re-processed by this same cycle's event loop below, so it
+  // joins skipEventIds exactly like any other freshly-pending item would.
+  // Items with no qualifying reply are left untouched — falling through to
+  // src/stale.js's existing idle-close sweep, unchanged.
+  if (typeof adapter.list_comments === 'function' && awaitingInfoItems.length > 0) {
+    const { reassessed } = await processAwaitingInfoItems(config, adapter, awaitingInfoItems, { enrich, assess });
+    for (const result of reassessed) {
+      // Skip this event for the rest of THIS cycle's loop regardless of
+      // whether the fresh verdict dispatched immediately or re-queued — the
+      // reply that triggered re-assessment is the same GitHub activity that
+      // bumped the event's updated_at, so it may also appear in `events`
+      // below; it must not be processed a second time in the same cycle.
+      const resolvedItem = awaitingInfoItems.find((item) => item.id === result.resolved_id);
+      if (resolvedItem?.event?.id) {
+        skipEventIds.add(resolvedItem.event.id);
+      }
+    }
+  } else {
+    // No qualifying-reply check is possible without list_comments (adapter
+    // does not implement it) — treat awaiting_info items the same as any
+    // other pending item this cycle (skip) rather than silently dropping
+    // them from dedup, which would risk a duplicate queue entry.
+    for (const item of awaitingInfoItems) {
+      if (item.event?.id) {
+        skipEventIds.add(item.event.id);
+      }
+    }
   }
 
   for (const event of events) {
