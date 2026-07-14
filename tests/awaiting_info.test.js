@@ -85,66 +85,79 @@ function makeComment({ login = 'bradorchard', type = 'User', body = 'v1.2.3', cr
 // ---------------------------------------------------------------------------
 
 describe('isAwaitingInfoVerdict', () => {
-  it('is true for a respond-with-body verdict mixed with another class', () => {
+  it('is true for a needs_changes verdict with respond-only classes (matches #328\'s real stored shape)', () => {
     const assessment = makeAssessment({
+      verdict: 'needs_changes',
+      suggested_action: { classes: ['respond'], body: 'Which version of @clagentic/console are you running?', dispatch_target: null, labels: [] },
+    });
+    assert.equal(isAwaitingInfoVerdict(assessment), true);
+  });
+
+  it('is true for a needs_changes verdict with respond mixed with another class', () => {
+    const assessment = makeAssessment({
+      verdict: 'needs_changes',
       suggested_action: { classes: ['respond', 'dispatch'], body: 'Please clarify X.', dispatch_target: null, labels: [] },
     });
     assert.equal(isAwaitingInfoVerdict(assessment), true);
   });
 
-  it('is false for a respond-only verdict (nothing else pending)', () => {
+  it('is false for an accept verdict with respond-only classes (plain acknowledgement, nothing pending)', () => {
     const assessment = makeAssessment({
+      verdict: 'accept',
       suggested_action: { classes: ['respond'], body: 'Thanks!', dispatch_target: null, labels: [] },
     });
     assert.equal(isAwaitingInfoVerdict(assessment), false);
   });
 
-  it('is false when respond has no body', () => {
+  it('is false when respond has no body, even for a needs_changes verdict', () => {
     const assessment = makeAssessment({
+      verdict: 'needs_changes',
       suggested_action: { classes: ['respond', 'dispatch'], body: null, dispatch_target: null, labels: [] },
     });
     assert.equal(isAwaitingInfoVerdict(assessment), false);
   });
 
-  it('is false when respond has a blank/whitespace-only body', () => {
+  it('is false when respond has a blank/whitespace-only body, even for a needs_changes verdict', () => {
     const assessment = makeAssessment({
+      verdict: 'needs_changes',
       suggested_action: { classes: ['respond', 'dispatch'], body: '   ', dispatch_target: null, labels: [] },
     });
     assert.equal(isAwaitingInfoVerdict(assessment), false);
   });
 
-  it('is false when the verdict has no respond class at all', () => {
+  it('is false when the verdict is needs_changes but has no respond class at all (e.g. escalate-only)', () => {
     const assessment = makeAssessment({
-      suggested_action: { classes: ['dispatch'], body: null, dispatch_target: null, labels: [] },
+      verdict: 'needs_changes',
+      suggested_action: { classes: ['escalate'], body: null, dispatch_target: null, labels: [] },
     });
     assert.equal(isAwaitingInfoVerdict(assessment), false);
   });
 
-  it('normalizes a legacy singular suggested_action.class', () => {
+  it('normalizes a legacy singular suggested_action.class for a needs_changes verdict', () => {
     const assessment = makeAssessment({
+      verdict: 'needs_changes',
       suggested_action: { class: 'respond', body: 'hi', dispatch_target: null, labels: [] },
     });
-    // Singular 'class' normalizes to a one-element list — no "other class"
-    // present, so this is not awaiting_info.
-    assert.equal(isAwaitingInfoVerdict(assessment), false);
+    assert.equal(isAwaitingInfoVerdict(assessment), true);
   });
 });
 
 describe('resolveQueueReason', () => {
   it('returns awaiting_info when the verdict qualifies', () => {
-    const assessment = makeAssessment();
+    const assessment = makeAssessment({ verdict: 'needs_changes' });
     assert.equal(resolveQueueReason(assessment, 'awaiting_approval'), 'awaiting_info');
   });
 
   it('returns the default reason when the verdict does not qualify', () => {
     const assessment = makeAssessment({
+      verdict: 'accept',
       suggested_action: { classes: ['dispatch'], body: null, dispatch_target: null, labels: [] },
     });
     assert.equal(resolveQueueReason(assessment, 'awaiting_approval'), 'awaiting_approval');
   });
 
   it('never reclassifies low_confidence, even for a qualifying verdict', () => {
-    const assessment = makeAssessment();
+    const assessment = makeAssessment({ verdict: 'needs_changes' });
     assert.equal(resolveQueueReason(assessment, 'low_confidence'), 'low_confidence');
   });
 });
