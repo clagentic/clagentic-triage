@@ -22,6 +22,8 @@ import {
   applyReleaseTransition,
   applyPrOpenedTransition,
   applyPrReadyForReviewTransition,
+  createLifecycleBackoffState,
+  runLifecycleCycle,
 } from './lifecycle.js';
 import { checkStaleNeedsInfo } from './stale.js';
 import { isActionClassValidForType, mismatchMessage, validClassesForType } from './action_classes.js';
@@ -308,6 +310,12 @@ async function cmdWatch(flags) {
 
   out(`[clagentic-triage] watch: polling every ${intervalSec}s. Ctrl-C to stop.`);
 
+  // Rate-limit backoff state (lr-b3a052): one instance for the process
+  // lifetime, shared across every tick() call, so a rate-limit hit in one
+  // lifecycle cycle suppresses GraphQL calls in subsequent cycles too — see
+  // runLifecycleCycle's docblock for the retry-storm this prevents.
+  const lifecycleBackoff = createLifecycleBackoffState();
+
   const tick = async () => {
     try {
       const events = await adapter.list_events(config);
@@ -327,18 +335,22 @@ async function cmdWatch(flags) {
     // have it yet).
     if (typeof adapter.list_lifecycle_events === 'function') {
       try {
-        const { mergedPrs, releases, openPrs = [] } = await adapter.list_lifecycle_events(config);
-        let appliedCount = 0;
-        for (const event of [...mergedPrs, ...releases, ...openPrs]) {
-          const result = await routeEvent(config, event, adapter);
-          if (result.applied) {
-            appliedCount += 1;
-          }
+        const result = await runLifecycleCycle(config, adapter, routeEvent, lifecycleBackoff);
+        if (result.skipped_backoff) {
+          out(
+            `[clagentic-triage] lifecycle cycle: skipped (rate-limit backoff active until ` +
+            `${new Date(lifecycleBackoff.backoffUntilMs).toISOString()})`,
+          );
+        } else {
+          out(
+            `[clagentic-triage] lifecycle cycle: merged_prs=${result.merged_prs} releases=${result.releases} ` +
+            `open_prs=${result.open_prs} (skipped_unchanged=${result.open_prs_skipped_unchanged}) ` +
+            `applied=${result.applied}` +
+            (result.rate_limited
+              ? ` (rate limited mid-cycle; backing off until ${new Date(lifecycleBackoff.backoffUntilMs).toISOString()})`
+              : ''),
+          );
         }
-        out(
-          `[clagentic-triage] lifecycle cycle: merged_prs=${mergedPrs.length} releases=${releases.length} ` +
-          `open_prs=${openPrs.length} applied=${appliedCount}`,
-        );
       } catch (e) {
         err(`[clagentic-triage] lifecycle cycle error: ${e.message}`);
       }
@@ -394,19 +406,17 @@ async function cmdRun(flags) {
   );
 
   // Lifecycle poll (T6 lr-d557, T10 lr-9e35) — see cmdWatch's tick for the
-  // rationale on routing these outside runPipeline.
+  // rationale on routing these outside runPipeline. A single-pass command
+  // gets a fresh backoff state each invocation (no persistent process to
+  // share it across cycles), but still benefits from runLifecycleCycle's
+  // mid-cycle short-circuit on a rate-limit hit (lr-b3a052).
   if (typeof adapter.list_lifecycle_events === 'function') {
-    const { mergedPrs, releases, openPrs = [] } = await adapter.list_lifecycle_events(config);
-    let appliedCount = 0;
-    for (const event of [...mergedPrs, ...releases, ...openPrs]) {
-      const result = await routeEvent(config, event, adapter);
-      if (result.applied) {
-        appliedCount += 1;
-      }
-    }
+    const lifecycleBackoff = createLifecycleBackoffState();
+    const result = await runLifecycleCycle(config, adapter, routeEvent, lifecycleBackoff);
     out(
-      `[clagentic-triage] lifecycle run: merged_prs=${mergedPrs.length} releases=${releases.length} ` +
-      `open_prs=${openPrs.length} applied=${appliedCount}`,
+      `[clagentic-triage] lifecycle run: merged_prs=${result.merged_prs} releases=${result.releases} ` +
+      `open_prs=${result.open_prs} applied=${result.applied}` +
+      (result.rate_limited ? ' (rate limited mid-run)' : ''),
     );
   }
 

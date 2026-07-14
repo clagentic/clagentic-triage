@@ -30,6 +30,14 @@
 import { enforceSingleStatus } from './labels.js';
 import { parse_closing_keyword_refs, is_repo_in_watch_scope } from './adapters/github.js';
 
+/**
+ * Fallback backoff duration (ms) applied when a rate-limited error carries no
+ * parseable reset/retry hint. Matches GitHub's documented ~1hr GraphQL point
+ * budget window (lr-b3a052) — safer to wait a full window than to guess low
+ * and re-trigger the storm this backoff exists to prevent.
+ */
+const DEFAULT_RATE_LIMIT_BACKOFF_MS = 60 * 60 * 1000;
+
 /** The status/* value applied when a PR merges to the default branch. */
 const AWAITING_RELEASE_STATUS_VALUE = 'awaiting-release';
 
@@ -363,4 +371,161 @@ export async function applyReleaseTransition(config, adapter, releaseEvent) {
   }
 
   return { applied: refs.length > 0, issues };
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle cycle runner with rate-limit backoff (lr-b3a052)
+// ---------------------------------------------------------------------------
+
+/**
+ * Parse a `(Retry-After: Ns)` / `(resets in Ns)` hint appended by the
+ * adapter's rate-limit error messages (src/adapters/github.js's
+ * `_rateLimitHint`) into a millisecond duration.
+ *
+ * Adapter-agnostic by design: any adapter's rate-limited AdapterError can opt
+ * into a precise backoff by appending one of these two hint shapes to its
+ * message; an adapter that does not is still covered by
+ * DEFAULT_RATE_LIMIT_BACKOFF_MS.
+ *
+ * @param {string} message
+ * @returns {number|null} milliseconds, or null if no hint was found
+ */
+function _parseBackoffHintMs(message) {
+  const retryAfterMatch = /Retry-After:\s*(\d+)s/.exec(message ?? '');
+  if (retryAfterMatch) {
+    return parseInt(retryAfterMatch[1], 10) * 1000;
+  }
+  const resetsInMatch = /resets in (\d+)s/.exec(message ?? '');
+  if (resetsInMatch) {
+    return parseInt(resetsInMatch[1], 10) * 1000;
+  }
+  return null;
+}
+
+/**
+ * Create a fresh rate-limit backoff state object for a lifecycle poll loop.
+ * Callers (cli.js's cmdWatch/cmdRun) own one instance for the process
+ * lifetime and pass it into every `runLifecycleCycle` call so a rate-limit
+ * hit in one cycle suppresses further GraphQL calls across *subsequent*
+ * cycles too — not just the remainder of the cycle that hit it.
+ *
+ * Also carries `seenOpenPrs` (repo#number -> last-processed updated_at), the
+ * call-volume-reduction half of lr-b3a052: an open PR whose `updated_at` has
+ * not changed since the last cycle that already routed it gets no fresh
+ * `get_pr_closing_issues` GraphQL call — nothing on GitHub could have changed
+ * its closing-issue set or draft state since then, so re-querying is pure
+ * budget waste. Bounded by GitHub's own open-PR count per repo; entries are
+ * never actively evicted for a still-open PR (re-querying resumes the moment
+ * `updated_at` changes, e.g. a new commit, comment, or review), and a
+ * PR that merges/closes leaves list_open_prs's result set entirely, so its
+ * entry simply stops being read (harmless if a caller cared enough to
+ * evict it, but not required for correctness).
+ *
+ * @returns {{ backoffUntilMs: number, seenOpenPrs: Map<string, string> }}
+ */
+export function createLifecycleBackoffState() {
+  return { backoffUntilMs: 0, seenOpenPrs: new Map() };
+}
+
+/**
+ * Run one lifecycle poll cycle: route every merged PR / release / open PR
+ * event through `routeEvent`-equivalent dispatch, with cross-cycle rate-limit
+ * backoff (lr-b3a052).
+ *
+ * Root cause this addresses: `get_pr_closing_issues` (GraphQL) was called
+ * once per open PR, every poll cycle, unconditionally and forever for as
+ * long as a PR stayed open (list_open_prs has no `since` filter by design —
+ * every still-open PR is safe-but-costly to re-observe every cycle). Once
+ * the installation's GraphQL budget was exhausted, each subsequent cycle
+ * immediately retried the same calls with no memory of the failure,
+ * re-asserting exhaustion every reset window — a self-sustaining retry storm
+ * layered on top of whatever real-traffic load contributed to the first
+ * exhaustion.
+ *
+ * `state.backoffUntilMs` persists across calls (caller passes the same state
+ * object every cycle): once any event in a cycle throws a `rate_limited`
+ * AdapterError, this function stops routing further events for the *rest of
+ * that cycle* (avoids burning remaining budget on calls that will also fail)
+ * and skips routing entirely on every subsequent call until the backoff
+ * window elapses, honoring the reset/Retry-After hint parsed from the error
+ * message when present, else a conservative 1-hour default.
+ *
+ * @param {object} config
+ * @param {object} adapter - source adapter (must implement list_lifecycle_events
+ *   and everything routeFn's transitions require)
+ * @param {(config: object, event: object, adapter: object) => Promise<object>} routeFn
+ *   - event router (cli.js's `routeEvent`); injected rather than imported to
+ *     avoid a lifecycle.js -> cli.js import (cli.js already imports
+ *     lifecycle.js — a reverse import would cycle).
+ * @param {{ backoffUntilMs: number, seenOpenPrs: Map<string,string> }} state
+ *   - mutable backoff + dedup state, one instance per process, shared across
+ *     calls (see createLifecycleBackoffState)
+ * @returns {Promise<{
+ *   merged_prs: number, releases: number, open_prs: number,
+ *   open_prs_skipped_unchanged: number, applied: number,
+ *   skipped_backoff: boolean, rate_limited: boolean,
+ * }>}
+ */
+export async function runLifecycleCycle(config, adapter, routeFn, state) {
+  const now = Date.now();
+  if (now < state.backoffUntilMs) {
+    return {
+      merged_prs: 0,
+      releases: 0,
+      open_prs: 0,
+      open_prs_skipped_unchanged: 0,
+      applied: 0,
+      skipped_backoff: true,
+      rate_limited: false,
+    };
+  }
+
+  const { mergedPrs, releases, openPrs = [] } = await adapter.list_lifecycle_events(config);
+
+  // Call-volume reduction (lr-b3a052): drop open PRs already routed at their
+  // current updated_at — see createLifecycleBackoffState's docblock. Merged
+  // PRs and releases are not deduped here: list_merged_prs/list_releases
+  // already bound their own result sets (since-filter / small per-repo
+  // count), and applyMergeTransition/applyReleaseTransition are one-shot by
+  // nature (a PR merges once), so they carry none of open PRs' "same item,
+  // every cycle, forever" cost.
+  const dedupedOpenPrs = openPrs.filter((event) => {
+    const key = `${event.repo}#${event.number}`;
+    const lastSeenUpdatedAt = state.seenOpenPrs.get(key);
+    return lastSeenUpdatedAt !== event.metadata?.updated_at;
+  });
+  const skippedUnchangedCount = openPrs.length - dedupedOpenPrs.length;
+
+  let appliedCount = 0;
+  let rateLimited = false;
+
+  for (const event of [...mergedPrs, ...releases, ...dedupedOpenPrs]) {
+    try {
+      const result = await routeFn(config, event, adapter);
+      if (result.applied) {
+        appliedCount += 1;
+      }
+      if (event.type === 'pr' && openPrs.includes(event)) {
+        state.seenOpenPrs.set(`${event.repo}#${event.number}`, event.metadata?.updated_at);
+      }
+    } catch (e) {
+      if (e?.code === 'rate_limited') {
+        const hintMs = _parseBackoffHintMs(e.message);
+        state.backoffUntilMs = Date.now() + (hintMs ?? DEFAULT_RATE_LIMIT_BACKOFF_MS);
+        rateLimited = true;
+        break; // stop burning remaining budget on calls that will also fail
+      }
+      throw e;
+    }
+  }
+
+  return {
+    merged_prs: mergedPrs.length,
+    releases: releases.length,
+    open_prs: openPrs.length,
+    open_prs_skipped_unchanged: skippedUnchangedCount,
+    applied: appliedCount,
+    skipped_backoff: false,
+    rate_limited: rateLimited,
+  };
 }

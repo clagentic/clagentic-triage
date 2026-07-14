@@ -238,6 +238,33 @@ async function _handleRateLimit(headers) {
 }
 
 /**
+ * Format a human-readable reset-time hint from GitHub rate-limit response
+ * headers, for inclusion in a thrown AdapterError message.
+ *
+ * GraphQL rate-limit responses carry the same `X-RateLimit-Reset`/
+ * `Retry-After` headers REST does (both share the same secondary-rate-limit
+ * machinery), even when the 200-with-`errors`-array shape is used instead of
+ * a 403/429 HTTP status. Returns an empty string when no reset info is
+ * present, so the hint is purely additive to the error message.
+ *
+ * @param {Headers} headers
+ * @returns {string}
+ */
+function _rateLimitHint(headers) {
+  const retryAfter = headers.get('Retry-After');
+  if (retryAfter) {
+    return ` (Retry-After: ${retryAfter}s)`;
+  }
+  const reset = parseInt(headers.get('X-RateLimit-Reset') ?? '', 10);
+  if (Number.isFinite(reset) && reset > 0) {
+    const now = Math.floor(Date.now() / 1000);
+    const seconds = Math.max(0, reset - now);
+    return ` (resets in ${seconds}s)`;
+  }
+  return '';
+}
+
+/**
  * Follow Link rel="next" pagination, accumulating results.
  * Stops when there is no next page or PER_REPO_SAFETY_CAP items are collected.
  *
@@ -1984,6 +2011,18 @@ export async function get_pr_closing_issues(config, event) {
     throw new AdapterError('GitHub token invalid or missing', 'auth_failure');
   }
 
+  if (res.status === 403 || res.status === 429) {
+    // GraphQL secondary/primary rate limiting can surface as an HTTP-level
+    // 403/429 (same as REST — see _fetchPaginated's Retry-After branch)
+    // rather than only via the query-level `errors` array below. Surface the
+    // reset/retry hint the same way so callers (the lifecycle poll loop) can
+    // back off instead of retrying immediately next cycle (lr-b3a052).
+    throw new AdapterError(
+      `get_pr_closing_issues rate limited: HTTP ${res.status}${_rateLimitHint(res.headers)}`,
+      'rate_limited',
+    );
+  }
+
   if (!res.ok) {
     throw new AdapterError(`get_pr_closing_issues failed: ${res.status} ${res.statusText}`);
   }
@@ -1991,11 +2030,23 @@ export async function get_pr_closing_issues(config, event) {
   const data = await res.json();
 
   // GraphQL returns 200 with an `errors` array on query-level failures
-  // (e.g. bad credentials can surface here instead of via HTTP status).
+  // (e.g. bad credentials, or a rate-limit rejection, can surface here
+  // instead of via HTTP status — GitHub's GraphQL endpoint returns 200 with
+  // a RATE_LIMITED-typed error, or a message containing "API rate limit",
+  // when the installation's GraphQL point budget is exhausted).
   if (Array.isArray(data.errors) && data.errors.length > 0) {
     const authError = data.errors.find((e) => e.type === 'UNAUTHORIZED' || e.type === 'FORBIDDEN');
     if (authError) {
       throw new AdapterError(`GitHub GraphQL auth failure: ${authError.message}`, 'auth_failure');
+    }
+    const rateLimitError = data.errors.find(
+      (e) => e.type === 'RATE_LIMITED' || /rate limit/i.test(e.message ?? ''),
+    );
+    if (rateLimitError) {
+      throw new AdapterError(
+        `get_pr_closing_issues GraphQL rate limit: ${rateLimitError.message}${_rateLimitHint(res.headers)}`,
+        'rate_limited',
+      );
     }
     throw new AdapterError(
       `get_pr_closing_issues GraphQL error: ${data.errors.map((e) => e.message).join('; ')}`,
