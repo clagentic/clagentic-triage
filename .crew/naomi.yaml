@@ -22,7 +22,11 @@ merge_allowed: true
 
 merge_requirements:
   tests_pass: true
-  ci_pass: true
+  # ci_pass: false -- this repo has no CI by design (no .github/workflows/,
+  # no .forgejo/workflows/); interim, per operator directive 2026-07-14
+  # (lr-b3a052). Kept consistent with .clagentic/loadout/config.yaml's
+  # merge.merge_requirements.ci_pass.
+  ci_pass: false
 
 # post_merge_steps — run in the target repo root after a successful merge
 # (crew_merge.py:run_post_merge_steps, lr-96cc). Deploys merged main by
