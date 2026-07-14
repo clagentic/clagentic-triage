@@ -1,0 +1,81 @@
+# .clagentic/loadout/config.yaml — repo-local loadout config (lr-b3a052)
+#
+# Scaffolded via /loadout-init (clagentic-loadout, lr-c21507) from
+# src/clagentic_loadout/loadout_init/starter_config.yaml. Carries no
+# deployment values (no real HOME, no real forge base URL, no agent
+# identities) — every value below is either role vocabulary or a
+# repo-tier policy value elicited for this repo. See
+# clagentic-loadout/docs/provisioning.md for the full schema reference
+# and clagentic-loadout/docs/loadout-init.md for the guided workflow.
+#
+# One sectioned file, one top-level key per verb/feature (roles:, merge:).
+
+# ---------------------------------------------------------------------------
+# roles: -- which loadout verbs each ROLE may invoke (docs/provisioning.md
+# "Step 1 -- declare the role's verb set"). Replace-not-merge: a role you
+# omit here is simply not provisioned, never silently inherited from a
+# built-in default. Role names are vocabulary only -- builder/reviewer/
+# security/merger/lead, or any role name you invent -- never an agent name.
+# ---------------------------------------------------------------------------
+roles:
+  builder:
+    - push
+  reviewer:
+    - git-host-api
+    - review-post
+    - stage-body
+  merger:
+    - merge
+    - push
+    - release-dispatch
+    - release-detect
+  lead:
+    - git-host-api
+
+# ---------------------------------------------------------------------------
+# merge: -- merge-gate declarations (docs/provisioning.md "Merge-gate config
+# homes"). Every key here is REPO-TIER policy (never an identity/login/
+# credential -- those live in the deployment-tier user config instead).
+# ---------------------------------------------------------------------------
+merge:
+  # merge_requirements: each key REPLACES its own default when present;
+  # a key you omit keeps its own built-in default.
+  merge_requirements:
+    # ci_pass: false -- this repo (clagentic/clagentic-triage) has NO CI by
+    # design: no .github/workflows/, no .forgejo/workflows/. The gate is
+    # explicitly declared not-required rather than left to fall back onto
+    # an unsatisfiable check. Interim, per operator directive 2026-07-14
+    # (lr-b3a052). Revisit if/when CI is added to this repo.
+    ci_pass: false
+    tests_pass: true
+    # max_changed_files: 30
+
+  # required_reviewer_roles: roles whose clean reviewer verdict is required
+  # before a merge is authorized. Role vocabulary only.
+  required_reviewer_roles:
+    - reviewer
+
+  # authorized_roles: roles permitted to hold merge authority (execute the
+  # actual merge). Absent/empty means NO role holds merge authority yet --
+  # fail-closed by construction; a repo must explicitly grant this.
+  authorized_roles:
+    - merger
+
+  # pre_checks: omitted -- this repo has no pre-merge validation commands
+  # beyond tests_pass above.
+  # pre_checks:
+  #   - cmd: "make lint"
+  #     description: "lint pass before merge"
+  #     on_failure: fail
+
+  # post_merge_steps: omitted here. Deployment values (real HOME, forge
+  # base URL, install paths) are elicited per-deployment, never templated
+  # into a repo-committed config (rule 1, see clagentic-loadout docs). This
+  # repo's existing post-merge automation is declared instead in
+  # .crew/naomi.yaml (bash deploy/install.sh), which stays the source of
+  # truth for that step until loadout-merge deployment values are elicited
+  # separately.
+  # post_merge_steps:
+  #   - cmd: "scripts/install.sh"
+  #     description: "self-install the merged build"
+  #     on_failure: fail
