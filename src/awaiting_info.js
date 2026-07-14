@@ -19,9 +19,23 @@
  *      clarifying-question body) rather than the generic `awaiting_approval`.
  *   2. Scanning ONLY `awaiting_info` queue items (never the full open-issue
  *      set — see lr-b3a052, the GraphQL rate-limit blocker this task was
- *      gated on) for a qualifying non-bot reply posted after the
- *      "waiting since" marker, and re-running enrich()/assess() when one is
- *      found.
+ *      gated on) for a qualifying non-bot reply, and re-running
+ *      enrich()/assess() when one is found.
+ *
+ * Reply-detection signal (lr-2ed0f0): "is there a reply to act on" is
+ * determined by LAST-COMMENT AUTHORSHIP, not by comparing a comment's
+ * timestamp against the item's own queued_at/awaiting_info_since marker.
+ * Marker-timestamp comparison assumes a reply always arrives chronologically
+ * after the queue entry exists — false whenever the entry is created or
+ * re-created AFTER a reply already sitting in the thread (confirmed live on
+ * clagentic/clagentic-console#328: reporter replied 11:41-11:43 UTC, a
+ * re-triaged queue entry got queued_at 18:49 UTC during unrelated operator
+ * remediation, and the already-posted reply looked "too early" and was
+ * skipped — the bot re-asked a question it already had the answer to). Who
+ * spoke last in the thread is the correct signal and needs no stored
+ * timestamp at all: if the last comment is from a non-bot author, that is
+ * the qualifying reply, full stop, regardless of when the queue entry itself
+ * was created.
  *
  * Explicit non-goals (per task lr-910ca2 design, locked by andy 2026-07-14):
  *   - No special extra-cautious approval gate for the re-assessed verdict —
@@ -119,21 +133,6 @@ export function needsInfoLabel(config) {
 // ---------------------------------------------------------------------------
 
 /**
- * Return the "waiting since" marker timestamp for a queue item: the moment
- * after which a reply counts as new information. Prefers the triage bot's
- * own clarifying-comment timestamp when the dispatch step recorded one;
- * falls back to queued_at (the moment the item was parked) — both are valid
- * "waiting since" anchors per the task design, and queued_at is always
- * present so this never returns null for a well-formed queue item.
- *
- * @param {object} item - queue item (src/queue.js shape)
- * @returns {string} ISO 8601 timestamp
- */
-function _waitingSinceMarker(item) {
-  return item.awaiting_info_since ?? item.queued_at;
-}
-
-/**
  * Return true if `comment` was authored by someone other than the triage
  * bot itself. Comments come from adapter.list_comments() as raw provider
  * objects (e.g. GitHub's `{ user: { login, type }, body, created_at }`) —
@@ -151,9 +150,31 @@ function _isNonBotComment(comment) {
 }
 
 /**
- * Scan one awaiting_info item's comments for a qualifying reply: a comment
- * from someone other than the triage bot, posted strictly after the
- * "waiting since" marker.
+ * Return the last (most recent) comment in a list_comments() result, or null
+ * for an empty list. list_comments() returns comments in the provider's
+ * natural (chronological, oldest-first) order, matching GitHub's API and the
+ * shape every other reader of this call already assumes.
+ *
+ * @param {object[]} comments
+ * @returns {object|null}
+ */
+function _lastComment(comments) {
+  return comments.length > 0 ? comments[comments.length - 1] : null;
+}
+
+/**
+ * Scan one awaiting_info item's comments for a qualifying reply, using
+ * last-comment authorship as the signal (lr-2ed0f0) rather than a
+ * timestamp comparison against the item's own queued_at/awaiting_info_since
+ * marker — see this module's docblock for why marker comparison is wrong.
+ *
+ * If the most recent comment in the thread is from a non-bot author (per
+ * `_isNonBotComment`), that comment IS the qualifying reply — act on it,
+ * regardless of its timestamp relative to when this queue entry was
+ * created. If the last comment is the bot's own, or there are no comments
+ * at all, there is nothing new to act on and the item falls through
+ * unchanged to src/stale.js's idle timeline (same as today's "no reply
+ * found" case).
  *
  * Scoped to a single item's list_comments() call — callers are responsible
  * for only invoking this for items already filtered to queue_reason ===
@@ -167,19 +188,13 @@ function _isNonBotComment(comment) {
  * @returns {Promise<object|null>} the qualifying comment, or null if none found
  */
 export async function findQualifyingReply(config, adapter, item) {
-  const since = new Date(_waitingSinceMarker(item)).getTime();
   const comments = await adapter.list_comments(config, item.event);
+  const last = _lastComment(comments);
 
-  for (const comment of comments) {
-    const postedAt = new Date(comment.created_at ?? 0).getTime();
-    if (Number.isNaN(postedAt) || postedAt <= since) {
-      continue;
-    }
-    if (_isNonBotComment(comment)) {
-      return comment;
-    }
+  if (last === null || !_isNonBotComment(last)) {
+    return null;
   }
-  return null;
+  return last;
 }
 
 /**

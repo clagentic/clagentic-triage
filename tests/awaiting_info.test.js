@@ -185,10 +185,11 @@ describe('findQualifyingReply', () => {
     assert.equal(reply, null);
   });
 
-  it('returns null when the only new comment is from the triage bot itself', async () => {
+  it('returns null when the last comment is from the triage bot itself', async () => {
     const item = makeQueueItem();
     const adapter = {
       list_comments: async () => [
+        makeComment({ login: 'bradorchard', created_at: '2026-07-12T00:00:00Z' }),
         makeComment({ login: 'clagentic-triage[bot]', type: 'Bot', created_at: '2026-07-13T00:00:00Z' }),
       ],
     };
@@ -196,16 +197,7 @@ describe('findQualifyingReply', () => {
     assert.equal(reply, null);
   });
 
-  it('returns null when the only new comment predates the waiting-since marker', async () => {
-    const item = makeQueueItem({ queued_at: '2026-07-10T00:00:00.000Z' });
-    const adapter = {
-      list_comments: async () => [makeComment({ created_at: '2026-07-09T00:00:00Z' })],
-    };
-    const reply = await findQualifyingReply(makeConfig(), adapter, item);
-    assert.equal(reply, null);
-  });
-
-  it('finds a qualifying non-bot reply posted after the waiting-since marker', async () => {
+  it('finds a qualifying non-bot reply as the last comment, regardless of its timestamp relative to queued_at', async () => {
     const item = makeQueueItem({ queued_at: '2026-07-10T00:00:00.000Z' });
     const reply = makeComment({ created_at: '2026-07-14T00:00:00Z', body: 'running v1.2.3' });
     const adapter = { list_comments: async () => [reply] };
@@ -214,14 +206,32 @@ describe('findQualifyingReply', () => {
     assert.equal(found, reply);
   });
 
-  it('prefers awaiting_info_since over queued_at when both are present', async () => {
-    const item = makeQueueItem({
-      queued_at: '2026-07-01T00:00:00.000Z',
-      awaiting_info_since: '2026-07-13T00:00:00.000Z',
+  // Regression test for clagentic/clagentic-console#328 (lr-2ed0f0): the
+  // reporter's reply already existed in the thread BEFORE this queue entry
+  // was created/re-created (e.g. a re-triage during operator remediation).
+  // Marker-timestamp comparison against queued_at would incorrectly treat
+  // the reply as "too early" and skip it — last-comment authorship must find
+  // it regardless.
+  it('finds a qualifying reply that predates queued_at (reply already existed before a late/re-created queue entry)', async () => {
+    const item = makeQueueItem({ queued_at: '2026-07-14T18:49:48.000Z' });
+    const reply = makeComment({
+      login: 'bradorchard',
+      created_at: '2026-07-14T11:43:00.000Z',
+      body: 'Running console v1.2.3',
     });
-    // Posted after queued_at but BEFORE awaiting_info_since — should not qualify.
+    const adapter = { list_comments: async () => [reply] };
+
+    const found = await findQualifyingReply(makeConfig(), adapter, item);
+    assert.equal(found, reply);
+  });
+
+  it('uses only the LAST comment as the signal — an earlier non-bot reply followed by a later bot comment does not qualify', async () => {
+    const item = makeQueueItem({ queued_at: '2026-07-10T00:00:00.000Z' });
     const adapter = {
-      list_comments: async () => [makeComment({ created_at: '2026-07-05T00:00:00Z' })],
+      list_comments: async () => [
+        makeComment({ login: 'bradorchard', created_at: '2026-07-11T00:00:00Z', body: 'v1.2.3' }),
+        makeComment({ login: 'clagentic-triage[bot]', type: 'Bot', created_at: '2026-07-12T00:00:00Z' }),
+      ],
     };
     const reply = await findQualifyingReply(makeConfig(), adapter, item);
     assert.equal(reply, null);
@@ -413,12 +423,10 @@ describe('processAwaitingInfoItems', () => {
 
     const adapter = {
       list_comments: async (_c, event) => {
-        // Comment timestamp deliberately far in the future — the item's real
-        // `queued_at` (set by enqueue() to the actual current time) is the
-        // "waiting since" marker, so the reply must postdate it regardless of
-        // when this test happens to run.
+        // Reply detection is last-comment-authorship based (lr-2ed0f0), not
+        // timestamp comparison — an arbitrary past timestamp still qualifies.
         if (event.number === 328) {
-          return [makeComment({ created_at: '2099-01-01T00:00:00Z', body: 'v1.2.3' })];
+          return [makeComment({ created_at: '2026-07-01T00:00:00Z', body: 'v1.2.3' })];
         }
         return []; // no reply for #329
       },
