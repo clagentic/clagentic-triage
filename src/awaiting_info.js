@@ -13,10 +13,10 @@
  * growing it into a god file (mirrors src/stale.js and src/release_notify.js,
  * which already extract single-purpose lifecycle concerns the same way):
  *
- *   1. Classifying a queued verdict as `awaiting_info` (a 'respond' class
- *      carrying a clarifying-question body, mixed with at least one other
- *      class that did not clear config.auto_approve) rather than the
- *      generic `awaiting_approval`.
+ *   1. Classifying a queued verdict as `awaiting_info` (a `needs_changes`
+ *      verdict — src/llm.js's VALID_VERDICTS enum value for "incomplete,
+ *      asked for more info" — carrying a 'respond' class with a
+ *      clarifying-question body) rather than the generic `awaiting_approval`.
  *   2. Scanning ONLY `awaiting_info` queue items (never the full open-issue
  *      set — see lr-b3a052, the GraphQL rate-limit blocker this task was
  *      gated on) for a qualifying non-bot reply posted after the
@@ -48,12 +48,17 @@ const NEEDS_INFO_VALUE = 'needs-info';
  * Decide whether a queued (non-auto-dispatched) Assessment should be tagged
  * `awaiting_info` rather than the generic `awaiting_approval`.
  *
- * An item qualifies when the verdict's own suggested_action is itself the
- * reason a human hasn't been asked to approve anything yet: it names
- * 'respond' with a non-empty clarifying-question body, mixed with at least
- * one other action class (e.g. 'dispatch') that kept the whole verdict from
- * auto-dispatching. A bare 'respond'-only verdict is NOT awaiting_info — it
- * is a plain comment with nothing further pending, which is the generic
+ * An item qualifies when the verdict is `needs_changes` — src/llm.js's
+ * VALID_VERDICTS enum value the assessor already emits for exactly this
+ * case: "incomplete, asked for more info, left open" (see every intent
+ * file's verdict vocabulary, e.g. "respond asking for the missing
+ * information and leave the issue open... Verdict: needs_changes") — AND
+ * the suggested_action names 'respond' with a non-empty clarifying-question
+ * body (that's what actually posts the question). A `needs_changes` verdict
+ * with a respond body IS the clarifying-question case, whether or not a
+ * second action class (e.g. 'dispatch') also happens to be present. Any
+ * other verdict (e.g. 'accept') with a bare 'respond' is NOT awaiting_info —
+ * it is a plain comment with nothing further pending, the generic
  * awaiting_approval case (or would have auto-dispatched if 'respond' alone
  * were trusted).
  *
@@ -70,9 +75,8 @@ export function isAwaitingInfoVerdict(assessment) {
 
   const hasRespondWithBody =
     classes.includes('respond') && typeof suggestedAction.body === 'string' && suggestedAction.body.trim().length > 0;
-  const hasOtherClass = classes.some((c) => c !== 'respond');
 
-  return hasRespondWithBody && hasOtherClass;
+  return assessment?.verdict === 'needs_changes' && hasRespondWithBody;
 }
 
 /**
