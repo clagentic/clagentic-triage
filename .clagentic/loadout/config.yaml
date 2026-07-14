@@ -68,14 +68,29 @@ merge:
   #     description: "lint pass before merge"
   #     on_failure: fail
 
-  # post_merge_steps: omitted here. Deployment values (real HOME, forge
-  # base URL, install paths) are elicited per-deployment, never templated
-  # into a repo-committed config (rule 1, see clagentic-loadout docs). This
-  # repo's existing post-merge automation is declared instead in
-  # .crew/naomi.yaml (bash deploy/install.sh), which stays the source of
-  # truth for that step until loadout-merge deployment values are elicited
-  # separately.
-  # post_merge_steps:
-  #   - cmd: "scripts/install.sh"
-  #     description: "self-install the merged build"
-  #     on_failure: fail
+  # post_merge_steps: wired live (lr-882af5). deploy/.env.example's defaults
+  # (CLAGENTIC_TRIAGE_INSTALL_DIR=/opt/clagentic-triage, SERVICE_NAME/RUN_USER/
+  # RUN_GROUP=clagentic-triage, GIT_REMOTE=github.com/clagentic/clagentic-triage,
+  # GIT_REF=main) already exactly match this repo's real single deployment
+  # target -- no further deployment-value elicitation was needed, so the
+  # previously-deferred concern in this comment (real HOME, forge base URL,
+  # install paths must be elicited per-deployment, never templated into a
+  # repo-committed config) does not block wiring this step for this repo.
+  #
+  # loadout-merge is this repo's confirmed live merge path (PRs #30, #31, #32
+  # merged by clagentic-merger[bot], "Merged via clagentic-loadout v0.1.0"),
+  # so THIS file -- not .crew/naomi.yaml -- is the config loadout-merge
+  # actually reads for post-merge automation. .crew/naomi.yaml's own
+  # post_merge_steps section is now dead for this repo; see the comment
+  # there pointing back here.
+  #
+  # on_failure: fail (deliberately NOT warn, unlike the old dead
+  # .crew/naomi.yaml value) per operator directive 2026-07-14: lr-0d45 found
+  # that warn-only post-merge install failures let a merge report green while
+  # the running build silently lags main -- exactly the failure this task
+  # (lr-882af5) is fixing, so a failed deploy here must be loud, not
+  # swallowed.
+  post_merge_steps:
+    - cmd: "bash deploy/install.sh"
+      description: "Run the idempotent installer/updater to sync merged main and restart the triage watch service"
+      on_failure: fail
