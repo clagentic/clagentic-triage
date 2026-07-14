@@ -15,7 +15,10 @@ import {
   isMergedToDefaultBranch,
   applyMergeTransition,
   applyReleaseTransition,
+  createLifecycleBackoffState,
+  runLifecycleCycle,
 } from '../src/lifecycle.js';
+import { AdapterError } from '../src/adapters/github.js';
 
 function makeConfig(overrides = {}) {
   return {
@@ -337,5 +340,195 @@ describe('applyReleaseTransition', () => {
     assert.equal(result.applied, false);
     assert.deepEqual(result.issues, []);
     assert.equal(state.closeCalls.length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runLifecycleCycle / createLifecycleBackoffState (lr-b3a052)
+// ---------------------------------------------------------------------------
+
+function makeOpenPrEvent(overrides = {}) {
+  return {
+    id: 'owner/repo#7',
+    type: 'pr',
+    repo: 'owner/repo',
+    number: 7,
+    metadata: { merged: false, draft: false, updated_at: '2026-07-14T10:00:00Z' },
+    ...overrides,
+  };
+}
+
+/**
+ * A minimal fake list_lifecycle_events-capable adapter for runLifecycleCycle
+ * tests. routeFn is injected separately per test (mirrors cli.js's routeEvent
+ * being passed in rather than imported, to avoid a lifecycle.js -> cli.js
+ * import cycle).
+ */
+function makeCycleAdapter({ mergedPrs = [], releases = [], openPrs = [] } = {}) {
+  return {
+    async list_lifecycle_events() {
+      return { mergedPrs, releases, openPrs };
+    },
+  };
+}
+
+describe('createLifecycleBackoffState', () => {
+  it('returns a fresh state with no active backoff and an empty seen-PR map', () => {
+    const state = createLifecycleBackoffState();
+    assert.equal(state.backoffUntilMs, 0);
+    assert.equal(state.seenOpenPrs.size, 0);
+  });
+});
+
+describe('runLifecycleCycle', () => {
+  it('routes every merged PR / release / open PR event and reports counts', async () => {
+    const config = makeConfig();
+    const openPr = makeOpenPrEvent();
+    const adapter = makeCycleAdapter({ openPrs: [openPr] });
+    const state = createLifecycleBackoffState();
+    const routed = [];
+    const routeFn = async (_cfg, event) => {
+      routed.push(event);
+      return { applied: true };
+    };
+
+    const result = await runLifecycleCycle(config, adapter, routeFn, state);
+
+    assert.deepEqual(routed, [openPr]);
+    assert.equal(result.open_prs, 1);
+    assert.equal(result.open_prs_skipped_unchanged, 0);
+    assert.equal(result.applied, 1);
+    assert.equal(result.rate_limited, false);
+    assert.equal(result.skipped_backoff, false);
+  });
+
+  it('call-volume reduction: skips an open PR whose updated_at is unchanged since the last cycle', async () => {
+    const config = makeConfig();
+    const openPr = makeOpenPrEvent();
+    const adapter = makeCycleAdapter({ openPrs: [openPr] });
+    const state = createLifecycleBackoffState();
+    let routeCalls = 0;
+    const routeFn = async () => {
+      routeCalls += 1;
+      return { applied: false };
+    };
+
+    const first = await runLifecycleCycle(config, adapter, routeFn, state);
+    const second = await runLifecycleCycle(config, adapter, routeFn, state);
+
+    assert.equal(routeCalls, 1);
+    assert.equal(first.open_prs_skipped_unchanged, 0);
+    assert.equal(second.open_prs_skipped_unchanged, 1);
+  });
+
+  it('re-routes an open PR once its updated_at changes', async () => {
+    const config = makeConfig();
+    const state = createLifecycleBackoffState();
+    let routeCalls = 0;
+    const routeFn = async () => {
+      routeCalls += 1;
+      return { applied: false };
+    };
+
+    const staleAdapter = makeCycleAdapter({ openPrs: [makeOpenPrEvent()] });
+    await runLifecycleCycle(config, staleAdapter, routeFn, state);
+
+    const freshAdapter = makeCycleAdapter({
+      openPrs: [makeOpenPrEvent({ metadata: { merged: false, draft: false, updated_at: '2026-07-14T11:00:00Z' } })],
+    });
+    await runLifecycleCycle(config, freshAdapter, routeFn, state);
+
+    assert.equal(routeCalls, 2);
+  });
+
+  it('on a rate_limited error, stops routing further events in the same cycle and sets a backoff window', async () => {
+    const config = makeConfig();
+    const first = makeOpenPrEvent({ number: 1 });
+    const second = makeOpenPrEvent({ number: 2 });
+    const adapter = makeCycleAdapter({ openPrs: [first, second] });
+    const state = createLifecycleBackoffState();
+    const routed = [];
+    const routeFn = async (_cfg, event) => {
+      routed.push(event);
+      throw new AdapterError('get_pr_closing_issues GraphQL rate limit: API rate limit exceeded (Retry-After: 30s)', 'rate_limited');
+    };
+
+    const before = Date.now();
+    const result = await runLifecycleCycle(config, adapter, routeFn, state);
+
+    assert.deepEqual(routed, [first]); // stopped after the first failure — never tried `second`
+    assert.equal(result.rate_limited, true);
+    assert.ok(state.backoffUntilMs >= before + 30_000);
+    assert.ok(state.backoffUntilMs <= before + 31_000);
+  });
+
+  it('skips list_lifecycle_events and routeFn entirely while a backoff window is active', async () => {
+    const config = makeConfig();
+    const state = createLifecycleBackoffState();
+    state.backoffUntilMs = Date.now() + 60_000;
+    let listCalled = false;
+    const adapter = {
+      async list_lifecycle_events() {
+        listCalled = true;
+        return { mergedPrs: [], releases: [], openPrs: [] };
+      },
+    };
+    const routeFn = async () => ({ applied: false });
+
+    const result = await runLifecycleCycle(config, adapter, routeFn, state);
+
+    assert.equal(listCalled, false);
+    assert.equal(result.skipped_backoff, true);
+  });
+
+  it('resumes routing once the backoff window elapses', async () => {
+    const config = makeConfig();
+    const state = createLifecycleBackoffState();
+    state.backoffUntilMs = Date.now() - 1; // already elapsed
+    const adapter = makeCycleAdapter({ openPrs: [makeOpenPrEvent()] });
+    let routeCalls = 0;
+    const routeFn = async () => {
+      routeCalls += 1;
+      return { applied: false };
+    };
+
+    const result = await runLifecycleCycle(config, adapter, routeFn, state);
+
+    assert.equal(routeCalls, 1);
+    assert.equal(result.skipped_backoff, false);
+  });
+
+  it('falls back to the default 1-hour backoff when the rate-limited error carries no parseable hint', async () => {
+    const config = makeConfig();
+    const adapter = makeCycleAdapter({ openPrs: [makeOpenPrEvent()] });
+    const state = createLifecycleBackoffState();
+    const routeFn = async () => {
+      throw new AdapterError('get_pr_closing_issues rate limited: HTTP 403', 'rate_limited');
+    };
+
+    const before = Date.now();
+    await runLifecycleCycle(config, adapter, routeFn, state);
+
+    const oneHourMs = 60 * 60 * 1000;
+    assert.ok(state.backoffUntilMs >= before + oneHourMs - 1000);
+    assert.ok(state.backoffUntilMs <= before + oneHourMs + 1000);
+  });
+
+  it('re-throws a non-rate-limited error rather than treating it as a backoff signal', async () => {
+    const config = makeConfig();
+    const adapter = makeCycleAdapter({ openPrs: [makeOpenPrEvent()] });
+    const state = createLifecycleBackoffState();
+    const routeFn = async () => {
+      throw new AdapterError('something else went wrong', 'forbidden');
+    };
+
+    await assert.rejects(
+      () => runLifecycleCycle(config, adapter, routeFn, state),
+      (err) => {
+        assert.equal(err.code, 'forbidden');
+        return true;
+      },
+    );
+    assert.equal(state.backoffUntilMs, 0);
   });
 });
