@@ -11,3 +11,10 @@ node_modules/
 .scratch-*
 pr-body-*.txt
 test-out.txt
+
+# Agent run-log / probe scratch: dotfiles left by agent sessions in any
+# subdir (e.g. tests/.run-*.txt, tests/.probe2.test.js, tests/.pr-body-*.txt)
+# — same leakage class as above but with dotted prefixes (lr-e3fd)
+**/.run-*
+**/.probe*
+**/.pr-body-*
