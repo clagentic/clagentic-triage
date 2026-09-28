@@ -928,4 +928,132 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     );
     assert.doesNotMatch(result.stdout, /active after \d+s/, 'must not claim active when is-active never reported up');
   });
+
+  it('CLAGENTIC_TRIAGE_SKIP_SYSTEMD=1 succeeds with no getent on PATH and never resolves it', () => {
+    // GETENT_BIN resolution (and its absolute-path check) lives inside the
+    // `[ "${SKIP_SYSTEMD}" = "1" ]` branch's else-arm in install.sh, so a
+    // SKIP_SYSTEMD=1 host renders no unit and must never require getent at
+    // all — proves the fold-in #7 move out of unconditional config-time
+    // resolution actually took effect, rather than just moving the call
+    // site without changing when it runs.
+    const caseDir = join(workDir, 'skip-systemd-no-getent');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    mkdirSync(installDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    // A closed PATH containing every tool install.sh needs with
+    // SKIP_SYSTEMD=1 (no systemctl/chown calls happen in that path, but
+    // _render_template + the run-wrapper chmod still run, along with real
+    // coreutils install.sh's own logic calls directly — sed, mkdir, cat,
+    // basename, dirname, chmod, flock — none of which are stubbed by
+    // makeFakeSystem) EXCEPT getent. Real coreutils are symlinked in by
+    // absolute path (resolved from THIS test's own PATH) rather than
+    // appending the real system PATH wholesale, which would silently
+    // re-expose the real system getent and defeat this test's premise.
+    const noGetentDir = join(caseDir, 'no-getent-bin');
+    mkdirSync(noGetentDir, { recursive: true });
+    const write = (name, script) => {
+      const p = join(noGetentDir, name);
+      writeFileSync(p, `#!/usr/bin/env bash\n${script}\n`);
+      chmodSync(p, 0o755);
+    };
+    write('id', `[ "$1" = "-u" ] && { echo 1000; exit 0; }; exit 1`);
+    write('useradd', `exit 0`);
+    write('groupadd', `exit 0`);
+    write('npm', `exit 0`);
+    write('git', `
+sub="$1"; shift
+case "$sub" in
+  clone)
+    dest="\${@: -1}"
+    mkdir -p "$dest/.git"
+    mkdir -p "$dest/deploy"
+    exit 0
+    ;;
+  -C)
+    repo="$1"; shift
+    action="$1"
+    case "$action" in
+      fetch) exit 0 ;;
+      checkout) exit 0 ;;
+      reset) exit 0 ;;
+      rev-parse) echo "deadbeefcafef00d0000000000000000000000" ;;
+    esac
+    exit 0
+    ;;
+esac
+exit 0
+`);
+    for (const coreutil of ['bash', 'sed', 'mkdir', 'cat', 'basename', 'dirname', 'chmod', 'flock']) {
+      const resolved = spawnSync('command', ['-v', coreutil], { shell: '/bin/sh', encoding: 'utf8' })
+        .stdout.trim();
+      if (!resolved) {
+        throw new Error(`could not resolve an absolute path to ${coreutil} via the test runner PATH`);
+      }
+      symlinkSync(resolved, join(noGetentDir, coreutil));
+    }
+
+    const result = spawnSync(BASH_BIN, [INSTALL_SH], {
+      env: {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SKIP_SYSTEMD: '1',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+        HOME: caseDir,
+        PATH: noGetentDir,
+      },
+      encoding: 'utf8',
+    });
+
+    assert.equal(result.status, 0, `install.sh must succeed with SKIP_SYSTEMD=1 and no getent: ${result.stderr}\n${result.stdout}`);
+    assert.doesNotMatch(
+      result.stderr,
+      /getent/,
+      `install.sh must never attempt to resolve getent when SKIP_SYSTEMD=1, got stderr: ${result.stderr}`,
+    );
+  });
+
+  it('_sed_escape_replacement: a substituted value containing #, & and a backslash renders verbatim', () => {
+    // sed's replacement text treats '&' (whole match), backslash (escape
+    // introducer), and '#' (this script's chosen delimiter) as special.
+    // ENV_FILE is substituted into the rendered unit's
+    // `EnvironmentFile=-@@ENV_FILE@@` line and, unlike INSTALL_DIR, is never
+    // touched as a real filesystem path by install.sh itself (no mkdir/cd
+    // against it) — safe to set to a value containing characters that are
+    // not necessarily valid in a real directory install.sh needs to create.
+    const caseDir = join(workDir, 'sed-escape-replacement');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir } = makeFakeSystem(caseDir);
+    const trickyEnvFile = '/etc/clagentic-triage/tri#age&env\\file.env';
+
+    const result = runInstall(
+      {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        CLAGENTIC_TRIAGE_ENV_FILE: trickyEnvFile,
+        TMPDIR: caseDir,
+      },
+      binDir,
+    );
+
+    assert.equal(result.status, 0, `install.sh failed: ${result.stderr}\n${result.stdout}`);
+
+    const unitPath = join(unitDir, 'clagentic-triage.service');
+    const unitContents = readFileSync(unitPath, 'utf8');
+    assert.ok(
+      unitContents.includes(`EnvironmentFile=-${trickyEnvFile}`),
+      `expected the ENV_FILE value containing #, & and \\ to render verbatim, got unit contents: ${unitContents}`,
+    );
+    assert.ok(!unitContents.includes('@@ENV_FILE@@'), 'placeholder token must not survive rendering');
+  });
 });
