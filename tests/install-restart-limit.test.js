@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import {
   mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readFileSync, existsSync, cpSync,
+  symlinkSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -259,8 +260,13 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     assert.match(unitSection, /^StartLimitIntervalSec=\d+$/m, 'StartLimitIntervalSec must be in [Unit]');
     assert.match(unitSection, /^StartLimitBurst=\d+$/m, 'StartLimitBurst must be in [Unit]');
 
-    // RestartSec must stay well under the interval, or the burst count
-    // would never be reachable within the window at all.
+    // RestartSec must stay strictly under the interval, or the burst count
+    // would never be reachable within the window at all — an exact `==`
+    // fit is only reachable if the Nth restart lands at precisely the
+    // window boundary, which systemd's own counting does not guarantee
+    // (the window resets relative to the first counted start, not a fixed
+    // clock edge), so require real headroom rather than allowing an exact
+    // equality that could pass by chance and still race the limit.
     const restartSecMatch = unitContents.match(/^RestartSec=(\d+)$/m);
     const intervalMatch = unitContents.match(/^StartLimitIntervalSec=(\d+)$/m);
     const burstMatch = unitContents.match(/^StartLimitBurst=(\d+)$/m);
@@ -269,26 +275,33 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     const interval = Number(intervalMatch[1]);
     const burst = Number(burstMatch[1]);
     assert.ok(
-      restartSec * burst <= interval,
-      `restart budget (RestartSec=${restartSec} * StartLimitBurst=${burst} = ${restartSec * burst}) must fit within StartLimitIntervalSec=${interval}, or the burst limit can never trip`,
+      restartSec * burst < interval,
+      `restart budget (RestartSec=${restartSec} * StartLimitBurst=${burst} = ${restartSec * burst}) must fit strictly within StartLimitIntervalSec=${interval}, or the burst limit can never reliably trip`,
     );
   });
 
   // Builds a systemctl stub reporting the given LoadState (e.g.
-  // "not-found", "loaded") for `show -p LoadState --value`, and optionally
-  // fails reset-failed with a distinctive stderr message. Every call is
-  // logged to systemctl-calls.log so tests can assert install.sh's call
-  // sequence.
-  function writeLoadStateSystemctlStub(binDir, caseDir, loadState, resetFailedFails) {
+  // "not-found", "loaded") for `show -p LoadState --value`, optionally
+  // fails reset-failed with a distinctive stderr message, and drives
+  // `is-active`'s exit code from `isActive` (default true) so a
+  // failed/inactive-unit case actually differs from an active one from
+  // install.sh's perspective — the original stub hardcoded `is-active`
+  // to always exit 0 regardless of the simulated LoadState, so the
+  // "failed" and "active" test cases below were, from install.sh's point
+  // of view, identical (is-active always looked active either way). Every
+  // call is logged to systemctl-calls.log so tests can assert install.sh's
+  // call sequence.
+  function writeLoadStateSystemctlStub(binDir, caseDir, loadState, resetFailedFails, isActive = true) {
     const resetFailedCase = resetFailedFails
       ? '  reset-failed) echo "Failed to reset failed state: unit-test-simulated-dbus-error" >&2; exit 1 ;;\n'
       : '';
+    const isActiveExit = isActive ? 0 : 3;
     writeFileSync(
       join(binDir, 'systemctl'),
       `#!/usr/bin/env bash\n`
         + `echo "$*" >> "${join(caseDir, 'systemctl-calls.log')}"\n`
         + `case "$1" in\n`
-        + `  is-active) exit 0 ;;\n`
+        + `  is-active) exit ${isActiveExit} ;;\n`
         + `  show) echo "${loadState}" ;;\n`
         + resetFailedCase
         + `  *) exit 0 ;;\n`
@@ -520,10 +533,11 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     assert.equal(execStartPreLines.length, 2, `expected exactly 2 ExecStartPre= lines, got: ${execStartPreLines.join(' | ')}`);
     for (const line of execStartPreLines) {
       assert.doesNotMatch(line, /\/bin\/sh/, `ExecStartPre must not shell out: ${line}`);
-      // '+' prefix required — the guard must run as root regardless of
-      // the unit's own User=, since its job is to check whether that
-      // account exists at all.
-      assert.match(line, /^ExecStartPre=\+/);
+      // '!' prefix required — the guard must resolve the account
+      // regardless of the unit's own User=/Group=, while still running
+      // under the unit's sandbox directives (unlike '+', which would also
+      // bypass those).
+      assert.match(line, /^ExecStartPre=!/);
     }
     // Both checks must be present and independent — a group-only or
     // user-only guard would let the other identity's removal bypass it
@@ -537,8 +551,8 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     // getent` against the fake PATH set up by makeFakeSystem, so the
     // rendered path must equal that stub's path — not a hardcoded
     // /usr/bin/getent.
-    assert.equal(passwdLine, `ExecStartPre=+${expectedGetentBin} passwd clagentic-triage-test`);
-    assert.equal(groupLine, `ExecStartPre=+${expectedGetentBin} group clagentic-triage-test`);
+    assert.equal(passwdLine, `ExecStartPre=!${expectedGetentBin} passwd clagentic-triage-test`);
+    assert.equal(groupLine, `ExecStartPre=!${expectedGetentBin} group clagentic-triage-test`);
     assert.ok(!unitContents.includes('@@RUN_USER@@'), 'placeholder token must not survive rendering');
     assert.ok(!unitContents.includes('@@RUN_GROUP@@'), 'placeholder token must not survive rendering');
     assert.ok(!unitContents.includes('@@GETENT_BIN@@'), 'placeholder token must not survive rendering');
@@ -577,6 +591,21 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
       cpSync(join(binDir, name), join(noGetentDir, name));
       chmodSync(join(noGetentDir, name), 0o755);
     }
+    // The stub scripts under noGetentDir (id/useradd/groupadd/etc.) are
+    // themselves `#!/usr/bin/env bash` scripts — `env` resolves `bash`
+    // against THIS test's PATH too, independent of how install.sh itself
+    // is launched below. GETENT_BIN resolution now runs inside Step 3,
+    // after _provision_run_identity calls id/useradd/groupadd (see
+    // install.sh), so those stub scripts must actually be able to launch,
+    // or the run fails on "env: 'bash': No such file or directory" before
+    // install.sh's own getent-missing FATAL is ever reached — appending
+    // dirname(BASH_BIN) (e.g. /usr/bin) to PATH would fix that, but would
+    // also re-expose the real system `getent` living in that same
+    // directory, defeating this test entirely. Instead, symlink just
+    // `bash` itself (not the whole directory) into noGetentDir, so `env`
+    // finds bash without any other real system binary — including
+    // getent — becoming reachable.
+    symlinkSync(BASH_BIN, join(noGetentDir, 'bash'));
     // spawnSync('bash', ...) resolves its OWN executable against this call's
     // env.PATH, not the parent process's — a closed PATH lacking bash would
     // fail on ENOENT before install.sh ever runs a line, and the assertions
@@ -625,7 +654,7 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     assert.equal(positiveResult.status, 0, `install.sh failed: ${positiveResult.stderr}\n${positiveResult.stdout}`);
     const unitContents = readFileSync(join(unitDir, 'clagentic-triage.service'), 'utf8');
     assert.ok(
-      unitContents.includes(`ExecStartPre=+${join(binDir, 'getent')} passwd`),
+      unitContents.includes(`ExecStartPre=!${join(binDir, 'getent')} passwd`),
       'rendered ExecStartPre must use the getent path resolved from PATH',
     );
   });
@@ -649,6 +678,13 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     const { binDir } = makeFakeSystem(caseDir);
     writeFileSync(join(caseDir, 'getent'), '#!/usr/bin/env bash\nexit 0\n');
     chmodSync(join(caseDir, 'getent'), 0o755);
+    // The stub scripts under binDir (id/useradd/groupadd/etc., and this
+    // case's own relative `getent`) are `#!/usr/bin/env bash` scripts —
+    // `env` resolves `bash` against this test's PATH too. Symlink just
+    // `bash` itself into binDir (not the whole real /usr/bin, which would
+    // also re-expose the real system `getent` and risk masking which
+    // getent this test's assertions are actually exercising).
+    symlinkSync(BASH_BIN, join(binDir, 'bash'));
 
     const result = spawnSync(BASH_BIN, [INSTALL_SH], {
       cwd: caseDir,
@@ -662,7 +698,8 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
         TMPDIR: caseDir,
         HOME: caseDir,
         // "." resolves getent to the relative "./getent"; binDir supplies
-        // every other required tool via its absolute path.
+        // every other required tool via its absolute path (including the
+        // bash symlink added just above).
         PATH: `.:${binDir}`,
       },
       encoding: 'utf8',
@@ -717,10 +754,10 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     // contain that word (see the group-guard test below, whose caseDir
     // name 'execstartpre-group-runtime' hit exactly this).
     const resolvedGetentBin = join(binDir, 'getent');
-    const execStartPreLines = unitContents.split('\n').filter((l) => l.startsWith(`ExecStartPre=+${resolvedGetentBin} `));
-    const passwdLine = execStartPreLines.find((l) => l.slice(`ExecStartPre=+${resolvedGetentBin} `.length).split(' ')[0] === 'passwd');
+    const execStartPreLines = unitContents.split('\n').filter((l) => l.startsWith(`ExecStartPre=!${resolvedGetentBin} `));
+    const passwdLine = execStartPreLines.find((l) => l.slice(`ExecStartPre=!${resolvedGetentBin} `.length).split(' ')[0] === 'passwd');
     assert.ok(passwdLine, `expected a getent passwd ExecStartPre line, got: ${execStartPreLines.join(' | ')}`);
-    // Strip 'ExecStartPre=+' (systemd directive syntax) and the leading
+    // Strip 'ExecStartPre=!' (systemd directive syntax) and the leading
     // resolved getent path to get just the trailing argv ('passwd',
     // RUN_USER) — the guard's own binary path is asserted separately
     // above; here a stubbed 'getent' on PATH stands in for it so the test
@@ -728,7 +765,7 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     // against a stub that reports the account absent. GETENT_BIN is
     // resolved at render time (not hardcoded), so strip it dynamically
     // rather than assuming a fixed path.
-    const argv = passwdLine.slice(`ExecStartPre=+${resolvedGetentBin} `.length).split(' ');
+    const argv = passwdLine.slice(`ExecStartPre=!${resolvedGetentBin} `.length).split(' ');
     assert.deepEqual(argv, ['passwd', 'clagentic-triage-test']);
 
     // Simulate the account being absent: a `getent` stub on PATH that
@@ -785,14 +822,14 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     // "group", so a plain l.includes('group') would false-match the
     // passwd line too.
     const resolvedGetentBin = join(binDir, 'getent');
-    const execStartPreLines = unitContents.split('\n').filter((l) => l.startsWith(`ExecStartPre=+${resolvedGetentBin} `));
-    const groupLine = execStartPreLines.find((l) => l.slice(`ExecStartPre=+${resolvedGetentBin} `.length).split(' ')[0] === 'group');
+    const execStartPreLines = unitContents.split('\n').filter((l) => l.startsWith(`ExecStartPre=!${resolvedGetentBin} `));
+    const groupLine = execStartPreLines.find((l) => l.slice(`ExecStartPre=!${resolvedGetentBin} `.length).split(' ')[0] === 'group');
     assert.ok(groupLine, `expected a getent group ExecStartPre line, got: ${execStartPreLines.join(' | ')}`);
-    // Strip 'ExecStartPre=+' and the leading resolved getent path to get
+    // Strip 'ExecStartPre=!' and the leading resolved getent path to get
     // just the trailing argv ('group', RUN_GROUP) — see the passwd-guard
     // test above for why the binary path itself isn't re-asserted here, and
     // why it's stripped dynamically rather than assuming a fixed path.
-    const argv = groupLine.slice(`ExecStartPre=+${resolvedGetentBin} `.length).split(' ');
+    const argv = groupLine.slice(`ExecStartPre=!${resolvedGetentBin} `.length).split(' ');
     assert.deepEqual(argv, ['group', 'clagentic-triage-test']);
 
     // Simulate the group being absent: a `getent` stub that always
@@ -812,5 +849,83 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     });
 
     assert.notEqual(guardResult.status, 0, 'guard must fail when the group does not exist');
+  });
+
+  it('reports active after restart when systemctl is-active reports the unit up', () => {
+    // Companion to the "stays inactive" case below — asserts the two cases
+    // actually differ from install.sh's own point of view. The original
+    // shared systemctl stub hardcoded `is-active` to always exit 0
+    // regardless of the simulated LoadState/ActiveState, so a "failed unit"
+    // test case and an "active unit" test case were indistinguishable to
+    // install.sh's post-restart poll loop — both looked active. This pair
+    // drives `is-active`'s exit code explicitly via writeLoadStateSystemctlStub's
+    // `isActive` param instead of relying on the always-succeeds default.
+    const caseDir = join(workDir, 'post-restart-poll-active');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir } = makeFakeSystem(caseDir);
+    writeLoadStateSystemctlStub(binDir, caseDir, 'loaded', false, true);
+
+    const result = runInstall(
+      {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+      },
+      binDir,
+    );
+
+    assert.equal(result.status, 0, `install.sh failed: ${result.stderr}\n${result.stdout}`);
+    assert.match(result.stdout, /active after \d+s/, `expected install.sh to report active, got stdout: ${result.stdout}`);
+    assert.doesNotMatch(result.stdout, /did not report active/, 'must not warn when is-active reports up');
+  });
+
+  it('warns rather than reports active when systemctl is-active never reports the unit up', () => {
+    // The other half of the pair above: when `is-active` genuinely stays
+    // non-zero, install.sh's poll loop must fall through to its WARNING
+    // path, not silently claim success. There is no override for the poll
+    // loop's fixed 30s/2s timing, so this test genuinely waits out the
+    // full 30s; kept as the suite's only test doing so.
+    const caseDir = join(workDir, 'post-restart-poll-inactive');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir } = makeFakeSystem(caseDir);
+    writeLoadStateSystemctlStub(binDir, caseDir, 'loaded', false, false);
+
+    const result = runInstall(
+      {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+      },
+      binDir,
+    );
+
+    // install.sh itself still exits 0 here (the WARNING path logs and
+    // continues rather than aborting the install) — the assertion that
+    // matters is which message it printed.
+    assert.equal(result.status, 0, `install.sh failed: ${result.stderr}\n${result.stdout}`);
+    assert.match(
+      result.stdout,
+      /WARNING: .* did not report active within 30s/,
+      `expected install.sh's inactive-after-restart WARNING, got stdout: ${result.stdout}`,
+    );
+    assert.doesNotMatch(result.stdout, /active after \d+s/, 'must not claim active when is-active never reported up');
   });
 });

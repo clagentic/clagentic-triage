@@ -32,21 +32,24 @@ Group=@@RUN_GROUP@@
 WorkingDirectory=@@INSTALL_DIR@@
 EnvironmentFile=-@@ENV_FILE@@
 @@GITHUB_APP_PRIVATE_KEY_FILE_ENV_LINE@@
-# Runs as root (the '+' prefix opts out of the unit's User=/Group=/hardening
-# directives for these exec lines only — see systemd.service(5)) so it can
-# resolve the account regardless of what User=/Group= itself will be. Belt-
-# and-suspenders alongside install.sh's own preflight (_provision_run_identity):
-# this catches an account or group that existed at install time but was
-# later removed from the host, a drift window install.sh cannot see since
-# it only runs at install/update time, not on every service start. Checks
-# both RUN_USER and RUN_GROUP — a missing group fails just as opaquely
-# (status=216/GROUP) as a missing user (status=217/USER), and only checking
-# the user would let a removed group bypass the guard entirely.
+# Runs as root for credential resolution only (the '!' prefix opts out of
+# ONLY the unit's User=/Group= for these exec lines — see systemd.service(5)
+# — unlike '+', which would also bypass the sandbox directives below
+# (NoNewPrivileges, ProtectSystem, ProtectHome, PrivateTmp)). '!' resolves
+# the account regardless of what User=/Group= itself will be, while still
+# running the check itself under the same hardening as the real service.
+# Belt-and-suspenders alongside install.sh's own preflight
+# (_provision_run_identity): this catches an account or group that existed
+# at install time but was later removed from the host, a drift window
+# install.sh cannot see since it only runs at install/update time, not on
+# every service start. Checks both RUN_USER and RUN_GROUP — a missing group
+# fails just as opaquely (status=216/GROUP) as a missing user
+# (status=217/USER), and only checking the user would let a removed group
+# bypass the guard entirely.
 #
-# Direct getent exec lines, no '/bin/sh -c' wrapper — ExecStartPre= with a
-# '+' prefix runs as root regardless of the unit's own User=, so a shell
-# wrapper here would interpolate @@RUN_USER@@/@@RUN_GROUP@@ into a root
-# shell command line. Both values are install-time config (see
+# Direct getent exec lines, no '/bin/sh -c' wrapper — a shell wrapper here
+# would interpolate @@RUN_USER@@/@@RUN_GROUP@@ into a root-privileged shell
+# command line. Both values are install-time config (see
 # deploy/.env.example), not attacker input, but a direct exec removes the
 # shell-interpolation surface entirely rather than relying on that
 # distinction. getent's own non-zero exit still fails the start (bounded by
@@ -57,8 +60,8 @@ EnvironmentFile=-@@ENV_FILE@@
 # hardcoded here — its absolute path is not guaranteed to be /usr/bin on
 # every distro); ExecStartPre requires an absolute path since it does not
 # consult PATH.
-ExecStartPre=+@@GETENT_BIN@@ passwd @@RUN_USER@@
-ExecStartPre=+@@GETENT_BIN@@ group @@RUN_GROUP@@
+ExecStartPre=!@@GETENT_BIN@@ passwd @@RUN_USER@@
+ExecStartPre=!@@GETENT_BIN@@ group @@RUN_GROUP@@
 ExecStart=@@RUN_WRAPPER_PATH@@
 Restart=on-failure
 RestartSec=5
