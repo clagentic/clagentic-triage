@@ -96,6 +96,15 @@ _log() {
 # On any host where creation is not permitted (non-root, useradd/groupadd
 # unavailable), fails loudly with an actionable message instead of writing
 # a unit that can never start — never a silent no-op.
+#
+# Called from Step 3 below (search "_provision_run_identity" in this file)
+# strictly before the unit is rendered/enabled/restarted, so install.sh
+# never enables a unit whose User= does not resolve. This does not cover
+# drift between install runs — an account removed from the host after a
+# successful install without a subsequent re-install — which is what the
+# rendered unit's own ExecStartPre identity guard and
+# StartLimitIntervalSec/StartLimitBurst bounds are for (see
+# deploy/clagentic-triage.service.template).
 # ---------------------------------------------------------------------------
 _provision_run_identity() {
     if [ "${SKIP_USER_PROVISION}" = "1" ]; then
@@ -241,10 +250,48 @@ fi
 # Step 3 — Install path: run-identity, deps, template rendering, systemd
 # (re)load+restart
 # ---------------------------------------------------------------------------
+GETENT_BIN=""
 if [ "${SKIP_SYSTEMD}" = "1" ]; then
     _log "skipping run-identity provisioning (CLAGENTIC_TRIAGE_SKIP_SYSTEMD=1; no unit will be rendered)"
 else
     _provision_run_identity
+
+    # getent's absolute path, resolved at render time rather than hardcoded
+    # in the unit template: ExecStartPre= requires an absolute path since it
+    # does not consult PATH, but that path is not guaranteed to be
+    # /usr/bin/getent on every distro. Same command -v resolution
+    # _provision_run_identity already relies on for useradd/groupadd; fails
+    # loudly if getent is not found rather than rendering an ExecStartPre
+    # line that can never succeed.
+    #
+    # Gated on SKIP_SYSTEMD (not run unconditionally at config time): a
+    # SKIP_SYSTEMD=1 host renders no unit at all, so requiring getent to be
+    # on PATH there is a spurious hard dependency — e.g. a dry-run or a host
+    # where systemd is managed out-of-band and getent genuinely isn't
+    # installed. GETENT_BIN stays "" in that case; _render_template's sed
+    # still runs (for the run-wrapper template, which never uses this
+    # placeholder) with an empty substitution that is simply never used.
+    GETENT_BIN="$(command -v getent || true)"
+    if [ -z "${GETENT_BIN}" ]; then
+        echo "[clagentic-triage-install] FATAL: 'getent' is not available on PATH." >&2
+        echo "[clagentic-triage-install] The rendered unit's ExecStartPre identity guard requires it." >&2
+        exit 1
+    fi
+    # ExecStartPre= in the unit template requires an absolute path (it does
+    # not consult PATH at all), so a relative resolution from `command -v`
+    # (e.g. a PATH entry like "." or a shell-function/alias substitute is
+    # never expected here, but a non-absolute PATH entry is a real
+    # misconfiguration systemd would silently fail on) must be caught here
+    # at render time, not left to surface as an opaque unit-start failure
+    # later.
+    case "${GETENT_BIN}" in
+        /*) ;;
+        *)
+            echo "[clagentic-triage-install] FATAL: resolved getent path '${GETENT_BIN}' is not absolute." >&2
+            echo "[clagentic-triage-install] Check for a non-absolute PATH entry ahead of the real getent binary." >&2
+            exit 1
+            ;;
+    esac
 fi
 
 if [ "${SKIP_NPM_CI}" = "1" ]; then
@@ -282,6 +329,19 @@ if [ -n "${GITHUB_APP_PRIVATE_KEY_FILE}" ]; then
     _github_app_key_file_env_line="Environment=CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE=${GITHUB_APP_PRIVATE_KEY_FILE}"
 fi
 
+# _sed_escape_replacement — escape a value for safe use as a sed `s#...#X#`
+# replacement (X = this function's output). sed's replacement text treats
+# '&' (whole match), backslash (escape introducer, e.g. '\1'), and the
+# delimiter itself ('#', used throughout this script's sed invocations) as
+# special — an unescaped occurrence of any of these in a substituted value
+# (e.g. an install path or env-driven config value containing one of these
+# characters) corrupts the render instead of being inserted literally.
+# Escape backslash first so the escaping backslashes just-added for '&'/'#'
+# are not themselves re-escaped.
+_sed_escape_replacement() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/&/\\\&/g' -e 's/#/\\#/g'
+}
+
 _render_template() {
     # $1 = template path, $2 = output path
     local _tmpl="$1"
@@ -294,17 +354,18 @@ _render_template() {
     # substitute the resolved Environment= line.
     local _key_file_stage
     if [ -n "${_github_app_key_file_env_line}" ]; then
-        _key_file_stage="s#@@GITHUB_APP_PRIVATE_KEY_FILE_ENV_LINE@@#${_github_app_key_file_env_line}#g"
+        _key_file_stage="s#@@GITHUB_APP_PRIVATE_KEY_FILE_ENV_LINE@@#$(_sed_escape_replacement "${_github_app_key_file_env_line}")#g"
     else
         _key_file_stage="/@@GITHUB_APP_PRIVATE_KEY_FILE_ENV_LINE@@/d"
     fi
     sed \
-        -e "s#@@INSTALL_DIR@@#${INSTALL_DIR}#g" \
-        -e "s#@@RUN_USER@@#${RUN_USER}#g" \
-        -e "s#@@RUN_GROUP@@#${RUN_GROUP}#g" \
-        -e "s#@@ENV_FILE@@#${ENV_FILE}#g" \
-        -e "s#@@RUN_WRAPPER_PATH@@#${RUN_WRAPPER_PATH}#g" \
-        -e "s#@@NODE_BIN@@#${NODE_BIN}#g" \
+        -e "s#@@INSTALL_DIR@@#$(_sed_escape_replacement "${INSTALL_DIR}")#g" \
+        -e "s#@@RUN_USER@@#$(_sed_escape_replacement "${RUN_USER}")#g" \
+        -e "s#@@RUN_GROUP@@#$(_sed_escape_replacement "${RUN_GROUP}")#g" \
+        -e "s#@@ENV_FILE@@#$(_sed_escape_replacement "${ENV_FILE}")#g" \
+        -e "s#@@RUN_WRAPPER_PATH@@#$(_sed_escape_replacement "${RUN_WRAPPER_PATH}")#g" \
+        -e "s#@@NODE_BIN@@#$(_sed_escape_replacement "${NODE_BIN}")#g" \
+        -e "s#@@GETENT_BIN@@#$(_sed_escape_replacement "${GETENT_BIN}")#g" \
         -e "${_key_file_stage}" \
         "${_tmpl}" > "${_out}"
 }
@@ -325,6 +386,38 @@ else
 
     _log "reloading systemd daemon..."
     systemctl daemon-reload
+
+    # Clear any tripped StartLimitBurst (see the unit template's [Unit]
+    # section) before enable/restart. Without this, once a persistent
+    # failure (e.g. the removed-RUN_USER incident this bound exists to
+    # catch) exhausts the burst budget and lands the unit in `failed`, a
+    # later install.sh run — even after the host is repaired — has its
+    # `systemctl restart` refused with "start request repeated too
+    # quickly", because the trip is sticky until reset-failed clears it.
+    #
+    # Gated on LoadState, not `systemctl is-failed`: is-failed only reports
+    # true for a unit currently sitting in `failed` state, but systemd's
+    # start-rate counter (the thing StartLimitBurst actually tracks) is
+    # attached to the unit for as long as it stays LOADED — including while
+    # it is `active` or mid-Restart=-driven retry, not only once it has
+    # fully landed in `failed`. Gating on is-failed alone misses that
+    # window: a unit that is still active/restarting when this install runs
+    # can trip its OWN start-rate counter on the very next restart this
+    # install triggers, with nothing here to clear it first. LoadState
+    # covers every case reset-failed can legitimately act on. A unit that
+    # is not loaded (fresh host — daemon-reload just above does not eagerly
+    # load it) has nothing to reset, so reset-failed is skipped only then.
+    # When the unit IS loaded, reset-failed always has a real target, so a
+    # non-zero exit there is a genuine problem (e.g. systemd/dbus
+    # unreachable) and must fail the install loudly with its stderr
+    # visible, not be swallowed.
+    _load_state="$(systemctl show -p LoadState --value "${SERVICE_NAME}" 2>/dev/null || true)"
+    if [ "${_load_state}" = "loaded" ]; then
+        _log "clearing any tripped start-limit state for ${SERVICE_NAME}..."
+        systemctl reset-failed "${SERVICE_NAME}"
+    else
+        _log "${SERVICE_NAME} is not loaded (LoadState=${_load_state:-<none>}); skipping reset-failed"
+    fi
 
     _log "enabling ${SERVICE_NAME}..."
     systemctl enable "${SERVICE_NAME}"

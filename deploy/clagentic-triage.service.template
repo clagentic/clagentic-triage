@@ -14,6 +14,16 @@ Description=clagentic:triage — LLM-powered issue/PR triage watch service
 Documentation=https://github.com/clagentic/clagentic-triage
 After=network-online.target
 Wants=network-online.target
+# Bound systemd's restart loop. RestartSec=5 alone never trips the default
+# StartLimit (5 starts / 10s) since restarts are always spaced 5s apart, so
+# a permanent failure (e.g. User= resolving to a deleted account, status
+# 217/USER) restarts forever. With these bounds a persistent failure
+# exhausts its budget (6 starts within 5 minutes) and the unit lands in
+# `failed`, visible via `systemctl status`/`is-failed` instead of churning
+# the journal indefinitely. A single transient crash-and-recover, or even a
+# handful across an hour, stays well under the budget and is unaffected.
+StartLimitIntervalSec=300
+StartLimitBurst=6
 
 [Service]
 Type=simple
@@ -22,6 +32,36 @@ Group=@@RUN_GROUP@@
 WorkingDirectory=@@INSTALL_DIR@@
 EnvironmentFile=-@@ENV_FILE@@
 @@GITHUB_APP_PRIVATE_KEY_FILE_ENV_LINE@@
+# Runs as root for credential resolution only (the '!' prefix opts out of
+# ONLY the unit's User=/Group= for these exec lines — see systemd.service(5)
+# — unlike '+', which would also bypass the sandbox directives below
+# (NoNewPrivileges, ProtectSystem, ProtectHome, PrivateTmp)). '!' resolves
+# the account regardless of what User=/Group= itself will be, while still
+# running the check itself under the same hardening as the real service.
+# Belt-and-suspenders alongside install.sh's own preflight
+# (_provision_run_identity): this catches an account or group that existed
+# at install time but was later removed from the host, a drift window
+# install.sh cannot see since it only runs at install/update time, not on
+# every service start. Checks both RUN_USER and RUN_GROUP — a missing group
+# fails just as opaquely (status=216/GROUP) as a missing user
+# (status=217/USER), and only checking the user would let a removed group
+# bypass the guard entirely.
+#
+# Direct getent exec lines, no '/bin/sh -c' wrapper — a shell wrapper here
+# would interpolate @@RUN_USER@@/@@RUN_GROUP@@ into a root-privileged shell
+# command line. Both values are install-time config (see
+# deploy/.env.example), not attacker input, but a direct exec removes the
+# shell-interpolation surface entirely rather than relying on that
+# distinction. getent's own non-zero exit still fails the start (bounded by
+# StartLimitIntervalSec/StartLimitBurst above); the actionable "why" lives
+# in install.sh's preflight message and the journal context around this
+# unit, not in a custom string built by a shell wrapper here. @@GETENT_BIN@@
+# is resolved by install.sh at render time via `command -v getent` (not
+# hardcoded here — its absolute path is not guaranteed to be /usr/bin on
+# every distro); ExecStartPre requires an absolute path since it does not
+# consult PATH.
+ExecStartPre=!@@GETENT_BIN@@ passwd @@RUN_USER@@
+ExecStartPre=!@@GETENT_BIN@@ group @@RUN_GROUP@@
 ExecStart=@@RUN_WRAPPER_PATH@@
 Restart=on-failure
 RestartSec=5
