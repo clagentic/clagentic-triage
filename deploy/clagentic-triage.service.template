@@ -14,6 +14,16 @@ Description=clagentic:triage — LLM-powered issue/PR triage watch service
 Documentation=https://github.com/clagentic/clagentic-triage
 After=network-online.target
 Wants=network-online.target
+# Bound systemd's restart loop. RestartSec=5 alone never trips the default
+# StartLimit (5 starts / 10s) since restarts are always spaced 5s apart, so
+# a permanent failure (e.g. User= resolving to a deleted account, status
+# 217/USER) restarts forever. With these bounds a persistent failure
+# exhausts its budget (6 starts within 5 minutes) and the unit lands in
+# `failed`, visible via `systemctl status`/`is-failed` instead of churning
+# the journal indefinitely. A single transient crash-and-recover, or even a
+# handful across an hour, stays well under the budget and is unaffected.
+StartLimitIntervalSec=300
+StartLimitBurst=6
 
 [Service]
 Type=simple
@@ -22,6 +32,16 @@ Group=@@RUN_GROUP@@
 WorkingDirectory=@@INSTALL_DIR@@
 EnvironmentFile=-@@ENV_FILE@@
 @@GITHUB_APP_PRIVATE_KEY_FILE_ENV_LINE@@
+# Runs as root (the '+' prefix opts out of the unit's User=/Group=/hardening
+# directives for this one exec line only — see systemd.service(5)) so it can
+# resolve the account regardless of what User= itself will be. Belt-and-
+# suspenders alongside install.sh's own preflight (_provision_run_identity):
+# this catches an account that existed at install time but was later
+# removed from the host, a drift window install.sh cannot see since it only
+# runs at install/update time, not on every service start. Fails fast with
+# a clear systemd log line instead of entering ExecStart and failing
+# opaquely with status=217/USER.
+ExecStartPre=+/bin/sh -c 'getent passwd "@@RUN_USER@@" >/dev/null || { echo "clagentic-triage: RUN_USER=@@RUN_USER@@ does not exist on this host; re-run deploy/install.sh or create the account" >&2; exit 1; }'
 ExecStart=@@RUN_WRAPPER_PATH@@
 Restart=on-failure
 RestartSec=5

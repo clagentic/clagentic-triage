@@ -96,6 +96,15 @@ _log() {
 # On any host where creation is not permitted (non-root, useradd/groupadd
 # unavailable), fails loudly with an actionable message instead of writing
 # a unit that can never start — never a silent no-op.
+#
+# Called from Step 3 below (search "_provision_run_identity" in this file)
+# strictly before the unit is rendered/enabled/restarted, so install.sh
+# never enables a unit whose User= does not resolve. This does not cover
+# drift between install runs — an account removed from the host after a
+# successful install without a subsequent re-install — which is what the
+# rendered unit's own ExecStartPre identity guard and
+# StartLimitIntervalSec/StartLimitBurst bounds are for (see
+# deploy/clagentic-triage.service.template).
 # ---------------------------------------------------------------------------
 _provision_run_identity() {
     if [ "${SKIP_USER_PROVISION}" = "1" ]; then
