@@ -143,15 +143,28 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     const unitContents = readFileSync(unitPath, 'utf8');
 
     // Bound must be a finite window and a finite count — not commented out,
-    // not left as a placeholder.
+    // not left as a placeholder. Burst=0 would disable the limit entirely
+    // (systemd treats a zero burst as "no limit"), reopening the infinite
+    // restart loop this suite exists to catch, so assert it's strictly
+    // positive rather than just numeric.
     assert.match(unitContents, /^StartLimitIntervalSec=\d+$/m);
-    assert.match(unitContents, /^StartLimitBurst=\d+$/m);
+    const burstLineMatch = unitContents.match(/^StartLimitBurst=(\d+)$/m);
+    assert.ok(burstLineMatch, 'expected a StartLimitBurst= line in the rendered unit');
+    assert.ok(
+      Number(burstLineMatch[1]) > 0,
+      `StartLimitBurst must be > 0 (got ${burstLineMatch[1]}) — a zero burst disables the start limit entirely`,
+    );
 
     // Directives belong in [Unit], not [Service] — systemd ignores
-    // StartLimit* silently if placed in the wrong section.
-    const unitSection = unitContents.split(/^\[Service\]/m)[0];
-    assert.match(unitSection, /StartLimitIntervalSec=\d+/, 'StartLimitIntervalSec must be in [Unit]');
-    assert.match(unitSection, /StartLimitBurst=\d+/, 'StartLimitBurst must be in [Unit]');
+    // StartLimit* silently if placed in the wrong section. Extract the
+    // [Unit] section strictly (between the [Unit] header and the next
+    // section header) rather than "everything before [Service]", so this
+    // still catches a future reorder that puts [Service] ahead of [Unit].
+    const sectionMatch = unitContents.match(/^\[Unit\]\n([\s\S]*?)(?=^\[\w+\]|\Z)/m);
+    assert.ok(sectionMatch, 'expected a [Unit] section in the rendered unit');
+    const unitSection = sectionMatch[1];
+    assert.match(unitSection, /^StartLimitIntervalSec=\d+$/m, 'StartLimitIntervalSec must be in [Unit]');
+    assert.match(unitSection, /^StartLimitBurst=\d+$/m, 'StartLimitBurst must be in [Unit]');
 
     // RestartSec must stay well under the interval, or the burst count
     // would never be reachable within the window at all.
