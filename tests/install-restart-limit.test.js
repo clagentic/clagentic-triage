@@ -181,7 +181,7 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     );
   });
 
-  it('renders an ExecStartPre identity guard referencing the configured RUN_USER', () => {
+  it('renders an ExecStartPre identity guard referencing the configured RUN_USER and RUN_GROUP', () => {
     const caseDir = join(workDir, 'execstartpre');
     const installDir = join(caseDir, 'opt', 'clagentic-triage');
     const unitDir = join(caseDir, 'systemd');
@@ -215,11 +215,22 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     // unit's own User=, since its job is to check whether that account
     // exists at all.
     assert.match(execStartPreLine, /^ExecStartPre=\+/);
-    assert.ok(
-      execStartPreLine.includes('clagentic-triage-test'),
-      `expected the rendered RUN_USER in the identity guard, got: ${execStartPreLine}`,
+    // Both checks must be present and independent — a group-only or
+    // user-only guard would let the other identity's removal bypass it
+    // entirely (missing user -> status=217/USER, missing group ->
+    // status=216/GROUP).
+    assert.match(
+      execStartPreLine,
+      /getent passwd "clagentic-triage-test"/,
+      `expected a getent passwd check for RUN_USER in the identity guard, got: ${execStartPreLine}`,
+    );
+    assert.match(
+      execStartPreLine,
+      /getent group "clagentic-triage-test"/,
+      `expected a getent group check for RUN_GROUP in the identity guard, got: ${execStartPreLine}`,
     );
     assert.ok(!unitContents.includes('@@RUN_USER@@'), 'placeholder token must not survive rendering');
+    assert.ok(!unitContents.includes('@@RUN_GROUP@@'), 'placeholder token must not survive rendering');
 
     // ExecStartPre must precede ExecStart so the guard actually gates the
     // real start attempt.
@@ -277,6 +288,63 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
 
     assert.notEqual(guardResult.status, 0, 'guard must fail when the account does not exist');
     assert.match(guardResult.stderr, /clagentic-triage-test.*does not exist/i);
+    assert.match(guardResult.stderr, /install\.sh/);
+  });
+
+  it('the ExecStartPre guard also fails fast with an actionable message when the group is missing', () => {
+    // Same failure class as the missing-user case (status=217/USER) but for
+    // the group: a RUN_GROUP removed from the host after install would
+    // otherwise bypass a user-only guard and surface as an opaque
+    // status=216/GROUP instead. The `getent` stub here reports the user
+    // present but the group absent, so this only passes if the guard
+    // genuinely checks the group independently of the user.
+    const caseDir = join(workDir, 'execstartpre-group-runtime');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir } = makeFakeSystem(caseDir);
+
+    const result = runInstall(
+      {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+      },
+      binDir,
+    );
+    assert.equal(result.status, 0, `install.sh failed: ${result.stderr}\n${result.stdout}`);
+
+    const unitPath = join(unitDir, 'clagentic-triage.service');
+    const unitContents = readFileSync(unitPath, 'utf8');
+    const execStartPreLine = unitContents.split('\n').find((l) => l.startsWith('ExecStartPre='));
+    const rawCmd = execStartPreLine.replace(/^ExecStartPre=\+?/, '');
+
+    // Simulate the group being absent while the user still resolves: a
+    // `getent` stub that succeeds for `passwd` lookups but reports "not
+    // found" (exit 2, matching real getent) for `group` lookups.
+    const missingGroupBin = join(caseDir, 'missing-group-bin');
+    mkdirSync(missingGroupBin, { recursive: true });
+    writeFileSync(
+      join(missingGroupBin, 'getent'),
+      '#!/usr/bin/env bash\ncase "$1" in\n  passwd) exit 0 ;;\n  group) exit 2 ;;\nesac\n',
+    );
+    chmodSync(join(missingGroupBin, 'getent'), 0o755);
+
+    const guardResult = spawnSync('sh', ['-c', rawCmd], {
+      env: { ...process.env, PATH: `${missingGroupBin}:${process.env.PATH}` },
+      encoding: 'utf8',
+    });
+
+    assert.notEqual(guardResult.status, 0, 'guard must fail when the group does not exist');
+    assert.match(guardResult.stderr, /clagentic-triage-test.*does not exist/i);
+    assert.match(guardResult.stderr, /group/i);
     assert.match(guardResult.stderr, /install\.sh/);
   });
 });
