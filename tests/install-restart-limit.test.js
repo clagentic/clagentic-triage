@@ -36,6 +36,30 @@ const INSTALL_SH = join(REPO_ROOT, 'deploy', 'install.sh');
 const REAL_SERVICE_TEMPLATE = join(REPO_ROOT, 'deploy', 'clagentic-triage.service.template');
 const REAL_RUN_TEMPLATE = join(REPO_ROOT, 'deploy', 'clagentic-triage-run.template');
 
+// Resolved once against the REAL (test-runner) PATH, not a test case's
+// closed fake PATH. `spawnSync('bash', ...)` resolves its executable
+// against the CHILD env's PATH (Node looks it up itself, it does not
+// inherit the parent's resolution) — so a test that hands install.sh a
+// closed PATH lacking `bash` never launches install.sh at all; it fails
+// on ENOENT before install.sh's own logic runs a single line, and a bare
+// `assert.notEqual(status, 0)` then passes for the wrong reason. Any test
+// case that intentionally omits a tool (e.g. the getent-missing negative
+// path below) must still put `bash` itself on the child's PATH via this
+// absolute path, so a non-zero exit only ever means install.sh actually
+// ran and failed on the condition under test.
+function resolveBashBin() {
+  const result = spawnSync('command', ['-v', 'bash'], {
+    shell: '/bin/sh',
+    encoding: 'utf8',
+  });
+  const resolved = (result.stdout || '').trim();
+  if (result.status !== 0 || !resolved) {
+    throw new Error('could not resolve an absolute path to bash via the test runner PATH');
+  }
+  return resolved;
+}
+const BASH_BIN = resolveBashBin();
+
 function makeFakeSystem(dir) {
   const binDir = join(dir, 'bin');
   mkdirSync(binDir, { recursive: true });
@@ -58,12 +82,17 @@ function makeFakeSystem(dir) {
   // tests can assert install.sh's call sequence, e.g. that reset-failed
   // runs before enable/restart. is-active always succeeds so the post-
   // restart poll loop in install.sh doesn't block on a real service.
-  // is-failed defaults to failure (exit 1 = "not failed"), matching a
-  // fresh/not-loaded unit; individual tests override this stub when they
-  // need to simulate a unit that IS in failed state.
+  // `show -p LoadState --value` defaults to "not-found" (the real
+  // systemctl's own value for a unit it has never heard of), matching a
+  // fresh host; individual tests override this stub when they need to
+  // simulate a loaded unit (active or failed).
   write('systemctl', `
 echo "$*" >> "${join(dir, 'systemctl-calls.log')}"
-case "$1" in is-active) exit 0 ;; is-failed) exit 1 ;; *) exit 0 ;; esac
+case "$1" in
+  is-active) exit 0 ;;
+  show) echo "not-found" ;;
+  *) exit 0 ;;
+esac
 `);
   write('git', `
 sub="$1"; shift
@@ -129,7 +158,7 @@ function runInstall(env, extraPath) {
     ...env,
     PATH: `${extraPath}:${process.env.PATH}`,
   };
-  return spawnSync('bash', [INSTALL_SH], { env: fullEnv, encoding: 'utf8' });
+  return spawnSync(BASH_BIN, [INSTALL_SH], { env: fullEnv, encoding: 'utf8' });
 }
 
 describe('extractUnitSectionByHeaderSplit — [Unit]-section extraction helper', () => {
@@ -245,14 +274,37 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     );
   });
 
-  it('skips systemctl reset-failed on a fresh host where the unit is not in failed state', () => {
-    // daemon-reload does NOT eagerly load a unit, so a fresh host's unit is
-    // neither loaded nor failed. `systemctl reset-failed` on a not-loaded
+  // Builds a systemctl stub reporting the given LoadState (e.g.
+  // "not-found", "loaded") for `show -p LoadState --value`, and optionally
+  // fails reset-failed with a distinctive stderr message. Every call is
+  // logged to systemctl-calls.log so tests can assert install.sh's call
+  // sequence.
+  function writeLoadStateSystemctlStub(binDir, caseDir, loadState, resetFailedFails) {
+    const resetFailedCase = resetFailedFails
+      ? '  reset-failed) echo "Failed to reset failed state: unit-test-simulated-dbus-error" >&2; exit 1 ;;\n'
+      : '';
+    writeFileSync(
+      join(binDir, 'systemctl'),
+      `#!/usr/bin/env bash\n`
+        + `echo "$*" >> "${join(caseDir, 'systemctl-calls.log')}"\n`
+        + `case "$1" in\n`
+        + `  is-active) exit 0 ;;\n`
+        + `  show) echo "${loadState}" ;;\n`
+        + resetFailedCase
+        + `  *) exit 0 ;;\n`
+        + `esac\n`,
+    );
+    chmodSync(join(binDir, 'systemctl'), 0o755);
+  }
+
+  it('skips systemctl reset-failed on a fresh host where the unit is not loaded', () => {
+    // daemon-reload does NOT eagerly load a unit, so a fresh host's unit
+    // has LoadState=not-found. `systemctl reset-failed` on a not-loaded
     // unit errors against real systemctl, so install.sh must gate the call
-    // on `systemctl is-failed` and skip it entirely here rather than
-    // running it unconditionally (which would abort a fresh install under
-    // `set -e`). The shared systemctl stub's is-failed defaults to exit 1
-    // ("not failed"), matching this case.
+    // on LoadState and skip it entirely here rather than running it
+    // unconditionally (which would abort a fresh install under `set -e`).
+    // The shared systemctl stub's `show -p LoadState` defaults to
+    // "not-found", matching this case.
     const caseDir = join(workDir, 'reset-failed-skip-fresh-host');
     const installDir = join(caseDir, 'opt', 'clagentic-triage');
     const unitDir = join(caseDir, 'systemd');
@@ -281,24 +333,25 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     assert.ok(existsSync(callsLogPath), 'expected the systemctl stub to have logged calls');
     const calls = readFileSync(callsLogPath, 'utf8').trim().split('\n');
 
-    const isFailedIdx = calls.findIndex((c) => c.startsWith('is-failed'));
+    const showIdx = calls.findIndex((c) => c.startsWith('show'));
     const resetFailedIdx = calls.findIndex((c) => c.startsWith('reset-failed'));
     const enableIdx = calls.findIndex((c) => c.startsWith('enable'));
     const restartIdx = calls.findIndex((c) => c.startsWith('restart'));
 
-    assert.ok(isFailedIdx >= 0, `expected install.sh to check 'systemctl is-failed', got calls: ${calls.join(' | ')}`);
-    assert.equal(resetFailedIdx, -1, `reset-failed must not run when the unit is not failed, got calls: ${calls.join(' | ')}`);
+    assert.ok(showIdx >= 0, `expected install.sh to check 'systemctl show -p LoadState', got calls: ${calls.join(' | ')}`);
+    assert.equal(resetFailedIdx, -1, `reset-failed must not run when the unit is not loaded, got calls: ${calls.join(' | ')}`);
     assert.ok(enableIdx >= 0, `expected a 'systemctl enable' call, got calls: ${calls.join(' | ')}`);
     assert.ok(restartIdx >= 0, `expected a 'systemctl restart' call, got calls: ${calls.join(' | ')}`);
   });
 
-  it('clears a tripped start-limit via systemctl reset-failed before enable/restart', () => {
+  it('clears a tripped start-limit via systemctl reset-failed before enable/restart when the unit is loaded and failed', () => {
     // Once StartLimitBurst (asserted above) trips on a persistent failure,
-    // the unit lands in `failed` and the trip is sticky: a later `systemctl
-    // restart`, even after the host is repaired, is refused with "start
-    // request repeated too quickly" until something clears it. install.sh
-    // must run `systemctl reset-failed` itself so a post-merge install
-    // recovers a previously-tripped unit without a manual operator step.
+    // the unit lands in `failed` (LoadState stays "loaded") and the trip is
+    // sticky: a later `systemctl restart`, even after the host is
+    // repaired, is refused with "start request repeated too quickly" until
+    // something clears it. install.sh must run `systemctl reset-failed`
+    // itself so a post-merge install recovers a previously-tripped unit
+    // without a manual operator step.
     const caseDir = join(workDir, 'reset-failed');
     const installDir = join(caseDir, 'opt', 'clagentic-triage');
     const unitDir = join(caseDir, 'systemd');
@@ -307,13 +360,7 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     seedInstallDir(installDir);
 
     const { binDir } = makeFakeSystem(caseDir);
-    // Override the shared systemctl stub so is-failed reports the unit AS
-    // failed (exit 0), simulating a previously-tripped StartLimitBurst.
-    writeFileSync(
-      join(binDir, 'systemctl'),
-      `#!/usr/bin/env bash\necho "$*" >> "${join(caseDir, 'systemctl-calls.log')}"\ncase "$1" in\n  is-active) exit 0 ;;\n  is-failed) exit 0 ;;\n  *) exit 0 ;;\nesac\n`,
-    );
-    chmodSync(join(binDir, 'systemctl'), 0o755);
+    writeLoadStateSystemctlStub(binDir, caseDir, 'loaded', false);
 
     const result = runInstall(
       {
@@ -347,8 +394,56 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     );
   });
 
-  it('fails loudly when systemctl reset-failed fails on a unit that IS in failed state', () => {
-    // When the unit is failed, reset-failed always has a real target — a
+  it('clears the start-rate counter via systemctl reset-failed when the unit is loaded and still active', () => {
+    // Gating on `systemctl is-failed` alone misses this case: systemd's
+    // start-rate counter (what StartLimitBurst tracks) is attached to a
+    // unit for as long as it stays LOADED, not only once it has landed in
+    // `failed`. A unit that is loaded and currently active/auto-restarting
+    // when this install runs can still be carrying counted starts from a
+    // recent restart burst, and this install's own restart could push it
+    // over StartLimitBurst with nothing here to clear it first. Gating on
+    // LoadState=loaded (regardless of ActiveState) covers this window;
+    // gating on is-failed alone would not.
+    const caseDir = join(workDir, 'reset-failed-loaded-active');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir } = makeFakeSystem(caseDir);
+    writeLoadStateSystemctlStub(binDir, caseDir, 'loaded', false);
+
+    const result = runInstall(
+      {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+      },
+      binDir,
+    );
+
+    assert.equal(result.status, 0, `install.sh failed: ${result.stderr}\n${result.stdout}`);
+
+    const callsLogPath = join(caseDir, 'systemctl-calls.log');
+    const calls = readFileSync(callsLogPath, 'utf8').trim().split('\n');
+    const resetFailedIdx = calls.findIndex((c) => c.startsWith('reset-failed'));
+    const enableIdx = calls.findIndex((c) => c.startsWith('enable'));
+    const restartIdx = calls.findIndex((c) => c.startsWith('restart'));
+
+    assert.ok(resetFailedIdx >= 0, `expected a 'systemctl reset-failed' call for a loaded-but-active unit, got calls: ${calls.join(' | ')}`);
+    assert.ok(
+      resetFailedIdx < enableIdx && resetFailedIdx < restartIdx,
+      `reset-failed must run before enable/restart, got order: ${calls.join(' | ')}`,
+    );
+  });
+
+  it('fails loudly when systemctl reset-failed fails on a unit that IS loaded', () => {
+    // When the unit is loaded, reset-failed always has a real target — a
     // non-zero exit here means something genuinely wrong (e.g. systemd/
     // dbus unreachable), not "nothing to reset". install.sh runs under
     // `set -e` with no `|| true` on this call, so a failing reset-failed
@@ -362,14 +457,7 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     seedInstallDir(installDir);
 
     const { binDir } = makeFakeSystem(caseDir);
-    // Override the shared systemctl stub so is-failed reports the unit as
-    // failed, and reset-failed itself fails with a distinctive stderr
-    // message, simulating systemd/dbus being unreachable.
-    writeFileSync(
-      join(binDir, 'systemctl'),
-      `#!/usr/bin/env bash\necho "$*" >> "${join(caseDir, 'systemctl-calls.log')}"\ncase "$1" in\n  is-active) exit 0 ;;\n  is-failed) exit 0 ;;\n  reset-failed) echo "Failed to reset failed state: unit-test-simulated-dbus-error" >&2; exit 1 ;;\n  *) exit 0 ;;\nesac\n`,
-    );
-    chmodSync(join(binDir, 'systemctl'), 0o755);
+    writeLoadStateSystemctlStub(binDir, caseDir, 'loaded', true);
 
     const result = runInstall(
       {
@@ -489,7 +577,13 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
       cpSync(join(binDir, name), join(noGetentDir, name));
       chmodSync(join(noGetentDir, name), 0o755);
     }
-    const negativeResult = spawnSync('bash', [INSTALL_SH], {
+    // spawnSync('bash', ...) resolves its OWN executable against this call's
+    // env.PATH, not the parent process's — a closed PATH lacking bash would
+    // fail on ENOENT before install.sh ever runs a line, and the assertions
+    // below would then pass for the wrong reason (see BASH_BIN's comment
+    // above). Invoke bash by its resolved absolute path directly so only
+    // `getent` is missing from the child's PATH, not bash itself.
+    const negativeResult = spawnSync(BASH_BIN, [INSTALL_SH], {
       env: {
         CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
         CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
@@ -504,6 +598,15 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
       encoding: 'utf8',
     });
     assert.notEqual(negativeResult.status, 0, 'install.sh must fail when getent is not on PATH');
+    // Assert install.sh actually ran and failed specifically on the
+    // getent-missing condition, not merely that some process somewhere
+    // exited non-zero (e.g. bash itself failing to spawn would also be
+    // non-zero and would defeat this test silently).
+    assert.match(
+      negativeResult.stderr,
+      /'getent' is not available on PATH/,
+      `expected install.sh's own getent-missing FATAL message, got stderr: ${negativeResult.stderr}`,
+    );
     assert.ok(!existsSync(join(unitDir, 'clagentic-triage.service')), 'no unit should be rendered without getent');
 
     // Positive path: getent present (via makeFakeSystem's stub).
@@ -525,6 +628,53 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
       unitContents.includes(`ExecStartPre=+${join(binDir, 'getent')} passwd`),
       'rendered ExecStartPre must use the getent path resolved from PATH',
     );
+  });
+
+  it('fails loudly when the resolved GETENT_BIN is not an absolute path', () => {
+    // ExecStartPre= in the unit template requires an absolute path — it
+    // does not consult PATH at all. `command -v` only ever returns an
+    // absolute path for a normal PATH-resolved binary, but a PATH entry
+    // that is itself relative (e.g. a bare "." ahead of the real getent
+    // directory) can make it resolve to a relative one instead. Simulate
+    // that by putting a same-named `getent` at the case dir's own root and
+    // pointing PATH at "." (relative), so `command -v getent` resolves to
+    // the relative string "./getent" rather than an absolute path.
+    const caseDir = join(workDir, 'getent-bin-non-absolute');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir } = makeFakeSystem(caseDir);
+    writeFileSync(join(caseDir, 'getent'), '#!/usr/bin/env bash\nexit 0\n');
+    chmodSync(join(caseDir, 'getent'), 0o755);
+
+    const result = spawnSync(BASH_BIN, [INSTALL_SH], {
+      cwd: caseDir,
+      env: {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+        HOME: caseDir,
+        // "." resolves getent to the relative "./getent"; binDir supplies
+        // every other required tool via its absolute path.
+        PATH: `.:${binDir}`,
+      },
+      encoding: 'utf8',
+    });
+
+    assert.notEqual(result.status, 0, 'install.sh must fail when GETENT_BIN does not resolve to an absolute path');
+    assert.match(
+      result.stderr,
+      /resolved getent path .* is not absolute/,
+      `expected install.sh's own non-absolute-path FATAL message, got stderr: ${result.stderr}`,
+    );
+    assert.ok(!existsSync(join(unitDir, 'clagentic-triage.service')), 'no unit should be rendered with a non-absolute GETENT_BIN');
   });
 
   it('the ExecStartPre getent-passwd guard fails when RUN_USER does not resolve', () => {

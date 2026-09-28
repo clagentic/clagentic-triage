@@ -84,6 +84,20 @@ if [ -z "${GETENT_BIN}" ]; then
     echo "[clagentic-triage-install] The rendered unit's ExecStartPre identity guard requires it." >&2
     exit 1
 fi
+# ExecStartPre= in the unit template requires an absolute path (it does not
+# consult PATH at all), so a relative resolution from `command -v` (e.g. a
+# PATH entry like "." or a shell-function/alias substitute is never expected
+# here, but a non-absolute PATH entry is a real misconfiguration systemd
+# would silently fail on) must be caught here at render time, not left to
+# surface as an opaque unit-start failure later.
+case "${GETENT_BIN}" in
+    /*) ;;
+    *)
+        echo "[clagentic-triage-install] FATAL: resolved getent path '${GETENT_BIN}' is not absolute." >&2
+        echo "[clagentic-triage-install] Check for a non-absolute PATH entry ahead of the real getent binary." >&2
+        exit 1
+        ;;
+esac
 FORCE="${CLAGENTIC_TRIAGE_FORCE_UPDATE:-0}"
 SKIP_NPM_CI="${CLAGENTIC_TRIAGE_SKIP_NPM_CI:-0}"
 SKIP_SYSTEMD="${CLAGENTIC_TRIAGE_SKIP_SYSTEMD:-0}"
@@ -356,20 +370,28 @@ else
     # `systemctl restart` refused with "start request repeated too
     # quickly", because the trip is sticky until reset-failed clears it.
     #
-    # Gated on `systemctl is-failed`, not run unconditionally: daemon-reload
-    # (just above) does NOT eagerly load a unit, so on a fresh host the unit
-    # is not loaded yet and `systemctl reset-failed` on a not-loaded unit
-    # errors — running it unconditionally would abort a fresh install under
-    # `set -e`. Only a unit that is actually in `failed` state needs
-    # clearing. When it IS failed, reset-failed always has a real target, so
-    # a non-zero exit there is a genuine problem (e.g. systemd/dbus
+    # Gated on LoadState, not `systemctl is-failed`: is-failed only reports
+    # true for a unit currently sitting in `failed` state, but systemd's
+    # start-rate counter (the thing StartLimitBurst actually tracks) is
+    # attached to the unit for as long as it stays LOADED — including while
+    # it is `active` or mid-Restart=-driven retry, not only once it has
+    # fully landed in `failed`. Gating on is-failed alone misses that
+    # window: a unit that is still active/restarting when this install runs
+    # can trip its OWN start-rate counter on the very next restart this
+    # install triggers, with nothing here to clear it first. LoadState
+    # covers every case reset-failed can legitimately act on. A unit that
+    # is not loaded (fresh host — daemon-reload just above does not eagerly
+    # load it) has nothing to reset, so reset-failed is skipped only then.
+    # When the unit IS loaded, reset-failed always has a real target, so a
+    # non-zero exit there is a genuine problem (e.g. systemd/dbus
     # unreachable) and must fail the install loudly with its stderr
     # visible, not be swallowed.
-    if systemctl is-failed --quiet "${SERVICE_NAME}" 2>/dev/null; then
-        _log "clearing tripped start-limit state for ${SERVICE_NAME}..."
+    _load_state="$(systemctl show -p LoadState --value "${SERVICE_NAME}" 2>/dev/null || true)"
+    if [ "${_load_state}" = "loaded" ]; then
+        _log "clearing any tripped start-limit state for ${SERVICE_NAME}..."
         systemctl reset-failed "${SERVICE_NAME}"
     else
-        _log "${SERVICE_NAME} is not in failed state; skipping reset-failed"
+        _log "${SERVICE_NAME} is not loaded (LoadState=${_load_state:-<none>}); skipping reset-failed"
     fi
 
     _log "enabling ${SERVICE_NAME}..."
