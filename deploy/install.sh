@@ -72,6 +72,18 @@ NODE_BIN="${CLAGENTIC_TRIAGE_NODE_BIN:-/usr/bin/node}"
 # override. Configurable per-host; unset by default (PAT or inline-env PEM
 # auth continue to work unchanged if this is not set).
 GITHUB_APP_PRIVATE_KEY_FILE="${CLAGENTIC_TRIAGE_GITHUB_APP_PRIVATE_KEY_FILE:-}"
+# getent's absolute path, resolved at render time rather than hardcoded in
+# the unit template: ExecStartPre= requires an absolute path since it does
+# not consult PATH, but that path is not guaranteed to be /usr/bin/getent
+# on every distro. Same command -v resolution this preflight already uses
+# for useradd/groupadd below; fails loudly if getent is not found rather
+# than rendering an ExecStartPre line that can never succeed.
+GETENT_BIN="$(command -v getent || true)"
+if [ -z "${GETENT_BIN}" ]; then
+    echo "[clagentic-triage-install] FATAL: 'getent' is not available on PATH." >&2
+    echo "[clagentic-triage-install] The rendered unit's ExecStartPre identity guard requires it." >&2
+    exit 1
+fi
 FORCE="${CLAGENTIC_TRIAGE_FORCE_UPDATE:-0}"
 SKIP_NPM_CI="${CLAGENTIC_TRIAGE_SKIP_NPM_CI:-0}"
 SKIP_SYSTEMD="${CLAGENTIC_TRIAGE_SKIP_SYSTEMD:-0}"
@@ -314,6 +326,7 @@ _render_template() {
         -e "s#@@ENV_FILE@@#${ENV_FILE}#g" \
         -e "s#@@RUN_WRAPPER_PATH@@#${RUN_WRAPPER_PATH}#g" \
         -e "s#@@NODE_BIN@@#${NODE_BIN}#g" \
+        -e "s#@@GETENT_BIN@@#${GETENT_BIN}#g" \
         -e "${_key_file_stage}" \
         "${_tmpl}" > "${_out}"
 }
@@ -343,15 +356,21 @@ else
     # `systemctl restart` refused with "start request repeated too
     # quickly", because the trip is sticky until reset-failed clears it.
     #
-    # Not tolerated: by this point daemon-reload has already run against
-    # the just-rendered unit, so the unit is guaranteed loaded and
-    # reset-failed always has a real target to act on (a no-op reset on an
-    # unloaded/non-failed unit exits 0 against real systemctl — that is
-    # the "nothing to reset" case, not a failure). A non-zero exit here is
-    # a genuine problem (e.g. systemd/dbus unreachable) and must fail the
-    # install loudly with its stderr visible, not be swallowed.
-    _log "clearing any tripped start-limit state for ${SERVICE_NAME}..."
-    systemctl reset-failed "${SERVICE_NAME}"
+    # Gated on `systemctl is-failed`, not run unconditionally: daemon-reload
+    # (just above) does NOT eagerly load a unit, so on a fresh host the unit
+    # is not loaded yet and `systemctl reset-failed` on a not-loaded unit
+    # errors — running it unconditionally would abort a fresh install under
+    # `set -e`. Only a unit that is actually in `failed` state needs
+    # clearing. When it IS failed, reset-failed always has a real target, so
+    # a non-zero exit there is a genuine problem (e.g. systemd/dbus
+    # unreachable) and must fail the install loudly with its stderr
+    # visible, not be swallowed.
+    if systemctl is-failed --quiet "${SERVICE_NAME}" 2>/dev/null; then
+        _log "clearing tripped start-limit state for ${SERVICE_NAME}..."
+        systemctl reset-failed "${SERVICE_NAME}"
+    else
+        _log "${SERVICE_NAME} is not in failed state; skipping reset-failed"
+    fi
 
     _log "enabling ${SERVICE_NAME}..."
     systemctl enable "${SERVICE_NAME}"

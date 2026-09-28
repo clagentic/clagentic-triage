@@ -58,9 +58,12 @@ function makeFakeSystem(dir) {
   // tests can assert install.sh's call sequence, e.g. that reset-failed
   // runs before enable/restart. is-active always succeeds so the post-
   // restart poll loop in install.sh doesn't block on a real service.
+  // is-failed defaults to failure (exit 1 = "not failed"), matching a
+  // fresh/not-loaded unit; individual tests override this stub when they
+  // need to simulate a unit that IS in failed state.
   write('systemctl', `
 echo "$*" >> "${join(dir, 'systemctl-calls.log')}"
-case "$1" in is-active) exit 0 ;; *) exit 0 ;; esac
+case "$1" in is-active) exit 0 ;; is-failed) exit 1 ;; *) exit 0 ;; esac
 `);
   write('git', `
 sub="$1"; shift
@@ -242,6 +245,53 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     );
   });
 
+  it('skips systemctl reset-failed on a fresh host where the unit is not in failed state', () => {
+    // daemon-reload does NOT eagerly load a unit, so a fresh host's unit is
+    // neither loaded nor failed. `systemctl reset-failed` on a not-loaded
+    // unit errors against real systemctl, so install.sh must gate the call
+    // on `systemctl is-failed` and skip it entirely here rather than
+    // running it unconditionally (which would abort a fresh install under
+    // `set -e`). The shared systemctl stub's is-failed defaults to exit 1
+    // ("not failed"), matching this case.
+    const caseDir = join(workDir, 'reset-failed-skip-fresh-host');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir } = makeFakeSystem(caseDir);
+
+    const result = runInstall(
+      {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+      },
+      binDir,
+    );
+
+    assert.equal(result.status, 0, `install.sh failed: ${result.stderr}\n${result.stdout}`);
+
+    const callsLogPath = join(caseDir, 'systemctl-calls.log');
+    assert.ok(existsSync(callsLogPath), 'expected the systemctl stub to have logged calls');
+    const calls = readFileSync(callsLogPath, 'utf8').trim().split('\n');
+
+    const isFailedIdx = calls.findIndex((c) => c.startsWith('is-failed'));
+    const resetFailedIdx = calls.findIndex((c) => c.startsWith('reset-failed'));
+    const enableIdx = calls.findIndex((c) => c.startsWith('enable'));
+    const restartIdx = calls.findIndex((c) => c.startsWith('restart'));
+
+    assert.ok(isFailedIdx >= 0, `expected install.sh to check 'systemctl is-failed', got calls: ${calls.join(' | ')}`);
+    assert.equal(resetFailedIdx, -1, `reset-failed must not run when the unit is not failed, got calls: ${calls.join(' | ')}`);
+    assert.ok(enableIdx >= 0, `expected a 'systemctl enable' call, got calls: ${calls.join(' | ')}`);
+    assert.ok(restartIdx >= 0, `expected a 'systemctl restart' call, got calls: ${calls.join(' | ')}`);
+  });
+
   it('clears a tripped start-limit via systemctl reset-failed before enable/restart', () => {
     // Once StartLimitBurst (asserted above) trips on a persistent failure,
     // the unit lands in `failed` and the trip is sticky: a later `systemctl
@@ -257,6 +307,13 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     seedInstallDir(installDir);
 
     const { binDir } = makeFakeSystem(caseDir);
+    // Override the shared systemctl stub so is-failed reports the unit AS
+    // failed (exit 0), simulating a previously-tripped StartLimitBurst.
+    writeFileSync(
+      join(binDir, 'systemctl'),
+      `#!/usr/bin/env bash\necho "$*" >> "${join(caseDir, 'systemctl-calls.log')}"\ncase "$1" in\n  is-active) exit 0 ;;\n  is-failed) exit 0 ;;\n  *) exit 0 ;;\nesac\n`,
+    );
+    chmodSync(join(binDir, 'systemctl'), 0o755);
 
     const result = runInstall(
       {
@@ -290,15 +347,13 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     );
   });
 
-  it('fails loudly when systemctl reset-failed fails (unit is guaranteed loaded by this point)', () => {
-    // By the time reset-failed runs, daemon-reload has already loaded the
-    // just-rendered unit, so reset-failed always has a real target — a
+  it('fails loudly when systemctl reset-failed fails on a unit that IS in failed state', () => {
+    // When the unit is failed, reset-failed always has a real target — a
     // non-zero exit here means something genuinely wrong (e.g. systemd/
     // dbus unreachable), not "nothing to reset". install.sh runs under
     // `set -e` with no `|| true` on this call, so a failing reset-failed
     // must abort the install with its stderr visible rather than being
-    // swallowed (reversing the earlier tolerate-it stance, which assumed
-    // a fresh-host "nothing loaded yet" case that cannot occur here).
+    // swallowed.
     const caseDir = join(workDir, 'reset-failed-fails-loud');
     const installDir = join(caseDir, 'opt', 'clagentic-triage');
     const unitDir = join(caseDir, 'systemd');
@@ -307,12 +362,12 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     seedInstallDir(installDir);
 
     const { binDir } = makeFakeSystem(caseDir);
-    // Override the shared systemctl stub so reset-failed specifically
-    // fails with a distinctive stderr message, simulating systemd/dbus
-    // being unreachable.
+    // Override the shared systemctl stub so is-failed reports the unit as
+    // failed, and reset-failed itself fails with a distinctive stderr
+    // message, simulating systemd/dbus being unreachable.
     writeFileSync(
       join(binDir, 'systemctl'),
-      `#!/usr/bin/env bash\necho "$*" >> "${join(caseDir, 'systemctl-calls.log')}"\ncase "$1" in\n  is-active) exit 0 ;;\n  reset-failed) echo "Failed to reset failed state: unit-test-simulated-dbus-error" >&2; exit 1 ;;\n  *) exit 0 ;;\nesac\n`,
+      `#!/usr/bin/env bash\necho "$*" >> "${join(caseDir, 'systemctl-calls.log')}"\ncase "$1" in\n  is-active) exit 0 ;;\n  is-failed) exit 0 ;;\n  reset-failed) echo "Failed to reset failed state: unit-test-simulated-dbus-error" >&2; exit 1 ;;\n  *) exit 0 ;;\nesac\n`,
     );
     chmodSync(join(binDir, 'systemctl'), 0o755);
 
@@ -349,6 +404,7 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     seedInstallDir(installDir);
 
     const { binDir } = makeFakeSystem(caseDir);
+    const expectedGetentBin = join(binDir, 'getent');
 
     const result = runInstall(
       {
@@ -385,20 +441,90 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     // user-only guard would let the other identity's removal bypass it
     // entirely (missing user -> status=217/USER, missing group ->
     // status=216/GROUP).
-    const passwdLine = execStartPreLines.find((l) => l.includes('getent passwd'));
-    const groupLine = execStartPreLines.find((l) => l.includes('getent group'));
+    const passwdLine = execStartPreLines.find((l) => l.includes('getent') && l.includes('passwd'));
+    const groupLine = execStartPreLines.find((l) => l.includes('getent') && l.includes('group'));
     assert.ok(passwdLine, `expected a getent passwd ExecStartPre line, got: ${execStartPreLines.join(' | ')}`);
     assert.ok(groupLine, `expected a getent group ExecStartPre line, got: ${execStartPreLines.join(' | ')}`);
-    assert.equal(passwdLine, 'ExecStartPre=+/usr/bin/getent passwd clagentic-triage-test');
-    assert.equal(groupLine, 'ExecStartPre=+/usr/bin/getent group clagentic-triage-test');
+    // GETENT_BIN is resolved by install.sh at render time via `command -v
+    // getent` against the fake PATH set up by makeFakeSystem, so the
+    // rendered path must equal that stub's path — not a hardcoded
+    // /usr/bin/getent.
+    assert.equal(passwdLine, `ExecStartPre=+${expectedGetentBin} passwd clagentic-triage-test`);
+    assert.equal(groupLine, `ExecStartPre=+${expectedGetentBin} group clagentic-triage-test`);
     assert.ok(!unitContents.includes('@@RUN_USER@@'), 'placeholder token must not survive rendering');
     assert.ok(!unitContents.includes('@@RUN_GROUP@@'), 'placeholder token must not survive rendering');
+    assert.ok(!unitContents.includes('@@GETENT_BIN@@'), 'placeholder token must not survive rendering');
 
     // Both ExecStartPre lines must precede ExecStart so the guard
     // actually gates the real start attempt.
     const execStartPreIdx = unitContents.indexOf('ExecStartPre=');
     const execStartIdx = unitContents.indexOf('ExecStart=');
     assert.ok(execStartPreIdx >= 0 && execStartIdx >= 0 && execStartPreIdx < execStartIdx);
+  });
+
+  it('resolves GETENT_BIN via command -v at render time and fails loudly when getent is unavailable', () => {
+    // install.sh must not hardcode getent's path — its absolute location
+    // is not guaranteed to be /usr/bin on every distro. This asserts the
+    // positive resolution path (the rendered path equals what `command -v
+    // getent` finds on PATH) and the negative path (no getent on PATH at
+    // all fails the install loudly, rather than rendering an ExecStartPre
+    // line that can never succeed).
+    const caseDir = join(workDir, 'getent-bin-resolution');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir } = makeFakeSystem(caseDir);
+
+    // Negative path first: a PATH with every fake tool except getent, and
+    // NOT the real system PATH appended (runInstall's helper always
+    // appends process.env.PATH, which would find the real system getent
+    // and defeat this case) — spawnSync is called directly here with an
+    // exact, closed PATH instead.
+    const noGetentDir = join(caseDir, 'no-getent-bin');
+    mkdirSync(noGetentDir, { recursive: true });
+    for (const name of ['id', 'useradd', 'groupadd', 'chown', 'systemctl', 'git', 'npm', 'flock']) {
+      cpSync(join(binDir, name), join(noGetentDir, name));
+      chmodSync(join(noGetentDir, name), 0o755);
+    }
+    const negativeResult = spawnSync('bash', [INSTALL_SH], {
+      env: {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+        HOME: caseDir,
+        PATH: noGetentDir,
+      },
+      encoding: 'utf8',
+    });
+    assert.notEqual(negativeResult.status, 0, 'install.sh must fail when getent is not on PATH');
+    assert.ok(!existsSync(join(unitDir, 'clagentic-triage.service')), 'no unit should be rendered without getent');
+
+    // Positive path: getent present (via makeFakeSystem's stub).
+    const positiveResult = runInstall(
+      {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+      },
+      binDir,
+    );
+    assert.equal(positiveResult.status, 0, `install.sh failed: ${positiveResult.stderr}\n${positiveResult.stdout}`);
+    const unitContents = readFileSync(join(unitDir, 'clagentic-triage.service'), 'utf8');
+    assert.ok(
+      unitContents.includes(`ExecStartPre=+${join(binDir, 'getent')} passwd`),
+      'rendered ExecStartPre must use the getent path resolved from PATH',
+    );
   });
 
   it('the ExecStartPre getent-passwd guard fails when RUN_USER does not resolve', () => {
@@ -434,15 +560,25 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
 
     const unitPath = join(unitDir, 'clagentic-triage.service');
     const unitContents = readFileSync(unitPath, 'utf8');
-    const passwdLine = unitContents.split('\n').find((l) => l.startsWith('ExecStartPre=') && l.includes('getent passwd'));
-    assert.ok(passwdLine, 'expected a getent passwd ExecStartPre line');
+    // Match on the resolved getent path PREFIX plus the trailing argv
+    // token, not a raw substring search — the resolved getent path lives
+    // under this test's own caseDir, so a plain l.includes('passwd')/
+    // l.includes('group') is vulnerable to a caseDir name that happens to
+    // contain that word (see the group-guard test below, whose caseDir
+    // name 'execstartpre-group-runtime' hit exactly this).
+    const resolvedGetentBin = join(binDir, 'getent');
+    const execStartPreLines = unitContents.split('\n').filter((l) => l.startsWith(`ExecStartPre=+${resolvedGetentBin} `));
+    const passwdLine = execStartPreLines.find((l) => l.slice(`ExecStartPre=+${resolvedGetentBin} `.length).split(' ')[0] === 'passwd');
+    assert.ok(passwdLine, `expected a getent passwd ExecStartPre line, got: ${execStartPreLines.join(' | ')}`);
     // Strip 'ExecStartPre=+' (systemd directive syntax) and the leading
-    // /usr/bin/getent path to get just the trailing argv ('passwd',
+    // resolved getent path to get just the trailing argv ('passwd',
     // RUN_USER) — the guard's own binary path is asserted separately
     // above; here a stubbed 'getent' on PATH stands in for it so the test
     // exercises the guard's actual passwd/RUN_USER argument pairing
-    // against a stub that reports the account absent.
-    const argv = passwdLine.replace(/^ExecStartPre=\+?\/usr\/bin\/getent /, '').split(' ');
+    // against a stub that reports the account absent. GETENT_BIN is
+    // resolved at render time (not hardcoded), so strip it dynamically
+    // rather than assuming a fixed path.
+    const argv = passwdLine.slice(`ExecStartPre=+${resolvedGetentBin} `.length).split(' ');
     assert.deepEqual(argv, ['passwd', 'clagentic-triage-test']);
 
     // Simulate the account being absent: a `getent` stub on PATH that
@@ -492,12 +628,21 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
 
     const unitPath = join(unitDir, 'clagentic-triage.service');
     const unitContents = readFileSync(unitPath, 'utf8');
-    const groupLine = unitContents.split('\n').find((l) => l.startsWith('ExecStartPre=') && l.includes('getent group'));
-    assert.ok(groupLine, 'expected a getent group ExecStartPre line');
-    // Strip 'ExecStartPre=+' and the leading /usr/bin/getent path to get
+    // Match on the resolved getent path PREFIX plus the trailing argv
+    // token ('group' or 'passwd'), not a raw substring search — the
+    // resolved getent path lives under this test's own caseDir
+    // ('execstartpre-group-runtime'), which itself contains the substring
+    // "group", so a plain l.includes('group') would false-match the
+    // passwd line too.
+    const resolvedGetentBin = join(binDir, 'getent');
+    const execStartPreLines = unitContents.split('\n').filter((l) => l.startsWith(`ExecStartPre=+${resolvedGetentBin} `));
+    const groupLine = execStartPreLines.find((l) => l.slice(`ExecStartPre=+${resolvedGetentBin} `.length).split(' ')[0] === 'group');
+    assert.ok(groupLine, `expected a getent group ExecStartPre line, got: ${execStartPreLines.join(' | ')}`);
+    // Strip 'ExecStartPre=+' and the leading resolved getent path to get
     // just the trailing argv ('group', RUN_GROUP) — see the passwd-guard
-    // test above for why the binary path itself isn't re-asserted here.
-    const argv = groupLine.replace(/^ExecStartPre=\+?\/usr\/bin\/getent /, '').split(' ');
+    // test above for why the binary path itself isn't re-asserted here, and
+    // why it's stripped dynamically rather than assuming a fixed path.
+    const argv = groupLine.slice(`ExecStartPre=+${resolvedGetentBin} `.length).split(' ');
     assert.deepEqual(argv, ['group', 'clagentic-triage-test']);
 
     // Simulate the group being absent: a `getent` stub that always

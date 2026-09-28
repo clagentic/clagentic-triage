@@ -52,11 +52,13 @@ EnvironmentFile=-@@ENV_FILE@@
 # distinction. getent's own non-zero exit still fails the start (bounded by
 # StartLimitIntervalSec/StartLimitBurst above); the actionable "why" lives
 # in install.sh's preflight message and the journal context around this
-# unit, not in a custom string built by a shell wrapper here. /usr/bin is
-# getent's standard location on a systemd host (glibc's getent package);
-# ExecStartPre requires an absolute path since it does not consult PATH.
-ExecStartPre=+/usr/bin/getent passwd @@RUN_USER@@
-ExecStartPre=+/usr/bin/getent group @@RUN_GROUP@@
+# unit, not in a custom string built by a shell wrapper here. @@GETENT_BIN@@
+# is resolved by install.sh at render time via `command -v getent` (not
+# hardcoded here — its absolute path is not guaranteed to be /usr/bin on
+# every distro); ExecStartPre requires an absolute path since it does not
+# consult PATH.
+ExecStartPre=+@@GETENT_BIN@@ passwd @@RUN_USER@@
+ExecStartPre=+@@GETENT_BIN@@ group @@RUN_GROUP@@
 ExecStart=@@RUN_WRAPPER_PATH@@
 Restart=on-failure
 RestartSec=5
