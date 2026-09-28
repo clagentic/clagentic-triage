@@ -342,11 +342,16 @@ else
     # later install.sh run — even after the host is repaired — has its
     # `systemctl restart` refused with "start request repeated too
     # quickly", because the trip is sticky until reset-failed clears it.
-    # Tolerate a unit that is not yet loaded (fresh host, nothing to
-    # reset) or not currently failed — reset-failed is a no-op in both
-    # cases, so failure here is never fatal to the install.
+    #
+    # Not tolerated: by this point daemon-reload has already run against
+    # the just-rendered unit, so the unit is guaranteed loaded and
+    # reset-failed always has a real target to act on (a no-op reset on an
+    # unloaded/non-failed unit exits 0 against real systemctl — that is
+    # the "nothing to reset" case, not a failure). A non-zero exit here is
+    # a genuine problem (e.g. systemd/dbus unreachable) and must fail the
+    # install loudly with its stderr visible, not be swallowed.
     _log "clearing any tripped start-limit state for ${SERVICE_NAME}..."
-    systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl reset-failed "${SERVICE_NAME}"
 
     _log "enabling ${SERVICE_NAME}..."
     systemctl enable "${SERVICE_NAME}"

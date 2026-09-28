@@ -290,13 +290,16 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     );
   });
 
-  it('tolerates systemctl reset-failed reporting a non-loaded/non-failed unit (fresh host, first install)', () => {
-    // On a fresh host reset-failed has nothing to reset — real systemctl
-    // exits non-zero in that case ("Unit ... not loaded" / no matching
-    // units). install.sh runs under `set -e`, so this only passes if
-    // install.sh explicitly tolerates that failure (e.g. `|| true`)
-    // instead of letting it abort the whole install.
-    const caseDir = join(workDir, 'reset-failed-tolerant');
+  it('fails loudly when systemctl reset-failed fails (unit is guaranteed loaded by this point)', () => {
+    // By the time reset-failed runs, daemon-reload has already loaded the
+    // just-rendered unit, so reset-failed always has a real target — a
+    // non-zero exit here means something genuinely wrong (e.g. systemd/
+    // dbus unreachable), not "nothing to reset". install.sh runs under
+    // `set -e` with no `|| true` on this call, so a failing reset-failed
+    // must abort the install with its stderr visible rather than being
+    // swallowed (reversing the earlier tolerate-it stance, which assumed
+    // a fresh-host "nothing loaded yet" case that cannot occur here).
+    const caseDir = join(workDir, 'reset-failed-fails-loud');
     const installDir = join(caseDir, 'opt', 'clagentic-triage');
     const unitDir = join(caseDir, 'systemd');
     mkdirSync(installDir, { recursive: true });
@@ -305,11 +308,11 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
 
     const { binDir } = makeFakeSystem(caseDir);
     // Override the shared systemctl stub so reset-failed specifically
-    // fails, matching real systemctl's behavior against a unit with
-    // nothing to reset.
+    // fails with a distinctive stderr message, simulating systemd/dbus
+    // being unreachable.
     writeFileSync(
       join(binDir, 'systemctl'),
-      `#!/usr/bin/env bash\necho "$*" >> "${join(caseDir, 'systemctl-calls.log')}"\ncase "$1" in\n  is-active) exit 0 ;;\n  reset-failed) exit 1 ;;\n  *) exit 0 ;;\nesac\n`,
+      `#!/usr/bin/env bash\necho "$*" >> "${join(caseDir, 'systemctl-calls.log')}"\ncase "$1" in\n  is-active) exit 0 ;;\n  reset-failed) echo "Failed to reset failed state: unit-test-simulated-dbus-error" >&2; exit 1 ;;\n  *) exit 0 ;;\nesac\n`,
     );
     chmodSync(join(binDir, 'systemctl'), 0o755);
 
@@ -326,14 +329,18 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
       binDir,
     );
 
-    assert.equal(
-      result.status,
-      0,
-      `install.sh must tolerate a failing reset-failed, got exit ${result.status}: ${result.stderr}\n${result.stdout}`,
-    );
+    assert.notEqual(result.status, 0, 'install.sh must fail when reset-failed fails');
+    assert.match(result.stderr, /unit-test-simulated-dbus-error/, 'the real stderr must surface, not be swallowed');
+
+    const callsLogPath = join(caseDir, 'systemctl-calls.log');
+    const calls = readFileSync(callsLogPath, 'utf8').trim().split('\n');
+    const enableIdx = calls.findIndex((c) => c.startsWith('enable'));
+    const restartIdx = calls.findIndex((c) => c.startsWith('restart'));
+    assert.equal(enableIdx, -1, 'enable must not run after a failing reset-failed aborts the install');
+    assert.equal(restartIdx, -1, 'restart must not run after a failing reset-failed aborts the install');
   });
 
-  it('renders an ExecStartPre identity guard referencing the configured RUN_USER and RUN_GROUP', () => {
+  it('renders direct ExecStartPre getent guards for the configured RUN_USER and RUN_GROUP, no shell wrapper', () => {
     const caseDir = join(workDir, 'execstartpre');
     const installDir = join(caseDir, 'opt', 'clagentic-triage');
     const unitDir = join(caseDir, 'systemd');
@@ -361,41 +368,47 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     const unitPath = join(unitDir, 'clagentic-triage.service');
     const unitContents = readFileSync(unitPath, 'utf8');
 
-    const execStartPreLine = unitContents.split('\n').find((l) => l.startsWith('ExecStartPre='));
-    assert.ok(execStartPreLine, 'expected an ExecStartPre= line in the rendered unit');
-    // '+' prefix required — the guard must run as root regardless of the
-    // unit's own User=, since its job is to check whether that account
-    // exists at all.
-    assert.match(execStartPreLine, /^ExecStartPre=\+/);
+    const execStartPreLines = unitContents.split('\n').filter((l) => l.startsWith('ExecStartPre='));
+    // Two independent lines, not one '/bin/sh -c' wrapper — a shell
+    // wrapper would interpolate RUN_USER/RUN_GROUP into a root shell
+    // command line; direct exec lines remove that interpolation surface
+    // entirely (no '/bin/sh -c' anywhere in either line).
+    assert.equal(execStartPreLines.length, 2, `expected exactly 2 ExecStartPre= lines, got: ${execStartPreLines.join(' | ')}`);
+    for (const line of execStartPreLines) {
+      assert.doesNotMatch(line, /\/bin\/sh/, `ExecStartPre must not shell out: ${line}`);
+      // '+' prefix required — the guard must run as root regardless of
+      // the unit's own User=, since its job is to check whether that
+      // account exists at all.
+      assert.match(line, /^ExecStartPre=\+/);
+    }
     // Both checks must be present and independent — a group-only or
     // user-only guard would let the other identity's removal bypass it
     // entirely (missing user -> status=217/USER, missing group ->
     // status=216/GROUP).
-    assert.match(
-      execStartPreLine,
-      /getent passwd "clagentic-triage-test"/,
-      `expected a getent passwd check for RUN_USER in the identity guard, got: ${execStartPreLine}`,
-    );
-    assert.match(
-      execStartPreLine,
-      /getent group "clagentic-triage-test"/,
-      `expected a getent group check for RUN_GROUP in the identity guard, got: ${execStartPreLine}`,
-    );
+    const passwdLine = execStartPreLines.find((l) => l.includes('getent passwd'));
+    const groupLine = execStartPreLines.find((l) => l.includes('getent group'));
+    assert.ok(passwdLine, `expected a getent passwd ExecStartPre line, got: ${execStartPreLines.join(' | ')}`);
+    assert.ok(groupLine, `expected a getent group ExecStartPre line, got: ${execStartPreLines.join(' | ')}`);
+    assert.equal(passwdLine, 'ExecStartPre=+/usr/bin/getent passwd clagentic-triage-test');
+    assert.equal(groupLine, 'ExecStartPre=+/usr/bin/getent group clagentic-triage-test');
     assert.ok(!unitContents.includes('@@RUN_USER@@'), 'placeholder token must not survive rendering');
     assert.ok(!unitContents.includes('@@RUN_GROUP@@'), 'placeholder token must not survive rendering');
 
-    // ExecStartPre must precede ExecStart so the guard actually gates the
-    // real start attempt.
+    // Both ExecStartPre lines must precede ExecStart so the guard
+    // actually gates the real start attempt.
     const execStartPreIdx = unitContents.indexOf('ExecStartPre=');
     const execStartIdx = unitContents.indexOf('ExecStart=');
     assert.ok(execStartPreIdx >= 0 && execStartIdx >= 0 && execStartPreIdx < execStartIdx);
   });
 
-  it('the ExecStartPre guard script itself fails fast with an actionable message when the account is missing', () => {
-    // Exercises the guard's actual shell logic (not just its presence in
-    // the rendered unit) by extracting the ExecStartPre command and running
-    // it directly against a `getent` stub that reports the account absent
-    // — the same condition systemd would hit for a removed RUN_USER.
+  it('the ExecStartPre getent-passwd guard fails when RUN_USER does not resolve', () => {
+    // Exercises the guard's actual command (not just its presence in the
+    // rendered unit) by running the exact ExecStartPre argv systemd would
+    // exec, against a `getent` stub that reports the account absent — the
+    // same condition systemd would hit for a removed RUN_USER. No shell
+    // wrapper to strip: the rendered line is a direct getent invocation,
+    // so the '+'-prefixed argv is run as-is (minus the '+' itself, which
+    // is systemd's own directive syntax, not part of the command).
     const caseDir = join(workDir, 'execstartpre-runtime');
     const installDir = join(caseDir, 'opt', 'clagentic-triage');
     const unitDir = join(caseDir, 'systemd');
@@ -421,10 +434,16 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
 
     const unitPath = join(unitDir, 'clagentic-triage.service');
     const unitContents = readFileSync(unitPath, 'utf8');
-    const execStartPreLine = unitContents.split('\n').find((l) => l.startsWith('ExecStartPre='));
-    // Strip the leading 'ExecStartPre=+' systemd directive syntax to get
-    // the raw command line systemd would exec.
-    const rawCmd = execStartPreLine.replace(/^ExecStartPre=\+?/, '');
+    const passwdLine = unitContents.split('\n').find((l) => l.startsWith('ExecStartPre=') && l.includes('getent passwd'));
+    assert.ok(passwdLine, 'expected a getent passwd ExecStartPre line');
+    // Strip 'ExecStartPre=+' (systemd directive syntax) and the leading
+    // /usr/bin/getent path to get just the trailing argv ('passwd',
+    // RUN_USER) — the guard's own binary path is asserted separately
+    // above; here a stubbed 'getent' on PATH stands in for it so the test
+    // exercises the guard's actual passwd/RUN_USER argument pairing
+    // against a stub that reports the account absent.
+    const argv = passwdLine.replace(/^ExecStartPre=\+?\/usr\/bin\/getent /, '').split(' ');
+    assert.deepEqual(argv, ['passwd', 'clagentic-triage-test']);
 
     // Simulate the account being absent: a `getent` stub on PATH that
     // always reports "not found" (exit 2, matching real getent).
@@ -433,23 +452,21 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     writeFileSync(join(missingAcctBin, 'getent'), '#!/usr/bin/env bash\nexit 2\n');
     chmodSync(join(missingAcctBin, 'getent'), 0o755);
 
-    const guardResult = spawnSync('sh', ['-c', rawCmd], {
+    const guardResult = spawnSync('getent', argv, {
       env: { ...process.env, PATH: `${missingAcctBin}:${process.env.PATH}` },
       encoding: 'utf8',
     });
 
     assert.notEqual(guardResult.status, 0, 'guard must fail when the account does not exist');
-    assert.match(guardResult.stderr, /clagentic-triage-test.*does not exist/i);
-    assert.match(guardResult.stderr, /install\.sh/);
   });
 
-  it('the ExecStartPre guard also fails fast with an actionable message when the group is missing', () => {
+  it('the ExecStartPre getent-group guard fails when RUN_GROUP does not resolve', () => {
     // Same failure class as the missing-user case (status=217/USER) but for
     // the group: a RUN_GROUP removed from the host after install would
     // otherwise bypass a user-only guard and surface as an opaque
-    // status=216/GROUP instead. The `getent` stub here reports the user
-    // present but the group absent, so this only passes if the guard
-    // genuinely checks the group independently of the user.
+    // status=216/GROUP instead. Runs the getent-group ExecStartPre line's
+    // own argv directly, independent of the getent-passwd line, so this
+    // only passes if the two checks are genuinely independent lines.
     const caseDir = join(workDir, 'execstartpre-group-runtime');
     const installDir = join(caseDir, 'opt', 'clagentic-triage');
     const unitDir = join(caseDir, 'systemd');
@@ -475,28 +492,30 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
 
     const unitPath = join(unitDir, 'clagentic-triage.service');
     const unitContents = readFileSync(unitPath, 'utf8');
-    const execStartPreLine = unitContents.split('\n').find((l) => l.startsWith('ExecStartPre='));
-    const rawCmd = execStartPreLine.replace(/^ExecStartPre=\+?/, '');
+    const groupLine = unitContents.split('\n').find((l) => l.startsWith('ExecStartPre=') && l.includes('getent group'));
+    assert.ok(groupLine, 'expected a getent group ExecStartPre line');
+    // Strip 'ExecStartPre=+' and the leading /usr/bin/getent path to get
+    // just the trailing argv ('group', RUN_GROUP) — see the passwd-guard
+    // test above for why the binary path itself isn't re-asserted here.
+    const argv = groupLine.replace(/^ExecStartPre=\+?\/usr\/bin\/getent /, '').split(' ');
+    assert.deepEqual(argv, ['group', 'clagentic-triage-test']);
 
-    // Simulate the group being absent while the user still resolves: a
-    // `getent` stub that succeeds for `passwd` lookups but reports "not
-    // found" (exit 2, matching real getent) for `group` lookups.
+    // Simulate the group being absent: a `getent` stub that always
+    // reports "not found" (exit 2, matching real getent). Unlike the
+    // combined-command version this replaces, the group check is now its
+    // own ExecStartPre line, so it doesn't need to simulate the user
+    // resolving first — systemd runs each ExecStartPre= line independently
+    // and this line only ever invokes `getent group`.
     const missingGroupBin = join(caseDir, 'missing-group-bin');
     mkdirSync(missingGroupBin, { recursive: true });
-    writeFileSync(
-      join(missingGroupBin, 'getent'),
-      '#!/usr/bin/env bash\ncase "$1" in\n  passwd) exit 0 ;;\n  group) exit 2 ;;\nesac\n',
-    );
+    writeFileSync(join(missingGroupBin, 'getent'), '#!/usr/bin/env bash\nexit 2\n');
     chmodSync(join(missingGroupBin, 'getent'), 0o755);
 
-    const guardResult = spawnSync('sh', ['-c', rawCmd], {
+    const guardResult = spawnSync('getent', argv, {
       env: { ...process.env, PATH: `${missingGroupBin}:${process.env.PATH}` },
       encoding: 'utf8',
     });
 
     assert.notEqual(guardResult.status, 0, 'guard must fail when the group does not exist');
-    assert.match(guardResult.stderr, /clagentic-triage-test.*does not exist/i);
-    assert.match(guardResult.stderr, /group/i);
-    assert.match(guardResult.stderr, /install\.sh/);
   });
 });

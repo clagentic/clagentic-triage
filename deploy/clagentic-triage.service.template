@@ -33,7 +33,7 @@ WorkingDirectory=@@INSTALL_DIR@@
 EnvironmentFile=-@@ENV_FILE@@
 @@GITHUB_APP_PRIVATE_KEY_FILE_ENV_LINE@@
 # Runs as root (the '+' prefix opts out of the unit's User=/Group=/hardening
-# directives for this one exec line only — see systemd.service(5)) so it can
+# directives for these exec lines only — see systemd.service(5)) so it can
 # resolve the account regardless of what User=/Group= itself will be. Belt-
 # and-suspenders alongside install.sh's own preflight (_provision_run_identity):
 # this catches an account or group that existed at install time but was
@@ -41,10 +41,22 @@ EnvironmentFile=-@@ENV_FILE@@
 # it only runs at install/update time, not on every service start. Checks
 # both RUN_USER and RUN_GROUP — a missing group fails just as opaquely
 # (status=216/GROUP) as a missing user (status=217/USER), and only checking
-# the user would let a removed group bypass the guard entirely. Fails fast
-# with a clear systemd log line instead of entering ExecStart and failing
-# opaquely with one of those status codes.
-ExecStartPre=+/bin/sh -c 'getent passwd "@@RUN_USER@@" >/dev/null || { echo "clagentic-triage: RUN_USER=@@RUN_USER@@ does not exist on this host; re-run deploy/install.sh or create the account" >&2; exit 1; }; getent group "@@RUN_GROUP@@" >/dev/null || { echo "clagentic-triage: RUN_GROUP=@@RUN_GROUP@@ does not exist on this host; re-run deploy/install.sh or create the group" >&2; exit 1; }'
+# the user would let a removed group bypass the guard entirely.
+#
+# Direct getent exec lines, no '/bin/sh -c' wrapper — ExecStartPre= with a
+# '+' prefix runs as root regardless of the unit's own User=, so a shell
+# wrapper here would interpolate @@RUN_USER@@/@@RUN_GROUP@@ into a root
+# shell command line. Both values are install-time config (see
+# deploy/.env.example), not attacker input, but a direct exec removes the
+# shell-interpolation surface entirely rather than relying on that
+# distinction. getent's own non-zero exit still fails the start (bounded by
+# StartLimitIntervalSec/StartLimitBurst above); the actionable "why" lives
+# in install.sh's preflight message and the journal context around this
+# unit, not in a custom string built by a shell wrapper here. /usr/bin is
+# getent's standard location on a systemd host (glibc's getent package);
+# ExecStartPre requires an absolute path since it does not consult PATH.
+ExecStartPre=+/usr/bin/getent passwd @@RUN_USER@@
+ExecStartPre=+/usr/bin/getent group @@RUN_GROUP@@
 ExecStart=@@RUN_WRAPPER_PATH@@
 Restart=on-failure
 RestartSec=5
