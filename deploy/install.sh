@@ -335,6 +335,19 @@ else
     _log "reloading systemd daemon..."
     systemctl daemon-reload
 
+    # Clear any tripped StartLimitBurst (see the unit template's [Unit]
+    # section) before enable/restart. Without this, once a persistent
+    # failure (e.g. the removed-RUN_USER incident this bound exists to
+    # catch) exhausts the burst budget and lands the unit in `failed`, a
+    # later install.sh run — even after the host is repaired — has its
+    # `systemctl restart` refused with "start request repeated too
+    # quickly", because the trip is sticky until reset-failed clears it.
+    # Tolerate a unit that is not yet loaded (fresh host, nothing to
+    # reset) or not currently failed — reset-failed is a no-op in both
+    # cases, so failure here is never fatal to the install.
+    _log "clearing any tripped start-limit state for ${SERVICE_NAME}..."
+    systemctl reset-failed "${SERVICE_NAME}" 2>/dev/null || true
+
     _log "enabling ${SERVICE_NAME}..."
     systemctl enable "${SERVICE_NAME}"
 

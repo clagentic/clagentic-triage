@@ -54,7 +54,14 @@ function makeFakeSystem(dir) {
   write('useradd', `exit 0`);
   write('groupadd', `exit 0`);
   write('chown', `exit 0`);
-  write('systemctl', `case "$1" in is-active) exit 0 ;; *) exit 0 ;; esac`);
+  // Logs every invocation (verb + full argv) to systemctl-calls.log so
+  // tests can assert install.sh's call sequence, e.g. that reset-failed
+  // runs before enable/restart. is-active always succeeds so the post-
+  // restart poll loop in install.sh doesn't block on a real service.
+  write('systemctl', `
+echo "$*" >> "${join(dir, 'systemctl-calls.log')}"
+case "$1" in is-active) exit 0 ;; *) exit 0 ;; esac
+`);
   write('git', `
 sub="$1"; shift
 case "$sub" in
@@ -93,6 +100,26 @@ function seedInstallDir(installDir) {
   cpSync(REAL_SERVICE_TEMPLATE, join(installDir, 'deploy', 'clagentic-triage.service.template'));
 }
 
+// Extracts a named systemd section's body by splitting the file on section
+// headers (`^[Name]`) rather than a regex lookahead to the next header or
+// end-of-string. A lookahead-based `(?=^\[\w+\]|$)` approach only bounds the
+// match correctly when another section follows; when the target section is
+// the LAST one in the file, "end of string" has to be expressed some other
+// way than `\Z`, since JS regex treats `\Z` as a literal 'Z' character, not
+// an end-of-input anchor (that's Perl/Python/.NET syntax). Splitting on
+// headers sidesteps the anchor question entirely and works identically
+// whether the target section is first, middle, or last.
+function extractUnitSectionByHeaderSplit(fileContents, sectionName) {
+  const parts = fileContents.split(/^\[(\w+)\]$/m);
+  // parts alternates: [preamble, header1, body1, header2, body2, ...]
+  for (let i = 1; i < parts.length; i += 2) {
+    if (parts[i] === sectionName) {
+      return parts[i + 1];
+    }
+  }
+  return null;
+}
+
 function runInstall(env, extraPath) {
   const fullEnv = {
     ...process.env,
@@ -101,6 +128,33 @@ function runInstall(env, extraPath) {
   };
   return spawnSync('bash', [INSTALL_SH], { env: fullEnv, encoding: 'utf8' });
 }
+
+describe('extractUnitSectionByHeaderSplit — [Unit]-section extraction helper', () => {
+  it('extracts the [Unit] body when another section follows it', () => {
+    const contents = '[Unit]\nStartLimitBurst=6\n\n[Service]\nType=simple\n';
+    const section = extractUnitSectionByHeaderSplit(contents, 'Unit');
+    assert.ok(section !== null);
+    assert.match(section, /^StartLimitBurst=6$/m);
+    assert.ok(!section.includes('Type=simple'), '[Unit] body must not bleed into [Service]');
+  });
+
+  it('extracts the [Unit] body when [Unit] is the LAST section in the file', () => {
+    // The regression case: a lookahead of `(?=^\[\w+\]|\Z)` relies on \Z as
+    // an end-of-string anchor, which JS regex does not support (\Z matches
+    // a literal 'Z'), so that approach silently fails to bound the match
+    // when there is no following section header to anchor on.
+    const contents = '[Service]\nType=simple\n\n[Unit]\nStartLimitBurst=6\nStartLimitIntervalSec=300\n';
+    const section = extractUnitSectionByHeaderSplit(contents, 'Unit');
+    assert.ok(section !== null, 'expected a [Unit] section even when it is last in the file');
+    assert.match(section, /^StartLimitBurst=6$/m);
+    assert.match(section, /^StartLimitIntervalSec=300$/m);
+  });
+
+  it('returns null when the named section is absent', () => {
+    const contents = '[Service]\nType=simple\n';
+    assert.equal(extractUnitSectionByHeaderSplit(contents, 'Unit'), null);
+  });
+});
 
 describe('deploy/install.sh — bounded restart + identity guard on the rendered unit', () => {
   let workDir;
@@ -160,9 +214,16 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     // [Unit] section strictly (between the [Unit] header and the next
     // section header) rather than "everything before [Service]", so this
     // still catches a future reorder that puts [Service] ahead of [Unit].
-    const sectionMatch = unitContents.match(/^\[Unit\]\n([\s\S]*?)(?=^\[\w+\]|\Z)/m);
-    assert.ok(sectionMatch, 'expected a [Unit] section in the rendered unit');
-    const unitSection = sectionMatch[1];
+    //
+    // Split on section headers rather than a lookahead-to-end-of-string
+    // regex: JS regex has no \Z (Perl/Python end-of-input anchor) — it
+    // matches a literal capital Z character, not "end of string" — so a
+    // `(?=^\[\w+\]|\Z)` lookahead only terminates the match at the next
+    // section header and silently fails to bound it when [Unit] is the
+    // LAST section in the file (covered below by
+    // extractUnitSectionByHeaderSplit's own dedicated test case).
+    const unitSection = extractUnitSectionByHeaderSplit(unitContents, 'Unit');
+    assert.ok(unitSection !== null, 'expected a [Unit] section in the rendered unit');
     assert.match(unitSection, /^StartLimitIntervalSec=\d+$/m, 'StartLimitIntervalSec must be in [Unit]');
     assert.match(unitSection, /^StartLimitBurst=\d+$/m, 'StartLimitBurst must be in [Unit]');
 
@@ -178,6 +239,97 @@ describe('deploy/install.sh — bounded restart + identity guard on the rendered
     assert.ok(
       restartSec * burst <= interval,
       `restart budget (RestartSec=${restartSec} * StartLimitBurst=${burst} = ${restartSec * burst}) must fit within StartLimitIntervalSec=${interval}, or the burst limit can never trip`,
+    );
+  });
+
+  it('clears a tripped start-limit via systemctl reset-failed before enable/restart', () => {
+    // Once StartLimitBurst (asserted above) trips on a persistent failure,
+    // the unit lands in `failed` and the trip is sticky: a later `systemctl
+    // restart`, even after the host is repaired, is refused with "start
+    // request repeated too quickly" until something clears it. install.sh
+    // must run `systemctl reset-failed` itself so a post-merge install
+    // recovers a previously-tripped unit without a manual operator step.
+    const caseDir = join(workDir, 'reset-failed');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir } = makeFakeSystem(caseDir);
+
+    const result = runInstall(
+      {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+      },
+      binDir,
+    );
+
+    assert.equal(result.status, 0, `install.sh failed: ${result.stderr}\n${result.stdout}`);
+
+    const callsLogPath = join(caseDir, 'systemctl-calls.log');
+    assert.ok(existsSync(callsLogPath), 'expected the systemctl stub to have logged calls');
+    const calls = readFileSync(callsLogPath, 'utf8').trim().split('\n');
+
+    const resetFailedIdx = calls.findIndex((c) => c.startsWith('reset-failed'));
+    const enableIdx = calls.findIndex((c) => c.startsWith('enable'));
+    const restartIdx = calls.findIndex((c) => c.startsWith('restart'));
+
+    assert.ok(resetFailedIdx >= 0, `expected a 'systemctl reset-failed' call, got calls: ${calls.join(' | ')}`);
+    assert.ok(enableIdx >= 0, `expected a 'systemctl enable' call, got calls: ${calls.join(' | ')}`);
+    assert.ok(restartIdx >= 0, `expected a 'systemctl restart' call, got calls: ${calls.join(' | ')}`);
+    assert.ok(
+      resetFailedIdx < enableIdx && resetFailedIdx < restartIdx,
+      `reset-failed must run before enable/restart, got order: ${calls.join(' | ')}`,
+    );
+  });
+
+  it('tolerates systemctl reset-failed reporting a non-loaded/non-failed unit (fresh host, first install)', () => {
+    // On a fresh host reset-failed has nothing to reset — real systemctl
+    // exits non-zero in that case ("Unit ... not loaded" / no matching
+    // units). install.sh runs under `set -e`, so this only passes if
+    // install.sh explicitly tolerates that failure (e.g. `|| true`)
+    // instead of letting it abort the whole install.
+    const caseDir = join(workDir, 'reset-failed-tolerant');
+    const installDir = join(caseDir, 'opt', 'clagentic-triage');
+    const unitDir = join(caseDir, 'systemd');
+    mkdirSync(installDir, { recursive: true });
+    mkdirSync(unitDir, { recursive: true });
+    seedInstallDir(installDir);
+
+    const { binDir } = makeFakeSystem(caseDir);
+    // Override the shared systemctl stub so reset-failed specifically
+    // fails, matching real systemctl's behavior against a unit with
+    // nothing to reset.
+    writeFileSync(
+      join(binDir, 'systemctl'),
+      `#!/usr/bin/env bash\necho "$*" >> "${join(caseDir, 'systemctl-calls.log')}"\ncase "$1" in\n  is-active) exit 0 ;;\n  reset-failed) exit 1 ;;\n  *) exit 0 ;;\nesac\n`,
+    );
+    chmodSync(join(binDir, 'systemctl'), 0o755);
+
+    const result = runInstall(
+      {
+        CLAGENTIC_TRIAGE_INSTALL_DIR: installDir,
+        CLAGENTIC_TRIAGE_SYSTEMD_UNIT_DIR: unitDir,
+        CLAGENTIC_TRIAGE_RUN_USER: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_RUN_GROUP: 'clagentic-triage-test',
+        CLAGENTIC_TRIAGE_SKIP_NPM_CI: '1',
+        CLAGENTIC_TRIAGE_FORCE_UPDATE: '1',
+        TMPDIR: caseDir,
+      },
+      binDir,
+    );
+
+    assert.equal(
+      result.status,
+      0,
+      `install.sh must tolerate a failing reset-failed, got exit ${result.status}: ${result.stderr}\n${result.stdout}`,
     );
   });
 
